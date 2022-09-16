@@ -1,0 +1,112 @@
+{
+    "name": "Tamzen",
+    "file": "tamzen.png",
+
+    "width": 196,
+    "height": 112,
+
+    "char_width": 7,
+    "char_height": 14,
+
+    "columns": 28,
+    "rows": 8,
+
+    "char_count": 224,
+    "char_set": [
+        {
+            "type": "single",
+            "index": 0,
+            "value": 0
+        },
+        {
+            "type": "single",
+            "index": 1,
+            "value": 2
+        },
+        {
+            "type": "single",
+            "index": 2,
+            "value": 7
+        },
+        {
+            "type": "range",
+            "index": 3,
+            "value": 11,
+            "count": 5
+        },
+        {
+            "type": "single",
+            "index": 8,
+            "value": 18
+        },
+        {
+            "type": "range",
+            "index": 9,
+            "value": 21,
+            "count": 5
+        },
+        {
+            "type": "single",
+            "index": 14,
+            "value": 30
+        },
+        {
+            "type": "range",
+            "index": 15,
+            "value": 32,
+            "count": 95
+        },
+
+
+
+        {
+            "type": "range",
+            "index": 110,
+            "value": 160,
+            "count": 7
+        },
+        {
+            "type": "single",
+            "index": 117,
+            "value": 169
+        },
+        {
+            "type": "single",
+            "index": 118,
+            "value": 171
+        },
+        {
+            "type": "single",
+            "index": 119,
+            "value": 170
+        },
+        {
+            "type": "range",
+            "index": 120,
+            "value": 176,
+            "count": 2
+        },
+        {
+            "type": "single",
+            "index": 122,
+            "value": 180
+        },
+        {
+            "type": "single",
+            "index": 123,
+            "value": 184
+        },
+        {
+            "type": "single",
+            "index": 124,
+            "value": 187
+        },
+        {
+            "type": "range",
+            "index": 125,
+            "value": 191,
+            "count": 65
+        }
+
+    ]
+}
