@@ -7,7 +7,7 @@
 class font {
     struct glyphs_cords {
         u16 code;
-        points_cord cords;
+        vec2 cords;
 
         auto operator<=>(glyphs_cords const& lhs) const {
             if (code < lhs.code) return -1;
@@ -25,7 +25,7 @@ class font {
 public:
     void load(std::string const&);
 
-    inline const points_cord* getGlyphCord(u16 code){
+    inline const vec2* getGlyphCord(u16 code){
 
         auto search = glyphs_cache.find(code);
 
@@ -34,6 +34,22 @@ public:
         } 
 
         return nullptr;
+    }
+
+    [[nodiscard]] inline float getRelativeWidth() const {
+        return x_incrment;
+    }
+
+    [[nodiscard]] inline float getRelativeHeight() const {
+        return y_incrment;
+    }
+
+    [[nodiscard]] inline float getCharHeight() const {
+        return char_height;
+    }
+
+    [[nodiscard]] inline float getCharWidth() const {
+        return char_width;
     }
 
 private:

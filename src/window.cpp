@@ -243,7 +243,7 @@ void window::createTheWindow(){
         Atom wm_strut_partial = XInternAtom(Xdisplay, "_NET_WM_STRUT_PARTIAL", only_if_exists);
 
         int strut[12] = {};
-        strut[2+2] = height*2+3; //bh;
+        strut[2+2] = height+17; //bh;
         // strut[8] = 0; //mon->x;
         // strut[9] = 0; //mon->x + mon->width - 1;
 

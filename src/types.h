@@ -91,6 +91,14 @@ struct vec4{
     vec4(float a, float b, float c, float d) : x(a), y(b), z(c), w(d) {}
 };
 
+struct vec2{
+
+    float x, y;
+
+    vec2(float all) : x(all), y(all) {}
+    vec2(float a, float b) : x(a), y(b) {}
+} __attribute__((aligned(8)));
+
 struct rect {
     u16 x, y; 
     u16 w, h; 

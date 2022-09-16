@@ -47,21 +47,6 @@ void font::load(std::string const& conf_name){
         }
     }
 
-    /*
-    for(auto const& i: glyphs_cords){
-
-        std::cout << i.first << ": ";
-        std::cout << i.second.p1.x << '|';
-        std::cout << i.second.p1.y << ' ';
-        std::cout << i.second.p1.z << '|';
-        std::cout << i.second.p1.w << ", ";
-
-        std::cout << i.second.p2.x << '|';
-        std::cout << i.second.p2.y << ' ';
-        std::cout << i.second.p2.z << '|';
-        std::cout << i.second.p2.w << '\n';
-    }
-    */
 }
 
 void font::addCord(u16 index, u16 glyph_value){
@@ -69,26 +54,13 @@ void font::addCord(u16 index, u16 glyph_value){
     u8 char_col = index % columns;
     u8 char_row = index / columns;
 
-    glyphs_cords glyph;
+    glyphs_cords glyph = {
 
-    float x, y, w, h;
-
-    x = x_incrment * static_cast<float>(char_col);
-    y = y_incrment * static_cast<float>(char_row);
-
-    w = x_incrment * static_cast<float>(char_col+1);
-    h = y_incrment * static_cast<float>(char_row+1);
-
-    glyph.code = glyph_value;
-
-    glyph.cords.p1 = {
-        x, y,
-        x, h,
-    };
-
-    glyph.cords.p2 = {
-        w, y,
-        w, h,
+        glyph_value,
+        {
+            x_incrment * static_cast<float>(char_col),
+            y_incrment * static_cast<float>(char_row)
+        }
     };
 
     glyphs_cache.insert(glyph);

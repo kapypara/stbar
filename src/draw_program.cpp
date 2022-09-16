@@ -15,15 +15,16 @@ void draw_program::build(){
 
             #version 150 core
 
-            in float point;
-            in vec4 texcoord;
+            in vec2 point;
+            in vec2 texcoord;
 
             out VS_OUT {
-                vec4 texcoord;
+                vec2 point;
+                vec2 texcoord;
             } vs_out;
 
             void main() {
-                gl_Position = vec4(point, 0.0, 0.0, 1.0);
+                vs_out.point = point;
                 vs_out.texcoord = texcoord;
             }
             )glsl");
@@ -32,31 +33,35 @@ void draw_program::build(){
 
             #version 150 core
 
-            layout(lines) in;
+            layout(points) in;
             layout(triangle_strip, max_vertices = 4) out;
 
             in VS_OUT {
-                vec4 texcoord;
+                vec2 point;
+                vec2 texcoord;
             } vs_in[];
+
+            uniform float height;
+            uniform vec2 tex_size;
 
             out vec2 texcoord_frag;
 
             void main() {
 
-                texcoord_frag = vs_in[0].texcoord.xy;
-                gl_Position = vec4(gl_in[0].gl_Position.x, 1, 0, 1);
+                texcoord_frag = vs_in[0].texcoord;
+                gl_Position = vec4(vs_in[0].point.x, height, 0, 1);
                 EmitVertex();
 
-                texcoord_frag = vs_in[0].texcoord.zw;
-                gl_Position = vec4(gl_in[0].gl_Position.x, -1, 0, 1);
+                texcoord_frag = vec2(vs_in[0].texcoord.x, vs_in[0].texcoord.y+tex_size.y);
+                gl_Position = vec4(vs_in[0].point.x, -height, 0, 1);
                 EmitVertex();
 
-                texcoord_frag = vs_in[1].texcoord.xy;
-                gl_Position = vec4(gl_in[1].gl_Position.x, 1, 0, 1);
+                texcoord_frag = vec2(vs_in[0].texcoord.x+tex_size.x, vs_in[0].texcoord.y);
+                gl_Position = vec4(vs_in[0].point.y, height, 0, 1);
                 EmitVertex();
 
-                texcoord_frag = vs_in[1].texcoord.zw;
-                gl_Position = vec4(gl_in[1].gl_Position.x, -1, 0, 1);
+                texcoord_frag = vec2(vs_in[0].texcoord.x+tex_size.x, vs_in[0].texcoord.y+tex_size.y);
+                gl_Position = vec4(vs_in[0].point.y, -height, 0, 1);
                 EmitVertex();
 
                 EndPrimitive();
@@ -71,7 +76,6 @@ void draw_program::build(){
 
             uniform vec4 bg;
             uniform sampler2D tex;
-
 
             void main() {
 
@@ -93,8 +97,13 @@ void draw_program::build(){
         return;
 
     point.defineLocation(program, "point");
-    texture_cordnate.defineLocation(program, "texcoord");
+    texture_coordinate.defineLocation(program, "texcoord");
+
+    height.defineLocation(program, "height");
+    texture_size.defineLocation(program, "tex_size");
     background.defineLocation(program, "bg");
+
+    height.setData(1.f);
 
     ready = true;
 }
@@ -106,10 +115,7 @@ void draw_program::use() const {
 
 void draw_program::draw() const {
 
-    GL::bindArray(program_attributes);
-    program.use();
-
-    glDrawArrays(GL_LINES, 0, 2);
+    glDrawArrays(GL_POINTS, 0, 1);
 }
 
 void draw_program::drawUntextured() const {
@@ -126,43 +132,35 @@ void draw_program::setTexture(GL::texture* new_texture){
     texture = new_texture;
 }
 
-void draw_program::setPoints(GLfloat p1, GLfloat p2) const {
-
-    std::array<GLfloat, 2> points_array {
-        p1,
-        p2,
-    };
+void draw_program::setPoints(vec2 const& points_vec) const {
 
     GL::bindBuffer(points);
-    GL::setBuffer(points, GL_DYNAMIC_DRAW, points_array);
-    point.setData(1, GL_FLOAT);
+    GL::setBuffer(points, GL_DYNAMIC_DRAW, sizeof(points_vec), &points_vec.x);
+
+    point.setData(2, GL_FLOAT);
     point.enable();
 }
 
 
-void draw_program::setCoordinates(vec4 const& side1, vec4 const& side2){
-
-    std::array<GLfloat, 2*4> coord_array {
-        side1.x,
-        side1.y,
-        side1.z,
-        side1.w,
-
-        side2.x,
-        side2.y,
-        side2.z,
-        side2.w,
-    };
+void draw_program::setCoordinates(vec2 const& coordinates_vec){
 
     GL::bindBuffer(coordinates);
-    GL::setBuffer(coordinates, GL_DYNAMIC_DRAW, coord_array);
+    GL::setBuffer(coordinates, GL_DYNAMIC_DRAW, sizeof(coordinates_vec), &coordinates_vec.x);
 
-    texture_cordnate.setData(4, GL_FLOAT);
-    texture_cordnate.enable();
+    texture_coordinate.setData(2, GL_FLOAT);
+    texture_coordinate.enable();
 }
 
-void draw_program::setBackground(vec4 const& color){
+void draw_program::setTextureSize(vec2 const& size){
+    texture_size.setData(size.x, size.y);
+}
+
+void draw_program::setBackgroundColor(vec4 const& color){
     background.setData(color.x, color.y, color.z, color.w);
+}
+
+void draw_program::setHeight(GLfloat height_in){
+    height.setData(height_in);
 }
 
 

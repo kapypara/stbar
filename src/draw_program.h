@@ -19,9 +19,9 @@ class draw_program {
     GL::program program;
 
     GL::shader vertex, geometry, fragment;
-    GL::attribute point, texture_cordnate;
+    GL::attribute point, texture_coordinate;
 
-    GL::uniform background;
+    GL::uniform height, texture_size, background;
 
     GL::buffer points, coordinates;
 
@@ -42,9 +42,12 @@ public:
     void drawTextured() const;
 
     void setTexture(GL::texture*);
-    void setPoints(GLfloat, GLfloat) const;
-    void setCoordinates(vec4 const&, vec4 const&);
-    void setBackground(vec4 const&);
+    void setPoints(vec2 const&) const;
+    void setCoordinates(vec2 const&);
+
+    void setTextureSize(vec2 const&);
+    void setBackgroundColor(vec4 const&);
+    void setHeight(GLfloat);
 
     void bindTexture() const;
     void unBindtexture() const;

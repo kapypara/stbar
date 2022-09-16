@@ -23,6 +23,10 @@ public:
         return width;
     }
 
+    [[nodiscard]] inline int get_height() const {
+        return height;
+    }
+
     inline void setDockMode(){
         docked = true;
     }

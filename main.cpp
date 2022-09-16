@@ -25,7 +25,7 @@ int main() {
 
     renderer ren;
 
-    ren.setWindow(0, 17, 1280, 14);
+    ren.setWindow(0, 17, 1280, 14+6);
     // ren.setWindow(0, 1024-14, 1280, 14);
 
     ren.setDockMode();
@@ -170,7 +170,7 @@ int main() {
         return 22;
 
     // background
-    dp.setBackground(vec4(.0f, .0f, .0f, .4666f));
+    dp.setBackgroundColor(vec4(.0f, .0f, .0f, .4666f));
 
     // texture
     GL::texture font_texture;
@@ -185,14 +185,29 @@ int main() {
 
     font_glyphs.load("assets/font/tamzen.json");
 
+    vec2 tex_char_size = {
+        font_glyphs.getRelativeWidth(),
+        font_glyphs.getRelativeHeight()
+    };
 
+    dp.setHeight(1);
 
+    dp.setPoints({-1, 1});
+    dp.setCoordinates({0, 0});
+    dp.setTextureSize({0,0});
+    dp.drawTextured();
+
+    dp.setTextureSize(tex_char_size);
+    dp.setHeight(14.f/static_cast<float>(ren.get_height()));
+
+    // std::cout << 15.f/static_cast<float>(ren.get_height()) << '\n';
+    // exit(1);
 
     // points
     std::vector<GLfloat> char_array;
 
     const int local_width = ren.get_width();
-    const int char_count = local_width / 7;
+    const int char_count = local_width / static_cast<int>(font_glyphs.getCharWidth());
 
     for(int i=0; i<char_count+2; i++){
 
@@ -207,49 +222,24 @@ int main() {
         char_array.push_back(cord);
     }
 
-    dp.setPoints(char_array[0], char_array[char_array.size()/2]);
+    dp.setPoints({char_array[0], char_array[char_array.size()/2]});
 
-
-    // coord
-    constexpr auto cord = [](rect r) {
-    // for refrence cord goes from 0,0 to 1,1
-
-        const float width = 196;
-        const float height = 112;
-
-        points_cord output;
-
-        output.p1.x = static_cast<float>(r.x) / width;
-        output.p1.y = static_cast<float>(r.y) / height;
-
-        output.p1.z = static_cast<float>(r.x) / width;
-        output.p1.w = static_cast<float>(r.y+r.h) / height;
-
-
-        output.p2.x = static_cast<float>(r.x+r.w) / width;
-        output.p2.y = static_cast<float>(r.y) / height;
-
-        output.p2.z = static_cast<float>(r.x+r.w) / width;
-        output.p2.w = static_cast<float>(r.y+r.h) / height;
-
-        return output; 
-    };
 
     // points_cord x = cord(rect(63, 28, 7, 14));
-    const points_cord* x = font_glyphs.getGlyphCord(0);
+    const vec2* x = font_glyphs.getGlyphCord(0);
 
-    dp.setCoordinates(x->p1, x->p2);
+    dp.setCoordinates({x->x, x->y});
+    dp.bindTexture();
 
     u16 i = 0;
     u16 a = 0;
 
     glClearColor(0, 0, 0, 0);
 
-        ren.handleEvents();
-        ren.update();
-
 	while (ren.is_running()) {
 
+        ren.handleEvents();
+        ren.update();
         // glClear(GL_COLOR_BUFFER_BIT);
         
         /*
@@ -257,18 +247,18 @@ int main() {
         program.use();
         dog.bind();
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, nullptr);
+        */
 
-            */
-
-        x = font_glyphs.getGlyphCord(i=((++i)>255)? 0: i);
+        x = font_glyphs.getGlyphCord(i=((++i)>255)? 0: i );
 
         if(x != nullptr){
 
-            dp.setPoints(char_array[a], char_array[a+1]);
+            // dp.setPoints({char_array[a], char_array[a+1]});
+            dp.setPoints({char_array[a], char_array[a+1]});
             a = ++a>char_array.size()-2? 0: a;
 
-            dp.setCoordinates(x->p1, x->p2);
-            dp.drawTextured();
+            dp.setCoordinates({x->x, x->y});
+            dp.draw();
 
             glFlush();
 
