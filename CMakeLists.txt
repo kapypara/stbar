@@ -30,7 +30,7 @@ add_executable(stbar_v4
     src/window.cpp
     src/renderer.cpp
 
-    src/draw_program.cpp
+    src/static_rect.cpp
     src/font.cpp
 
     src/gl/attribute.cpp
@@ -49,7 +49,7 @@ add_executable(stbar_v4
     )
 
 set(CMAKE_CXX_FLAGS "\
-    -std=c++20 -Wall -march=native -O3 -flto \
+    -std=c++20 -Wall -march=native -O3 -flto=auto \
     -lpthread -lX11 -lXrender -lGL -lGLEW -lm -lSOIL"
     )
 add_definitions(-DUSE_GLX_CREATE_WINDOW -DUSE_GLX_CREATE_CONTEXT_ATTRIB)

@@ -1,15 +1,15 @@
-#include "draw_program.h"
+#include "static_rect.h"
 
 #include "gl/texture.h"
 #include <cstring>
 
-draw_program::draw_program(){
+static_rect::static_rect(){
 
     points.setType(GL::buffer::type::array);
     coordinates.setType(GL::buffer::type::array);
 }
 
-void draw_program::build(){
+void static_rect::build(){
 
     vertex.create(GL::shader::type::vertex, R"glsl(
 
@@ -41,27 +41,34 @@ void draw_program::build(){
                 vec2 texcoord;
             } vs_in[];
 
-            uniform float height;
+            uniform vec2 rect_size;
             uniform vec2 tex_size;
 
             out vec2 texcoord_frag;
 
             void main() {
 
+                gl_Position = vec4(0, 0, 0, 1);
+
+
                 texcoord_frag = vs_in[0].texcoord;
-                gl_Position = vec4(vs_in[0].point.x, height, 0, 1);
+                gl_Position.x = vs_in[0].point.x;
+                gl_Position.y = vs_in[0].point.y;
                 EmitVertex();
 
                 texcoord_frag = vec2(vs_in[0].texcoord.x, vs_in[0].texcoord.y+tex_size.y);
-                gl_Position = vec4(vs_in[0].point.x, -height, 0, 1);
+                // gl_Position.x = vs_in[0].point.x;
+                gl_Position.y = vs_in[0].point.y - rect_size.y;
                 EmitVertex();
 
                 texcoord_frag = vec2(vs_in[0].texcoord.x+tex_size.x, vs_in[0].texcoord.y);
-                gl_Position = vec4(vs_in[0].point.y, height, 0, 1);
+                gl_Position.x = vs_in[0].point.x + rect_size.x;
+                gl_Position.y = vs_in[0].point.y;
                 EmitVertex();
 
                 texcoord_frag = vec2(vs_in[0].texcoord.x+tex_size.x, vs_in[0].texcoord.y+tex_size.y);
-                gl_Position = vec4(vs_in[0].point.y, -height, 0, 1);
+                // gl_Position.x = vs_in[0].point.x + rect_size.x;
+                gl_Position.y = vs_in[0].point.y - rect_size.y;
                 EmitVertex();
 
                 EndPrimitive();
@@ -99,76 +106,66 @@ void draw_program::build(){
     point.defineLocation(program, "point");
     texture_coordinate.defineLocation(program, "texcoord");
 
-    height.defineLocation(program, "height");
+    rect_size.defineLocation(program, "rect_size");
     texture_size.defineLocation(program, "tex_size");
     background.defineLocation(program, "bg");
 
-    height.setData(1.f);
+    // rect_size.setData(1.f, -1.f);
 
     ready = true;
 }
 
-void draw_program::use() const {
+void static_rect::use() const {
     GL::bindArray(program_attributes);
     program.use();
 }
 
-void draw_program::draw() const {
+void static_rect::draw(u16 count) const {
 
-    glDrawArrays(GL_POINTS, 0, 1);
+    glDrawArrays(GL_POINTS, 0, count);
 }
 
-void draw_program::drawUntextured() const {
-    GL::unBindTexture();
-    draw();
-}
-
-void draw_program::drawTextured() const {
-    bindTexture();
-    draw();
-}
-
-void draw_program::setTexture(GL::texture* new_texture){
+void static_rect::setTexture(GL::texture* new_texture){
     texture = new_texture;
 }
 
-void draw_program::setPoints(vec2 const& points_vec) const {
+void static_rect::setRectPoints(std::vector<GLfloat> const& points_vector) const {
 
     GL::bindBuffer(points);
-    GL::setBuffer(points, GL_DYNAMIC_DRAW, sizeof(points_vec), &points_vec.x);
+    GL::setBuffer(points, GL_DYNAMIC_DRAW, points_vector);
 
     point.setData(2, GL_FLOAT);
     point.enable();
 }
 
 
-void draw_program::setCoordinates(vec2 const& coordinates_vec){
+void static_rect::setTextureCoordinates(std::vector<GLfloat> const& coordinates_vec) const{
 
     GL::bindBuffer(coordinates);
-    GL::setBuffer(coordinates, GL_DYNAMIC_DRAW, sizeof(coordinates_vec), &coordinates_vec.x);
+    GL::setBuffer(coordinates, GL_DYNAMIC_DRAW, coordinates_vec);
 
     texture_coordinate.setData(2, GL_FLOAT);
     texture_coordinate.enable();
 }
 
-void draw_program::setTextureSize(vec2 const& size){
+void static_rect::setTextureSize(vec2 const& size){
     texture_size.setData(size.x, size.y);
 }
 
-void draw_program::setBackgroundColor(vec4 const& color){
+void static_rect::setBackgroundColor(vec4 const& color){
     background.setData(color.x, color.y, color.z, color.w);
 }
 
-void draw_program::setHeight(GLfloat height_in){
-    height.setData(height_in);
+void static_rect::setRectSize(vec2 const& size){
+    rect_size.setData(size.x, size.y);
 }
 
 
-void draw_program::bindTexture() const {
+void static_rect::bindTexture() const {
     GL::bindTexture(*texture);
 }
 
-void draw_program::unBindtexture() const {
+void static_rect::unBindtexture() const {
     GL::unBindTexture();
 }
 

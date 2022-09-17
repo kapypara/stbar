@@ -3,18 +3,17 @@
 
 using GL::attribute;
 
-GLint attribute::defineLocation(GLuint program, const GLchar *name){
+void attribute::defineLocation(GLuint program, const GLchar *name){
 
     location = glGetAttribLocation(program, name);
 
-    return location;
+    assert(location != -1);
 }
 
-GLint attribute::defineLocation(GL::program const& program, const GLchar *name){
+void attribute::defineLocation(GL::program const& program, const GLchar *name){
 
     assert(program.getStatus());
-
-    return defineLocation(program.getId(), name);
+    defineLocation(program.getId(), name);
 }
 
 

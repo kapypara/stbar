@@ -9,12 +9,12 @@ class attribute {
     GLint location = -1;
 
 public:
-    GLint defineLocation(GLuint program, const GLchar *name);
-    GLint defineLocation(GL::program const&, const GLchar *name);
+    void defineLocation(GLuint program, const GLchar *name);
+    void defineLocation(GL::program const&, const GLchar *name);
 
     template <typename Container>
-    GLint defineLocation(program const& program, Container name){
-        return defineLocation(program, static_cast<const GLchar*>(name.data()));
+    void defineLocation(program const& program, Container name){
+        defineLocation(program, static_cast<const GLchar*>(name.data()));
     }
 
     attribute() = default;
@@ -32,11 +32,9 @@ public:
 
     // TODO add check for current vao. also enableFor
     inline void enable() const {
-        assert(location != -1);
         glEnableVertexAttribArray(location);
     }
     inline void disable() const {
-        assert(location != -1);
         glDisableVertexAttribArray(location);
     }
 

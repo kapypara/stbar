@@ -6,9 +6,11 @@ using GL::uniform;
 
 void uniform::defineLocation(GLuint program, const GLchar *name){
     location = glGetUniformLocation(program, name);
+    assert(location != -1);
 }
 
 void uniform::defineLocation(GL::program const& program, const GLchar *name){
+    assert(program.getStatus());
     location = glGetUniformLocation(program.getId(), name);
 }
 

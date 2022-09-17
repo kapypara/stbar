@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-class draw_program {
+class static_rect {
 
     // GL Side
     GL::array program_attributes;
@@ -21,7 +21,7 @@ class draw_program {
     GL::shader vertex, geometry, fragment;
     GL::attribute point, texture_coordinate;
 
-    GL::uniform height, texture_size, background;
+    GL::uniform rect_size, texture_size, background;
 
     GL::buffer points, coordinates;
 
@@ -32,22 +32,19 @@ class draw_program {
 
 public:
 
-    draw_program();
+    static_rect();
 
     void build();
-    void draw() const;
+    void draw(u16) const;
     void use() const;
 
-    void drawUntextured() const;
-    void drawTextured() const;
-
     void setTexture(GL::texture*);
-    void setPoints(vec2 const&) const;
-    void setCoordinates(vec2 const&);
+    void setRectPoints(std::vector<GLfloat> const&) const;
+    void setTextureCoordinates(std::vector<GLfloat> const&) const;
 
+    void setRectSize(vec2 const&);
     void setTextureSize(vec2 const&);
     void setBackgroundColor(vec4 const&);
-    void setHeight(GLfloat);
 
     void bindTexture() const;
     void unBindtexture() const;
