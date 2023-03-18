@@ -19,7 +19,8 @@ void renderer::handleEvents(){
 
 void renderer::update(){
 
-    glViewport (0, 0, width, height); // set the dimention for the inital image
+    // set the dimention for the window image
+    glViewport (0, 0, width, height);
 
 }
 

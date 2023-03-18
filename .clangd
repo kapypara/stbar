@@ -5,6 +5,8 @@ Diagnostics:
   Suppress: [ -Wc99-designator ]
   ClangTidy:
     Add: '*'
+    CheckOptions: 
+      misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic: true
     Remove: 
         # ego I guess
       - llvmlibc-implementation-in-namespace
@@ -19,6 +21,9 @@ Diagnostics:
 
         # short names gang gang
       - readability-identifier-length
+
+        # operator overload
+      - fuchsia-overloaded-operator
 
         # its never done
       - google-readability-todo
@@ -44,3 +49,7 @@ Diagnostics:
       - readability-uppercase-literal-suffix
       - cert-dcl16-c
       - hicpp-uppercase-literal-suffix
+
+        # no private variables
+      - cppcoreguidelines-non-private-member-variables-in-classes
+      # misc-non-private-member-variables-in-classes # is modified (CheckOptions) to ingore classes with only public members 
