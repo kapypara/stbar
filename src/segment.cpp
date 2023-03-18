@@ -1,10 +1,9 @@
 #include <iostream>
 #include <string>
-#include "segments.h"
+#include "segment.h"
 
-#include <iostream>
-
-void segment::output::draw() {
+/*
+void segments::output::draw() {
 
     using std::cout;
 
@@ -33,8 +32,26 @@ void segment::output::draw() {
 
     cout << "%{B#77000000}" << std::endl;
 }
+*/
 
-void segment::state::new_tick(u16 tick_index, u64 value){
+
+void segment_draw::setSlots(std::span<float> const& x_poistion){
+    slots.clear();
+    slots = {x_poistion.begin(), x_poistion.end()};
+
+    limit = slots.size();
+}
+
+void segment::operator ()(u16 memory_size, u16 transition_size, segment::type use){
+
+    state_type = use;
+    ticks.resize(memory_size, 0);
+    transition_values.resize(transition_size, 0);
+
+    step_limit = log2u32(transition_size); // add +1 to make transition more smoother
+}
+
+void segment::new_tick(u16 tick_index, u64 value){
 
     ticks[tick_index] = value;
 
@@ -46,7 +63,7 @@ void segment::state::new_tick(u16 tick_index, u64 value){
     setTransition(target);
 }
 
-void segment::state::setTransition(u64 goal){
+void segment::setTransition(u64 goal){
 
     i64 step = goal - last;
 
@@ -55,12 +72,12 @@ void segment::state::setTransition(u64 goal){
         return;
     }
 
-#ifdef __this
-    for(u8 i=0; i<step_limit; i++){
+    #pragma unroll
+    for(u8 i=0; i<step_limit; i++) {
+    
         step = (step/2)?: step;
         // step = (step&0x8000000000000000) | (((step&0x7fffffffffffffff)>>1)?: step);
-    }
-#endif
+    } 
 
     // step = DivIfPossible(step, transition_values.size()/4);
 
