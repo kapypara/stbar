@@ -41,5 +41,8 @@ inline void setBuffer(GL::buffer const& buffer, GLenum usage, Container data) {
     setBuffer(buffer, usage, size, &data[0]);
 }
 
+inline void flush() {
+    glFlush();
+}
 
 };
