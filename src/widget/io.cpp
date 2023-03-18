@@ -1,4 +1,5 @@
 #include <fstream>
+
 #include "types.h"
 
 // a line in /proc/diskstats would look like:
@@ -6,7 +7,7 @@
 // we need these fields           --^^^--                      --^^^--
 // Field  3 -- # of sectors read 
 // Field  7 -- # of sectors written 
-// name of block Storage devices: sra loop1 sdf
+// example names of block Storage devices: sra loop1 sdf mmcblk
 // this code target none partation sd* and sr* block devices
 
 // refer to Documentation/iostats.txt for more information
@@ -24,13 +25,17 @@ io_t getIoStat(){
 
     u64 temp;
 
-    while(stat_file.ignore(20, 's')) {
+    // assuming line beginning is fixed
+    while (stat_file.ignore(13)) {
 
-        if (stat_file.peek() == 'd' || stat_file.peek() == 'r') { [[likely]]
+        std::string devices_name;
+        stat_file >> devices_name;
 
-            stat_file.ignore(2);
+        // TODO add sda support to this update
+        if (devices_name.compare(0, 6, "mmcblk") == 0) { [[likely]]
 
-            if (stat_file.get() == ' ') { [[unlikely]]
+            // checking if devices_name is not a volume parathion
+            if (devices_name[devices_name.length()-2] != 'p') { [[unlikely]]
 
                 stat_file.ignore(20, ' '); // skip feild 1
                 stat_file.ignore(20, ' '); // skip feild 2
