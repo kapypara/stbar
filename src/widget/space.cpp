@@ -22,7 +22,7 @@ u64 getFreeSpace() {
 
         while((line=getmntent(mount_point))) {
 
-            if(!strncmp(line->mnt_fsname, "/dev/sd", 7)) {
+            if (strncmp(line->mnt_fsname, "/dev/sd", 7) == 0 || strncmp(line->mnt_fsname, "/dev/mmcblk", 11) == 0) {
 
                 bytes += getPathFreeSpace(line->mnt_dir);
             }
@@ -39,7 +39,7 @@ inline u64 getPathFreeSpace(const char *path) {
 
     if (!statvfs(path, &fiData)) [[likely]]
         return fiData.f_bavail * fiData.f_bsize;
-    else
-        return 0;
+
+    return 0;
 }
 
