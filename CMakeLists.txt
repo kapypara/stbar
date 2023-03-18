@@ -42,17 +42,21 @@ add_executable(stbar_v4
     src/gl/texture.cpp
     src/gl/uniform.cpp
 
-    # src/output.cpp 
-    # src/segments.cpp
-    # src/format.cpp
-    # ${widget_src}
+    src/output.cpp 
+    src/segment.cpp
+    src/format.cpp
+    ${widget_src}
     )
 
 set(CMAKE_CXX_FLAGS "\
-    -std=c++20 -Wall -march=native -O3 -flto=auto \
+    -std=c++20 -Wall -O3 -g -flto=auto \
     -lpthread -lX11 -lXrender -lGL -lGLEW -lm -lSOIL"
     )
-add_definitions(-DUSE_GLX_CREATE_WINDOW -DUSE_GLX_CREATE_CONTEXT_ATTRIB)
+add_definitions(
+    -DUSE_GLX_CREATE_WINDOW
+    -DUSE_GLX_CREATE_CONTEXT_ATTRIB
+    -DIGNORE_UNKNOWN_GLYPHS
+    )
 
 # link assests in build dir
 file(CREATE_LINK "../assets" "assets" SYMBOLIC)
