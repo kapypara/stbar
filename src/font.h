@@ -9,18 +9,14 @@ class font {
         u16 code;
         vec2 cords;
 
-        auto operator<=>(glyphs_cords const& lhs) const {
-            if (code < lhs.code) return -1;
-            if (lhs.code < code) return 1;
-            return 0;
+        auto operator<=>(glyphs_cords const& rhs) const {
+            return code - rhs.code;
         }
 
-        auto operator<=>(u16 const lhs) const{
-            if (code < lhs) return -1;
-            if (lhs < code) return 1;
-            return 0;
+        auto operator<=>(u16 const rhs) const{
+            return code - rhs;
         }
-    };
+    } __attribute__((aligned(16)));
 
 public:
     void load(std::string const&);
@@ -44,11 +40,11 @@ public:
         return y_incrment;
     }
 
-    [[nodiscard]] inline float getCharHeight() const {
+    [[nodiscard]] inline u16 getCharHeight() const {
         return char_height;
     }
 
-    [[nodiscard]] inline float getCharWidth() const {
+    [[nodiscard]] inline u16 getCharWidth() const {
         return char_width;
     }
 
