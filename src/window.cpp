@@ -243,7 +243,7 @@ void window::createTheWindow(){
         Atom wm_strut_partial = XInternAtom(Xdisplay, "_NET_WM_STRUT_PARTIAL", only_if_exists);
 
         int strut[12] = {};
-        strut[2+2] = height+17; //bh;
+        strut[2+2] = height; //bh;
         // strut[8] = 0; //mon->x;
         // strut[9] = 0; //mon->x + mon->width - 1;
 
@@ -333,11 +333,19 @@ void window::updateTheMessageQueue(){
             case ClientMessage:
                 if (event.xclient.data.l[0] == del_atom)
                     running = false;
+                break;
 
             case ConfigureNotify:
                 xc = &(event.xconfigure);
                 width = xc->width;
                 height = xc->height;
+                break;
+
+            case ButtonPress:
+                last_click.x = event.xbutton.x;
+                last_click.y = event.xbutton.y;
+                last_click.button = event.xbutton.button;
+                clicked = true;
                 break;
         }
     }

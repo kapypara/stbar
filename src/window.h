@@ -27,6 +27,26 @@ public:
         return height;
     }
 
+    [[nodiscard]] inline bool is_ButtonClicked() const {
+        return clicked;
+    }
+
+    inline void clearClick() {
+        clicked = false;
+    }
+
+    [[nodiscard]] inline int getClick_x() const {
+        return last_click.x;
+    }
+
+    [[nodiscard]] inline int getClick_y() const {
+        return last_click.y;
+    }
+
+    [[nodiscard]] inline unsigned int getClick_button() const {
+        return last_click.button;
+    }
+
     inline void setDockMode(){
         docked = true;
     }
@@ -56,6 +76,13 @@ protected:
 
     bool running = true;
     bool docked = false;
+
+    // mosue event
+    bool clicked = false;
+    struct click {
+        int x, y;
+        unsigned int button;
+    } __attribute__((aligned(16))) last_click;
 
     static void fatalError(const char *why);
     static int ctxErrorHandler(Display *dpy, XErrorEvent *ev);

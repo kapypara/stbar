@@ -1,11 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <cinttypes>
+#include <mutex>
 #include <numeric>
 #include <utility>
 #include <vector>
-#include <mutex>
-#include <atomic>
 
 #define u8  uint8_t
 #define u16 uint16_t
@@ -51,10 +51,37 @@ struct net_t {
 
     net_t operator -(net_t const& b) const {
         return {
-            .rx = this->rx - b.rx,
-            .tx = this->tx - b.tx
+            this->rx - b.rx,
+            this->tx - b.tx
         };
     }
+
+    net_t operator +(net_t const& b) const {
+        return {
+            this->rx + b.rx,
+            this->tx + b.tx
+        };
+    }
+
+    net_t operator +=(net_t const& b) {
+        this->rx = this->rx + b.rx;
+        this->tx = this->tx + b.tx;
+
+        return *this;
+    }
+    
+
+    constexpr explicit net_t() = default;
+
+    constexpr explicit net_t(u64 i)
+        : rx(i)
+        , tx(i)
+    {}
+
+    constexpr net_t(u64 r, u64 t)
+        : rx(r)
+        , tx(t)
+    {}
 
     operator std::pair<u64, u64>(){
         return {this->rx, this->tx};
@@ -87,27 +114,24 @@ struct vec4{
 
     float x, y, z, w;
 
-    vec4(float all) : x(all), y(all), z(all), w(all) {}
-    vec4(float a, float b, float c, float d) : x(a), y(b), z(c), w(d) {}
-};
+    constexpr vec4() = default;
+    constexpr vec4(float all) : x(all), y(all), z(all), w(all) {}
+    constexpr vec4(float a, float b, float c, float d) : x(a), y(b), z(c), w(d) {}
+} __attribute__((aligned(16)));
 
 struct vec2{
 
     float x, y;
 
-    vec2(float all) : x(all), y(all) {}
-    vec2(float a, float b) : x(a), y(b) {}
+    constexpr vec2(const float all) : x(all), y(all) {}
+    constexpr vec2(const float a, const float b) : x(a), y(b) {}
 } __attribute__((aligned(8)));
 
 struct rect {
     u16 x, y; 
     u16 w, h; 
 
-    rect(u16 a, u16 b, u16 c, u16 d) : x(a), y(b), w(c), h(d) {}
-};
+    constexpr rect(u16 a, u16 b, u16 c, u16 d) : x(a), y(b), w(c), h(d) {}
+} __attribute__((aligned(8)));
 
-struct points_cord {
-    vec4 p1 = 0;
-    vec4 p2 = 0;
-};
 
