@@ -53,3 +53,10 @@ Diagnostics:
         # no private variables
       - cppcoreguidelines-non-private-member-variables-in-classes
       # misc-non-private-member-variables-in-classes # is modified (CheckOptions) to ingore classes with only public members 
+
+        # ask to use prgma unroll
+      - altera-unroll-loops
+
+        # warin about ID depended variables and performance degradation
+        # for refernce: Dependent names are characterized by a dependency on a template argument
+      - altera-id-dependent-backward-branch
