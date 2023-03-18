@@ -51,24 +51,23 @@ void static_rect::build(){
                 gl_Position = vec4(0, 0, 0, 1);
 
 
+                gl_Position.xy = vs_in[0].point;
                 texcoord_frag = vs_in[0].texcoord;
-                gl_Position.x = vs_in[0].point.x;
-                gl_Position.y = vs_in[0].point.y;
                 EmitVertex();
 
-                texcoord_frag = vec2(vs_in[0].texcoord.x, vs_in[0].texcoord.y+tex_size.y);
-                // gl_Position.x = vs_in[0].point.x;
+
                 gl_Position.y = vs_in[0].point.y - rect_size.y;
+                texcoord_frag.y = vs_in[0].texcoord.y + tex_size.y;
                 EmitVertex();
 
-                texcoord_frag = vec2(vs_in[0].texcoord.x+tex_size.x, vs_in[0].texcoord.y);
-                gl_Position.x = vs_in[0].point.x + rect_size.x;
-                gl_Position.y = vs_in[0].point.y;
+
+                gl_Position.xy = vec2(vs_in[0].point.x + rect_size.x, vs_in[0].point.y);
+                texcoord_frag = vec2(vs_in[0].texcoord.x + tex_size.x, vs_in[0].texcoord.y);
                 EmitVertex();
 
-                texcoord_frag = vec2(vs_in[0].texcoord.x+tex_size.x, vs_in[0].texcoord.y+tex_size.y);
-                // gl_Position.x = vs_in[0].point.x + rect_size.x;
+
                 gl_Position.y = vs_in[0].point.y - rect_size.y;
+                texcoord_frag.y = vs_in[0].texcoord.y + tex_size.y;
                 EmitVertex();
 
                 EndPrimitive();

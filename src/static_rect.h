@@ -35,8 +35,8 @@ public:
     static_rect();
 
     void build();
-    void draw(u16) const;
     void use() const;
+    void draw(u16) const;
 
     void setTexture(GL::texture*);
     void setRectPoints(std::vector<GLfloat> const&) const;
@@ -51,6 +51,10 @@ public:
 
     [[nodiscard]] inline bool is_ready() const {
         return ready;
+    }
+
+    inline void flush() const {
+        glFlush();
     }
 
 };
