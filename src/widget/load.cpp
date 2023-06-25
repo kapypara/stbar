@@ -1,16 +1,11 @@
-#include <fstream>
+#include <sys/sysinfo.h>
 #include "types.h"
 
 u64 getSystemLoad() {
 
-    float load_value;
-    std::ifstream load_file("/proc/loadavg");
+    struct sysinfo info;
 
-    if(!load_file.is_open()) [[unlikely]]
-        return 0;
+    sysinfo(&info);
 
-    load_file >> load_value;
-
-    return (u64)(load_value*100);
+    return info.loads[0] / ((1 << SI_LOAD_SHIFT) / 100);
 }
-
