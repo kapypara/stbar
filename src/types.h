@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <mutex>
 #include <numeric>
+#include <string>
 #include <utility>
 #include <vector>
 

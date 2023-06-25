@@ -123,115 +123,66 @@ void output_line::segmentsInit(){
         slots.push_back(cord);
     }
 
-    time = {
-        { slots.end()-time_segment.start_offset, slots.end()-time_segment.end_offset},
-        y_pos, time_segment.draw_offset,
-        time_segment.color
-    };
+    time = { time_segment, slots, y_pos }; 
     clearSegment(time);
 
-
-    free_memory = {
-        {slots.end()-free_memory_segment.start_offset, slots.end()-free_memory_segment.end_offset},
-        y_pos, free_memory_segment.draw_offset,
-        free_memory_segment.color
-    };
+    free_memory = { free_memory_segment, slots, y_pos };
     clearSegment(free_memory);
     drawSegment(free_memory, u"\n\n,\n\n\n");
 
 
-    cpu_usage = {
-        {slots.end()-cpu_usage_segment.start_offset, slots.end()-cpu_usage_segment.end_offset},
-        y_pos, cpu_usage_segment.draw_offset,
-        cpu_usage_segment.color
-    };
+    cpu_usage = { cpu_usage_segment, slots, y_pos };
     clearSegment(cpu_usage);
     drawSegment(cpu_usage, u"\n\n\n");
 
 
-    temperature = {
-        {slots.end()-temperature_segment.start_offset, slots.end()-temperature_segment.end_offset},
-        y_pos, temperature_segment.draw_offset,
-        temperature_segment.color
-    };
+    temperature = { temperature_segment, slots, y_pos };
     clearSegment(temperature);
     drawSegment(temperature, u"\n\n");
 
 
-    system_load = {
-        {slots.end()-system_load_segment.start_offset, slots.end()-system_load_segment.end_offset},
-        y_pos, system_load_segment.draw_offset,
-        system_load_segment.color
-    };
+    system_load = { system_load_segment, slots, y_pos };
     clearSegment(system_load);
     drawSegment(system_load, u"\n\n.\n\n");
 
 
-    free_space = {
-        {slots.end()-free_space_segment.start_offset, slots.end()-free_space_segment.end_offset},
-        y_pos, free_space_segment.draw_offset,
-        free_space_segment.color
-    };
+    free_space = { free_space_segment, slots, y_pos };
     clearSegment(free_space);
     drawSegment(free_space, u"\n\n\n\n.\n\n\nG");
 
 
-    dirty_memory = {
-        {slots.end()-dirty_memory_segment.start_offset, slots.end()-dirty_memory_segment.end_offset},
-        y_pos, dirty_memory_segment.draw_offset,
-        dirty_memory_segment.color
-    };
+    dirty_memory = { dirty_memory_segment, slots, y_pos };
     clearSegment(dirty_memory);
     drawSegment(dirty_memory, u"\n\n\n.\n\n");
 
 
-    io_write = {
-        {slots.end()-io_write_segment.start_offset, slots.end()-io_write_segment.end_offset},
-        y_pos, io_write_segment.draw_offset,
-        io_write_segment.color
-    };
+    io_write = { io_write_segment, slots, y_pos };
     clearSegment(io_write);
     drawSegment(io_write, u"\n\n\n.\n\n");
 
 
-    io_read = {
-        {slots.end()-io_read_segment.start_offset, slots.end()-io_read_segment.end_offset},
-        y_pos, io_read_segment.draw_offset,
-        io_read_segment.color
-    };
+    io_read = { io_read_segment, slots, y_pos };
     clearSegment(io_read);
     drawSegment(io_read, u"\n\n\n.\n\n");
 
-    net_tx = {
-        {slots.end()-net_tx_segment.start_offset, slots.end()-net_tx_segment.end_offset},
-        y_pos, net_tx_segment.draw_offset,
-        net_tx_segment.color
-    };
+    net_tx = { net_tx_segment, slots, y_pos };
     clearSegment(net_tx);
     drawSegment(net_tx, u"\n\n\n.\n\n");
 
-    net_rx = {
-        {slots.end()-net_rx_segment.start_offset, slots.end()-net_rx_segment.end_offset},
-        y_pos, net_rx_segment.draw_offset,
-        net_rx_segment.color
-    };
+    net_rx = { net_rx_segment, slots, y_pos };
     clearSegment(net_rx);
     drawSegment(net_rx, u"\n\n\n.\n\n");
 
 
-    sound_button = {
-        {slots.end()-sound_button_segment.start_offset, slots.end()-sound_button_segment.end_offset},
-        y_pos, sound_button_segment.draw_offset,
-        sound_button_segment.color
-    };
+    sound_button = { sound_button_segment, slots, y_pos };
     clearSegment(sound_button);
     drawSegment(sound_button, u"");
 
 
     window_title = {
+        window_title_segment,
+        y_pos,
         {slots.begin(), slots.end()-window_title_segment.end_offset},
-        y_pos, window_title_segment.draw_offset,
-        window_title_segment.color
     };
     clearSegment(window_title);
 

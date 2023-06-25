@@ -32,7 +32,7 @@ io_t getIoStat(){
         stat_file >> devices_name;
 
         // TODO add sda support to this update
-        if (devices_name.compare(0, 6, "mmcblk") == 0) { [[likely]]
+        if (devices_name.compare(0, 6, "mmcblk") == 0 || devices_name.compare(0, 2, "sd") == 0) { [[likely]]
 
             // checking if devices_name is not a volume parathion
             if (devices_name[devices_name.length()-2] != 'p') { [[unlikely]]

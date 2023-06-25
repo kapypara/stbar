@@ -4,6 +4,8 @@
 #include "font.h"
 #include "types.h"
 
+#include "widget/widgets_default.h"
+
 #include <functional>
 #include <string>
 
@@ -19,6 +21,27 @@ class segment_draw {
 
 public:
     segment_draw() = default;
+
+    segment_draw(segment_static_info const& seg,
+                 std::span<float> const& slots, float const y_poistion) 
+        : slots({slots.end()-seg.start_offset, slots.end()-seg.end_offset})
+        , y_offset(y_poistion)
+        , char_offset(seg.draw_offset)
+        , limit(this->slots.size())
+        , color(seg.color)
+    {}
+
+
+    segment_draw(segment_static_info const& seg, float const y_poistion,
+                 std::span<float> const& x_poistion)
+        : slots(x_poistion.begin(), x_poistion.end())
+        , y_offset(y_poistion)
+        , char_offset(seg.draw_offset)
+        , limit(this->slots.size())
+        , color(seg.color)
+    {}
+
+    // old API
     segment_draw(std::span<float> const& x_poistion, float y_poistion,
             u16 offset, vec4 const& new_color) 
         : slots(x_poistion.begin(), x_poistion.end())

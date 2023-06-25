@@ -1,3 +1,5 @@
+#pragma once
+
 #include "../segment.h"
 
 static consteval vec4 c2v(u32 RGBA){

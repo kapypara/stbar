@@ -63,7 +63,7 @@ void windowName::getActiveWindow() {
             current_window = *new_window;
             window_name = getWindowName(current_window);
 
-            if(window_name != window_name_old && window_name.length() != 0) { [[likely]]
+            if(window_name != window_name_old) { [[likely]]
 
                 setName(window_name);
                 window_name_old = window_name;
@@ -74,7 +74,7 @@ void windowName::getActiveWindow() {
 
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-        XSelectInput(dpy, current_window, PropertyChangeMask);
+        XSelectInput(dpy, current_window, PropertyChangeMask | FocusChangeMask);
         XNextEvent(dpy, &e);
     }
 }

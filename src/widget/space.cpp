@@ -8,6 +8,7 @@
 
 u64 getPathFreeSpace(const char *path);
 
+// FIXME handle repated mounted volumes
 u64 getFreeSpace() {
 
     std::FILE* mount_point = std::fopen("/proc/mounts", "r");
@@ -15,7 +16,7 @@ u64 getFreeSpace() {
 
     u64 bytes = 0;
 
-    if(!mount_point) [[unlikely]]
+    if(mount_point == nullptr) [[unlikely]]
         return 0;
 
     if (mount_point) {
