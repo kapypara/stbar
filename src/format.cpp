@@ -9,18 +9,22 @@ inline constexpr T bitSelect(C condition, T ifTrue, T ifFalse){
 
 inline u64 format::toBCD(u64 binary_num){
 
-    u64 bcd = 0;
-
 #if 1
 
-    u8 bcd_arr[10];
-    double a = binary_num;
+    u8 bcd[10];
 
-    asm("fbstp %0" : "=m" (bcd_arr[0]) : "t" (a) : "st");
+    asm("fildq %1\n"
+        "\tfbstp %0"
+        : "=m" (bcd)
+        : "m" (binary_num)
+        );
 
-    bcd = * reinterpret_cast<u64*>(bcd_arr);
+    binary_num = * reinterpret_cast<u64*>(bcd);
 
+    return binary_num;
 #else
+
+    u64 bcd = 0;
 
     for (u8 digit_bits=0; binary_num != 0; digit_bits+=4){
 
@@ -30,9 +34,10 @@ inline u64 format::toBCD(u64 binary_num){
 
         binary_num = digit.quot;
     }
+
+    return binary_num;
 #endif
 
-    return bcd;
 }
 
 inline constexpr u64 format::fromBCD(u64 bcd_num){
