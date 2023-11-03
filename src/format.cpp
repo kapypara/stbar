@@ -19,9 +19,7 @@ inline u64 format::toBCD(u64 binary_num){
         : "m" (binary_num)
         );
 
-    binary_num = * reinterpret_cast<u64*>(bcd);
-
-    return binary_num;
+    return * reinterpret_cast<u64*>(bcd);
 #else
 
     u64 bcd = 0;
