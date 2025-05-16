@@ -1,5 +1,6 @@
 #include "texture.h"
-#include "SOIL/SOIL.h"
+#include <vector>
+#include "../lib/lodepng.h"
 
 void GL::texture::create(){
     glGenTextures(1, &id);
@@ -12,10 +13,14 @@ void GL::texture::create(){
 
 void GL::texture::load(const char *image){
 
-    unsigned char* tex = SOIL_load_image(image, &width, &height, nullptr, SOIL_LOAD_RGBA);
+    unsigned int width, height;
+
+    std::vector<unsigned char> tex;
+    lodepng::decode(tex, width, height, image, LCT_RGBA, 8);
+
+    this->width = width;
+    this->height = height;
 
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, tex);
-
-    SOIL_free_image_data(tex);
+                 GL_UNSIGNED_BYTE, tex.data());
 }

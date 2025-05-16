@@ -22,7 +22,9 @@ set(widget_src
     src/widget/space.cpp
     src/widget/sound.cpp
     src/widget/window.cpp
-    )
+    lib/lodepng.cpp
+    lib/lodepng.h
+)
 
 add_executable(stbar_v4
     main.cpp
@@ -50,7 +52,7 @@ add_executable(stbar_v4
 
 set(CMAKE_CXX_FLAGS "\
     -std=c++20 -Wall -O3 -g -flto=auto \
-    -lpthread -lX11 -lXrender -lGL -lGLEW -lm -lSOIL"
+    -lpthread -lX11 -lXrender -lGL -lGLEW -lm"
     )
 add_definitions(
     -DUSE_GLX_CREATE_WINDOW

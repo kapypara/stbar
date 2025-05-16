@@ -16,7 +16,8 @@ int main() {
 
     renderer ren;
 
-    ren.setWindow(0, 0, 1280, 14+3);
+    ren.setWindow(0, 0, 1920, 14+3);
+    // ren.setWindow(0, 0, 1280, 14+3);
     // ren.setWindow(0, 1024-14, 1280, 14);
 
     ren.setDockMode();
