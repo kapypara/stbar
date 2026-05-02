@@ -1,21 +1,10 @@
 const std = @import("std");
-const stbar_v4 = @import("stbar_v4");
 const Renderer = @import("Renderer.zig").Renderer;
-
-// Import the C/C++ headers
-// const c = @cImport({
-//     @cInclude("font.h");
-//     @cInclude("gl/texture.h");
-//     @cInclude("output.h");
-//     @cInclude("static_rect.h");
-//     @cInclude("types.h");
-//     @cInclude("GL/glew.h"); // For GL_COLOR_BUFFER_BIT etc.
-// });
+const Ticker = @import("Ticker.zig").Ticker;
 
 pub fn main() !void {
     // Prints to stderr, ignoring potential errors.
     std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    try stbar_v4.bufferedPrint();
 
     // 1. Initialize Renderer
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -33,26 +22,23 @@ pub fn main() !void {
     try renderer.init(0, 0, 1920, 30);
     defer renderer.window.deinit(); // Clean up X11/GL resources
 
+    var ticker = try Ticker(60, 10).init();
+    var isWorkTick = true;
+
     // 4. Main Loop
     while (renderer.window.running) {
         renderer.handleEvents(); // Internally calls window.updateTheMessageQueue
         
-        renderer.update();
-        renderer.render();
+        if (isWorkTick) {
+            std.debug.print("Work Time !!\n", .{});
+            renderer.update();
+            renderer.render();
+        }
+
         renderer.swap();
-        
-        // Optional: slow down loop
-        std.time.sleep(16 * std.time.ns_per_ms); 
+        isWorkTick = ticker.tick();
     }
     
-    // Zig calls to C++ methods require a wrapper (see Step 2 below)
-    // c.renderer_setWindow(&ren, 0, 0, 1920, 14 + 3);
-    // c.renderer_setDockMode(&ren);
-    // c.renderer_init(&ren);
-
-    // c.glClearColor(0, 0, 0, 0);
-    // c.glClear(c.GL_COLOR_BUFFER_BIT);
-
     // 2. Setup Static Rect
     // var dp: c.static_rect = undefined;
     // c.static_rect_build(&dp);
