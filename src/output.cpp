@@ -174,9 +174,9 @@ void output_line::segmentsInit(){
     drawSegment(net_rx, u"\n\n\n.\n\n");
 
 
-    sound_button = { sound_button_segment, slots, y_pos };
-    clearSegment(sound_button);
-    drawSegment(sound_button, u"");
+    //sound_button = { sound_button_segment, slots, y_pos };
+    //clearSegment(sound_button);
+    //drawSegment(sound_button, u"");
 
 
     window_title = {
@@ -334,7 +334,7 @@ void output_line::handleClick(const u16 x_pos, const u8 button){
 
         break;
 
-        case sound_button_segment.end_offset+1 ... sound_button_segment.start_offset:
+        /*case sound_button_segment.end_offset+1 ... sound_button_segment.start_offset:
 
             sound_button_state = !sound_button_state;
             if(sound_button_state){
@@ -347,7 +347,7 @@ void output_line::handleClick(const u16 x_pos, const u8 button){
 
             }
 
-        break;
+        break;*/
 
         default: // window title
 

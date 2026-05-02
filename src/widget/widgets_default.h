@@ -58,8 +58,8 @@ constexpr segment_static_info io_read_segment = add_after_segment(io_write_segme
 constexpr segment_static_info net_tx_segment = add_after_segment(io_read_segment, 10, 0, 1, c2v(0x43843CCC));
 constexpr segment_static_info net_rx_segment = add_after_segment(net_tx_segment, 9, 0, 1, c2v(0x43843CCC));
 
-constexpr segment_static_info sound_button_segment = add_after_segment(net_rx_segment, 4, 0, 1, c2v(0x5A938FCC));
-constexpr segment_static_info window_title_segment(0, sound_button_segment.start_offset, 1, c2v(0x00000077));
+//constexpr segment_static_info sound_button_segment = add_after_segment(net_rx_segment, 4, 0, 1, c2v(0x5A938FCC));
+constexpr segment_static_info window_title_segment(0, net_rx_segment.start_offset, 1, c2v(0x00000077));
 
 // int ptr = printf("%f%f%f%f\n", xv.x, xv.y, xv.z, xv.w);
 
