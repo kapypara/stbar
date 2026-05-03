@@ -2,6 +2,7 @@ const std = @import("std");
 const Window = @import("Window.zig");
 const c = Window.c;
 
+/// Dummy Rednerer to tset if window is working
 pub const Renderer = struct {
     window: Window.Window,
     initialized: bool = false,
@@ -15,9 +16,6 @@ pub const Renderer = struct {
 
         try self.window.createTheWindow();
         try self.window.createTheRenderContext();
-
-        c.glewExperimental = c.GL_TRUE;
-        _ = c.glewInit();
         
         self.initialized = true;
     }

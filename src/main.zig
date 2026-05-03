@@ -1,5 +1,5 @@
 const std = @import("std");
-const Renderer = @import("Renderer.zig").Renderer;
+const Window = @import("Window.zig").Window;
 const Ticker = @import("Ticker.zig").Ticker;
 
 pub fn main() !void {
@@ -11,31 +11,31 @@ pub fn main() !void {
     defer _ = gpa.deinit();
 
     // 1. Initialize the struct
-    var renderer = Renderer{
-        .window = .{}, // Default Window values
+    var window = Window{
+        .docked = true,
     };
-    
-    // 2. Setup your mode
-    renderer.window.docked = true;
-    
+
     // 3. Call Init
-    try renderer.init(0, 0, 1920, 30);
-    defer renderer.window.deinit(); // Clean up X11/GL resources
+    try window.init(0, 0, 1920, 30);
+    defer window.deinit(); // Clean up X11/GL resources
 
     var ticker = try Ticker(60, 10).init();
     var isWorkTick = true;
 
     // 4. Main Loop
-    while (renderer.window.running) {
-        renderer.handleEvents(); // Internally calls window.updateTheMessageQueue
+    while (window.running) {
+        window.updateTheMessageQueue();
         
         if (isWorkTick) {
             std.debug.print("Work Time !!\n", .{});
-            renderer.update();
-            renderer.render();
+            window.updateViewport();
+
+            // TODO add render code
+            // renderer.render();
         }
 
-        renderer.swap();
+        // optional swap code
+        // window.swapBuffers();
         isWorkTick = ticker.tick();
     }
     
@@ -74,23 +74,4 @@ pub fn main() !void {
     // c.output_line_output(&bar);
 
     std.debug.print("Bar initialized successfully.\n", .{});
-}
-
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
-    };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
 }

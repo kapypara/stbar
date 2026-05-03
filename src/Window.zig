@@ -10,6 +10,8 @@ pub const c = @cImport({
     @cInclude("X11/Xutil.h");
 });
 
+const USE_GLX_CREATE_WINDOW = 1;
+
 pub const Window = struct {
     display: ?*c.Display = null,
     x_screen: i32 = 0,
@@ -34,6 +36,16 @@ pub const Window = struct {
     last_click: Click = .{ .x = 0, .y = 0, .button = 0 },
 
     const Click = struct { x: i32, y: i32, button: u32 };
+
+    pub fn init(self: *Window, x: i32, y: i32, width: i32, height: i32) !void {
+        self.x = x;
+        self.y = y;
+        self.width = width;
+        self.height = height;
+
+        try self.createTheWindow();
+        try self.createTheRenderContext();
+    }
 
     pub fn deinit(self: *Window) void {
         if (self.display) |dpy| {
@@ -108,12 +120,9 @@ pub const Window = struct {
         if (self.handle == 0) return error.CreateWindowFailed;
 
         // In your C++ code: glX_window_handle = window_handle (if USE_GLX_CREATE_WINDOW is 0)
-        const USE_GLX_CREATE_WINDOW = 1;
-
         if (USE_GLX_CREATE_WINDOW == 0) {
             self.glx_handle = self.handle;
         } else {
-
             const glx_attr = [_]i32{c.None};
             self.glx_handle = c.glXCreateWindow(dpy, self.fbconfig, self.handle, &glx_attr);
         }
@@ -170,6 +179,11 @@ pub const Window = struct {
         if (c.glXMakeContextCurrent(dpy, self.glx_handle, self.glx_handle, self.render_context) == 0) {
             return error.MakeContextCurrentFailed;
         }
+
+        if (USE_GLX_CREATE_WINDOW == 1) {
+            c.glewExperimental = c.GL_TRUE;
+            _ = c.glewInit();
+        }
     }
 
     pub fn updateTheMessageQueue(self: *Window) void {
@@ -202,5 +216,13 @@ pub const Window = struct {
     fn waitForMapNotify(_: ?*c.Display, ev: [*c]c.XEvent, arg: [*c]u8) callconv(.c) i32 {
         const handle = @as(*c.Window, @ptrCast(@alignCast(arg))).*;
         return if (ev.*.type == c.MapNotify and ev.*.xmap.window == handle) 1 else 0;
+    }
+
+    pub fn updateViewport(self: *Window) void {
+        c.glViewport(0, 0, self.width, self.height);
+    }
+
+    pub fn swapBuffers(self: *Window) void {
+        c.glXSwapBuffers(self.display, self.glx_handle);
     }
 };
