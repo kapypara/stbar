@@ -111,10 +111,17 @@ pub const RectDraw = struct {
         self.ready = true;
     }
 
+    /// Calls a GLEW-style function pointer getter and executes it with one argument
+    fn gl(getter: anytype, args: anytype) void {
+        if (getter()) |func| {
+            @call(.auto, func, args);
+        }
+    }
+
     pub fn deinit(self: *RectDraw) void {
-        c.glDeleteProgram(self.program);
-        c.glDeleteBuffers(2, &self.vbos);
-        c.glDeleteVertexArrays(1, &self.vao);
+        gl(c.glDeleteProgram, .{self.program});
+        gl(c.glDeleteBuffers, .{2, &self.vbos});
+        gl(c.glDeleteVertexArrays, .{1, &self.vao});
         self.ready = false;
     }
 

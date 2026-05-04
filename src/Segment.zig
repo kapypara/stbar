@@ -1,55 +1,32 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const MetricTag = @import("metrics.zig").MetricTag;
 
 pub const SegmentType = enum {
     average,
     rate_of_change,
 };
 
-pub const SegmentDraw = struct {
-    slots: []f32,
-    y_offset: f32,
-    char_offset: u16,
-    limit: u16,
-    color: [4]f32, // Assuming vec4 is 4 floats
-    allocator: Allocator,
-
-    pub fn init(allocator: Allocator, x_positions: []const f32, y_pos: f32, offset: u16, color: [4]f32) !SegmentDraw {
-        const slots = try allocator.alloc(f32, x_positions.len);
-        @memcpy(slots, x_positions);
-        return .{
-            .slots = slots,
-            .y_offset = y_pos,
-            .char_offset = offset,
-            .limit = @intCast(slots.len),
-            .color = color,
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *SegmentDraw) void {
-        self.allocator.free(self.slots);
-    }
-
-    pub fn setSlots(self: *SegmentDraw, x_positions: []const f32) !void {
-        if (x_positions.len != self.slots.len) {
-            self.slots = try self.allocator.realloc(self.slots, x_positions.len);
-        }
-        @memcpy(self.slots, x_positions);
-        self.limit = @intCast(self.slots.len);
-    }
-};
-
 pub const Segment = struct {
-    draw: SegmentDraw, // Composition instead of inheritance
+
+    metric_type: MetricTag,
     last: u64 = 0,
     state_type: SegmentType = .average,
     step_limit: u8 = 0,
-    ticks: []u64,
-    transition_values: []u64,
+    ticks: []u64 = undefined,
+    transition_values: []u64 = undefined,
+
+
+    // From Segment Draw
+    slots: []f32 = undefined,
+    y_offset: f32 = undefined,
+    char_offset: u16 = undefined,
+    limit: u16 = undefined,
+    color: [4]f32 = undefined, // Assuming vec4 is 4 floats
+    allocator: Allocator = undefined,
 
     // Equivalent to operator() setup
-    pub fn initData(self: *Segment, allocator: Allocator, memory_size: u16, transition_size: u16, use: SegmentType) !void {
+    pub fn initData(self: *Segment, allocator: Allocator, memory_size: u16, transition_size: u16, use: SegmentType, x_pos: []f32, y_pos: f32, offset: u16, color: [4]f32) !void {
         self.state_type = use;
         self.ticks = try allocator.alloc(u64, memory_size);
         @memset(self.ticks, 0);
@@ -59,6 +36,18 @@ pub const Segment = struct {
 
         // log2 for u32
         self.step_limit = @intCast(std.math.log2(@as(u32, transition_size)));
+
+
+        // From Segment Draw
+        const slots = try allocator.alloc(f32, x_pos);
+        @memcpy(slots, x_pos);
+
+            self.slots = slots;
+            self.y_offset = y_pos;
+            self.char_offset = offset;
+            self.limit = @intCast(slots.len);
+            self.color = color;
+            self.allocator = allocator;
     }
 
     pub fn deinit(self: *Segment) void {
@@ -66,6 +55,14 @@ pub const Segment = struct {
         allocator.free(self.ticks);
         allocator.free(self.transition_values);
         self.draw.deinit();
+    }
+
+    pub fn setSlots(self: *Segment, x_positions: []const f32) !void {
+        if (x_positions.len != self.slots.len) {
+            self.slots = try self.allocator.realloc(self.slots, x_positions.len);
+        }
+        @memcpy(self.slots, x_positions);
+        self.limit = @intCast(self.slots.len);
     }
 
     pub fn ticksSum(self: Segment) u64 {

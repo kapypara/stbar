@@ -34,9 +34,17 @@ pub const NetStat = struct {
     }
 };
 
-// --- Metric Union ---
+pub const MetricTag = enum {
+    cpu,
+    memory,
+    io,
+    net,
+    temp,
+    load,
+    window,
+};
 
-pub const Metric = union(enum) {
+pub const Metric = union(MetricTag) {
     cpu: CpuProbe,
     memory: MemProbe,
     io: IoProbe,

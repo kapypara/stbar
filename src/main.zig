@@ -1,6 +1,7 @@
 const std = @import("std");
 const Window = @import("Window.zig").Window;
 const Ticker = @import("Ticker.zig").Ticker;
+const StatusMonitor = @import("StatusMonitor.zig").StatusMonitor;
 
 pub fn main() !void {
     // Prints to stderr, ignoring potential errors.
@@ -9,6 +10,8 @@ pub fn main() !void {
     // 1. Initialize Renderer
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
+
+    const allocator = gpa.allocator();
 
     // 1. Initialize the struct
     var window = Window{
@@ -21,6 +24,9 @@ pub fn main() !void {
 
     var ticker = try Ticker(60, 10).init();
     var isWorkTick = true;
+
+    var monitor = try StatusMonitor.init(allocator, 10, 10);
+    defer monitor.deinit();
 
     // 4. Main Loop
     while (window.running) {

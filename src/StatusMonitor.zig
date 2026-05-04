@@ -1,84 +1,55 @@
 const std = @import("std");
-const segment = @import("segment.zig");
-const renderer = @import("renderer.zig");
-const types = @import("types.zig");
-const format = @import("format.zig");
-
-// Assuming these are defined elsewhere in your Zig project
-const Rect = types.Rect;
-const Font = types.Font;
-const Segment = segment.Segment;
-const SegmentDraw = segment.SegmentDraw;
+const Segment= @import("Segment.zig").Segment;
+const RectDraw = @import("RectDraw.zig").RectDraw;
+const FontAtlas = @import("FontAtlas.zig").FontAtlas;
 
 pub const StatusMonitor = struct {
     allocator: std.mem.Allocator,
-    screen: *renderer.Renderer,
-    rect: *Rect,
-    font_cache: *Font,
+    rect: RectDraw,
+    font: FontAtlas,
 
     // Timing
-    tick_rate: u8,
-    update_rate: u8,
-    update_interval: u8,
-    update_leftover: u8,
-    period_ns: u64,
-    start_time: i64,
-    program_counter: i64 = 0,
+    ticks: usize = 0,
+    update_smoothing: u8 = 0,
 
     // Segments
-    time: SegmentDraw,
-    free_memory: Segment,
-    cpu_usage: Segment,
-    temperature: Segment,
-    system_load: Segment,
-    free_space: Segment,
-    dirty_memory: Segment,
-    io_write: Segment,
-    io_read: Segment,
-    net_tx: Segment,
-    net_rx: Segment,
-    window_title: SegmentDraw,
+    // time: Segment = .{ .metric_type = .time },
+    free_memory: Segment = .{ .metric_type = .memory },
+    cpu_usage: Segment = .{ .metric_type = .cpu },
+    temperature: Segment = .{ .metric_type = .temp },
+    system_load: Segment = .{ .metric_type = .load },
+    // free_space: Segment = .{ .metric_type = . },
+    // dirty_memory: Segment = .{ .metric_type = . },
+    io: Segment = .{ .metric_type = .io },
+    net_tx: Segment = .{ .metric_type = .net },
+    window_title: Segment = .{ .metric_type = .window },
 
     // State
-    window_title_buf: std.ArrayList(u16),
+    window_title_buf: std.ArrayList(u16) = undefined,
     window_fetch_time: i64 = 0,
     window_name_rotation: u64 = 0,
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        scrn: *renderer.Renderer,
-        prep_rect: *Rect,
-        font: *Font,
-        tick: u8,
-        update: u8,
-    ) !StatusMonitor {
-        const actual_update = if (update > tick) update else tick;
-        
-        var self = StatusMonitor{
+    pub fn init(allocator: std.mem.Allocator, tick: u8, update: u8) !StatusMonitor {
+
+        // TODO validated (Rect, font
+        const self = StatusMonitor {
+            .rect = RectDraw.init(),
+            .font = try FontAtlas.loadFromJson(allocator, "assets/font/tamzen.json"),
+
+            .ticks = tick,
+            .update_smoothing = update,
+
             .allocator = allocator,
-            .screen = scrn,
-            .rect = prep_rect,
-            .font_cache = font,
-            .tick_rate = tick,
-            .update_rate = actual_update,
-            .update_interval = actual_update / tick,
-            .update_leftover = actual_update % tick,
-            .period_ns = (1_000_000_000 / @as(u64, actual_update)),
-            .start_time = std.time.nanoTimestamp(),
-            .window_title_buf = std.ArrayList(u16).init(allocator),
-            // Placeholders - initialized in segmentsInit
-            .time = undefined, .free_memory = undefined, .cpu_usage = undefined,
-            .temperature = undefined, .system_load = undefined, .free_space = undefined,
-            .dirty_memory = undefined, .io_write = undefined, .io_read = undefined,
-            .net_tx = undefined, .net_rx = undefined, .window_title = undefined,
+            .window_title_buf = .empty,
         };
 
-        try self.segmentsInit();
+        // try self.segmentsInit();
         return self;
     }
 
     pub fn deinit(self: *StatusMonitor) void {
-        self.window_title_buf.deinit();
+        self.window_title_buf.deinit(self.allocator);
+        self.rect.deinit();
     }
 
     fn segmentsInit(self: *StatusMonitor) !void {
@@ -88,16 +59,18 @@ pub const StatusMonitor = struct {
         const y_pos: f32 = 0.9 - (@as(f32, @floatFromInt(char_w)) / @as(f32, @floatFromInt(screen_w)));
 
         // Generate Slots (OpenGL Coordinates)
-        var slots = try self.allocator.alloc(f32, char_count + 1);
-        defer self.allocator.free(slots);
-        for (slots, 0..) |*slot, i| {
-            slot.* = (@as(f32, @floatFromInt(char_w * i)) / (@as(f32, @floatFromInt(screen_w)) / 2.0)) - 1.0;
-        }
+        // var slots = try self.allocator.alloc(f32, char_count + 1);
+        // defer self.allocator.free(slots);
+        // for (slots, 0..) |*slot, i| {
+        //     slot.* = (@as(f32, @floatFromInt(char_w * i)) / (@as(f32, @floatFromInt(screen_w)) / 2.0)) - 1.0;
+        // }
 
+        _ = y_pos;
+        _ = char_count;
         // Initialize segments (Simplified for brevity, following your C++ pattern)
         // In Zig, we'd likely pass a slice of slots to each segment
-        self.free_memory = Segment.init(segment.FREE_MEM_CONFIG, slots, y_pos);
-        self.drawSegment(u16, &self.free_memory, &[_]u16{ 0xE002, 0xE003 }); // Icon glyphs
+        // self.free_memory = Segment.init(segment.FREE_MEM_CONFIG, slots, y_pos);
+        // self.drawSegment(u16, &self.free_memory, &[_]u16{ 0xE002, 0xE003 }); // Icon glyphs
         
         // ... Repeat for other segments ...
     }
@@ -129,7 +102,7 @@ pub const StatusMonitor = struct {
 
     fn cycle(self: *StatusMonitor) !void {
         // Draw Time
-        self.drawSegment(u8, &self.time, format.getDate());
+        // self.drawSegment(u8, &self.time, format.getDate());
 
         var i: u8 = 0;
         while (i < self.tick_rate) : (i += 1) {
@@ -149,11 +122,13 @@ pub const StatusMonitor = struct {
             self.screen.clearClick();
         }
 
+        _ = tick_idx;
+
         // Zig Concurrency: Instead of std::async (which is heavy), 
         // we use a Thread Pool or simply sequential updates if latency is low.
         // For a status bar, sequential is often safer and easier to debug.
-        self.free_memory.newTick(tick_idx, format.getFreeMemory());
-        self.cpu_usage.newTick(tick_idx, format.getCpuUsage());
+        // self.free_memory.newTick(tick_idx, format.getFreeMemory());
+        // self.cpu_usage.newTick(tick_idx, format.getCpuUsage());
         // ... etc
     }
 

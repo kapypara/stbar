@@ -7,8 +7,8 @@ pub const FontAtlas = struct {
         uv: [2]f32,
 
         // Used for binary search
-        pub fn compareByCode(_: void, lhs: GlyphCoord, rhs: GlyphCoord) std.math.Order {
-            return std.math.order(lhs.code, rhs.code);
+        pub fn compareByCode(_: void, lhs: GlyphCoord, rhs: GlyphCoord) bool {
+            return std.math.order(lhs.code, rhs.code) == .lt;
         }
     };
 
@@ -53,39 +53,41 @@ pub const FontAtlas = struct {
         const file = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
         defer allocator.free(file);
 
-        var parser = std.json.Parser.init(allocator, .copy_strings_if_needed);
-        defer parser.deinit();
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            file,
+            .{}
+        );
+        defer parsed.deinit();
 
-        var tree = try parser.parse(file);
-        defer tree.deinit();
+        const root = parsed.value.object;
 
-        const root = tree.root.Object;
-
-        const columns = @as(u16, @intCast(root.get("columns").?.Integer));
-        const rows = @as(u16, @intCast(root.get("rows").?.Integer));
+        const columns = @as(u16, @intCast(root.get("columns").?.integer));
+        const rows = @as(u16, @intCast(root.get("rows").?.integer));
         
         const x_inc = 1.0 / @as(f32, @floatFromInt(columns));
         const y_inc = 1.0 / @as(f32, @floatFromInt(rows));
 
-        var glyph_list = std.ArrayList(GlyphCoord).init(allocator);
-        errdefer glyph_list.deinit();
+        var glyph_list: std.ArrayList(GlyphCoord) = .empty;
+        errdefer glyph_list.deinit(allocator);
 
-        const char_set = root.get("char_set").?.Array;
+        const char_set = root.get("char_set").?.array;
         for (char_set.items) |item| {
-            const obj = item.Object;
-            const type_str = obj.get("type").?.String;
+            const obj = item.object;
+            const type_str = obj.get("type").?.string;
             
-            const index = @as(u16, @intCast(obj.get("index").?.Integer));
-            const value = @as(u16, @intCast(obj.get("value").?.Integer));
+            const index = @as(u16, @intCast(obj.get("index").?.integer));
+            const value = @as(u16, @intCast(obj.get("value").?.integer));
 
             if (std.mem.eql(u8, type_str, "range")) {
-                const count = @as(u16, @intCast(obj.get("count").?.Integer));
+                const count = @as(u16, @intCast(obj.get("count").?.integer));
                 var i: u16 = 0;
                 while (i < count) : (i += 1) {
-                    try addGlyph(&glyph_list, index + i, value + i, columns, x_inc, y_inc);
+                    try addGlyph(allocator, &glyph_list, index + i, value + i, columns, x_inc, y_inc);
                 }
             } else {
-                try addGlyph(&glyph_list, index, value, columns, x_inc, y_inc);
+                try addGlyph(allocator, &glyph_list, index, value, columns, x_inc, y_inc);
             }
         }
 
@@ -94,21 +96,21 @@ pub const FontAtlas = struct {
 
         return FontAtlas{
             .allocator = allocator,
-            .name = try allocator.dupe(u8, root.get("name").?.String),
-            .bitmap_path = try allocator.dupe(u8, root.get("file").?.String),
-            .char_width = @as(u16, @intCast(root.get("char_width").?.Integer)),
-            .char_height = @as(u16, @intCast(root.get("char_height").?.Integer)),
+            .name = try allocator.dupe(u8, root.get("name").?.string),
+            .bitmap_path = try allocator.dupe(u8, root.get("file").?.string),
+            .char_width = @as(u16, @intCast(root.get("char_width").?.integer)),
+            .char_height = @as(u16, @intCast(root.get("char_height").?.integer)),
             .x_increment = x_inc,
             .y_increment = y_inc,
-            .glyphs = try glyph_list.toOwnedSlice(),
+            .glyphs = try glyph_list.toOwnedSlice(allocator),
         };
     }
 
-    fn addGlyph(list: *std.ArrayList(GlyphCoord), index: u16, value: u16, cols: u16, x_inc: f32, y_inc: f32) !void {
+    fn addGlyph(allocator: std.mem.Allocator, list: *std.ArrayList(GlyphCoord), index: u16, value: u16, cols: u16, x_inc: f32, y_inc: f32) !void {
         const col = @as(f32, @floatFromInt(index % cols));
         const row = @as(f32, @floatFromInt(index / cols));
 
-        try list.append(.{
+        try list.append(allocator, .{
             .code = value,
             .uv = .{ x_inc * col, y_inc * row },
         });
