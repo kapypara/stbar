@@ -2,11 +2,13 @@ const std = @import("std");
 const Segment= @import("Segment.zig").Segment;
 const RectDraw = @import("RectDraw.zig").RectDraw;
 const FontAtlas = @import("FontAtlas.zig").FontAtlas;
+const Window = @import("Window.zig").Window;
 
 pub const StatusMonitor = struct {
-    allocator: std.mem.Allocator,
-    rect: RectDraw,
-    font: FontAtlas,
+    allocator: std.mem.Allocator = undefined,
+    rect: RectDraw = undefined,
+    font: FontAtlas = undefined,
+    window: Window = undefined,
 
     // Timing
     ticks: usize = 0,
@@ -29,34 +31,32 @@ pub const StatusMonitor = struct {
     window_fetch_time: i64 = 0,
     window_name_rotation: u64 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, tick: u8, update: u8) !StatusMonitor {
-
-        // TODO validated (Rect, font
-        const self = StatusMonitor {
-            .rect = RectDraw.init(),
-            .font = try FontAtlas.loadFromJson(allocator, "assets/font/tamzen.json"),
-
-            .ticks = tick,
-            .update_smoothing = update,
-
-            .allocator = allocator,
-            .window_title_buf = .empty,
-        };
-
-        // try self.segmentsInit();
-        return self;
-    }
-
     pub fn deinit(self: *StatusMonitor) void {
         self.window_title_buf.deinit(self.allocator);
         self.rect.deinit();
+        self.font.deinit();
     }
 
-    fn segmentsInit(self: *StatusMonitor) !void {
-        const screen_w = self.screen.getWidth();
-        const char_w = self.font_cache.getCharWidth();
-        const char_count = screen_w / char_w;
-        const y_pos: f32 = 0.9 - (@as(f32, @floatFromInt(char_w)) / @as(f32, @floatFromInt(screen_w)));
+    pub fn init(self: *StatusMonitor, allocator: std.mem.Allocator, tick: u8, update: u8) !void {
+
+        // TODO validated Rect
+        self.rect = RectDraw.init();
+        self.font = try FontAtlas.loadFromJson(allocator, "assets/font/tamzen.json");
+
+        self.ticks = tick;
+        self.update_smoothing = update;
+
+        self.allocator = allocator;
+        self.window_title_buf = .empty;
+
+        const screen_w = self.window.width;
+        const char_w = self.font.char_width;
+
+        const char_count = @divTrunc(screen_w, char_w);
+
+        const sw: f32 = @floatFromInt(self.window.width);
+        const cw: f32 = @floatFromInt(self.font.char_width);
+        const y_pos: f32 = 0.9 - (cw / sw);
 
         // Generate Slots (OpenGL Coordinates)
         // var slots = try self.allocator.alloc(f32, char_count + 1);

@@ -25,7 +25,9 @@ pub fn main() !void {
     var ticker = try Ticker(60, 10).init();
     var isWorkTick = true;
 
-    var monitor = try StatusMonitor.init(allocator, 10, 10);
+    var monitor: StatusMonitor = .{};
+
+    try monitor.init(allocator, 10, 10);
     defer monitor.deinit();
 
     // 4. Main Loop
@@ -36,9 +38,12 @@ pub fn main() !void {
             std.debug.print("Work Time !!\n", .{});
             window.updateViewport();
 
-            // TODO add render code
-            // renderer.render();
+            // TODO add this
+            // monitor.update();
         }
+
+        // TODO add this
+        // monitor.render();
 
         // optional swap code
         // window.swapBuffers();
