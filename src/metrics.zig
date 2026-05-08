@@ -2,10 +2,13 @@ const std = @import("std");
 const fs = std.fs;
 const io = std.io;
 const mem = std.mem;
+const print = std.debug.print;
 
-const x11 = @cImport({
-    @cInclude("X11/Xlib.h");
-    @cInclude("X11/Xutil.h");
+const x11 = @import("Window.zig").c;
+
+const c = @cImport({
+    // @cInclude("sys/stat.h");
+    @cInclude("sys/statvfs.h");
 });
 
 // --- Data Structures ---
@@ -42,6 +45,8 @@ pub const MetricTag = enum {
     temp,
     load,
     window,
+    storage,
+    time,
 };
 
 pub const Metric = union(MetricTag) {
@@ -51,7 +56,9 @@ pub const Metric = union(MetricTag) {
     net: NetProbe,
     temp: TempProbe,
     load: LoadProbe,
-    window: WindowNameProbe, 
+    window: WindowNameProbe,
+    storage: StorageProbe,
+    time: TimeProbe,
 
     pub fn sample(self: *Metric) !void {
         return switch (self.*) {
@@ -62,6 +69,22 @@ pub const Metric = union(MetricTag) {
             .temp => |*p| p.sample(),
             .load => |*p| p.sample(),
             .window => |*p| p.sample(),
+            .storage => |*p| p.sample(),
+            .time => |*p| p.sample(),
+        };
+    }
+
+    pub fn init(tag: MetricTag) Metric {
+        return switch (tag) {
+            .cpu => .{ .cpu = .{} },
+            .memory => .{ .memory = .{} },
+            .io => .{ .io = .{} },
+            .net => .{ .net = .{} },
+            .temp => .{ .temp = .{} },
+            .load => .{ .load = .{} },
+            .window => .{ .window = .{} },
+            .storage => .{ .storage = .{} },
+            .time => .{ .time = .{} },
         };
     }
 };
@@ -76,7 +99,7 @@ pub const CpuProbe = struct {
     pub fn sample(self: *CpuProbe) !void {
         const file = try fs.openFileAbsolute("/proc/stat", .{});
         defer file.close();
-        var buf: [1024]u8 = undefined;
+        var buf: [128]u8 = undefined;
         const amt = try file.readAll(&buf);
 
         var it = mem.tokenizeAny(u8, buf[0..amt], " \n");
@@ -108,20 +131,25 @@ pub const MemProbe = struct {
     pub fn sample(self: *MemProbe) !void {
         const file = try fs.openFileAbsolute("/proc/meminfo", .{});
         defer file.close();
-        var reader = io.bufferedReader(file.reader());
-        var buf: [512]u8 = undefined;
 
-        while (try reader.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
-            var it = mem.tokenizeAny(u8, line, " :kbKB");
-            const label = it.next() orelse continue;
-            const val_str = it.next() orelse continue;
-            const val = try std.fmt.parseInt(u64, val_str, 10);
+        var buf: [2048]u8 = undefined;
+        const amt = try file.readAll(&buf);
+
+        var line_it = mem.tokenizeAny(u8, buf[0..amt], "\n");
+        while (line_it.next()) |line| {
+            var col_it = mem.tokenizeAny(u8, line, " :kbKB");
+            const label = col_it.next() orelse continue;
+            const val_str = col_it.next() orelse continue;
+            const val = std.fmt.parseInt(u64, val_str, 10) catch 0;
 
             if (mem.eql(u8, label, "MemFree")) {
                 self.free = val >> 10; // Convert KB to MB
             } else if (mem.eql(u8, label, "Dirty")) {
                 self.dirty = val >> 10;
             }
+
+            if (self.free != 0 and self.dirty != 0)
+                break;
         }
     }
 };
@@ -133,24 +161,48 @@ pub const IoProbe = struct {
     pub fn sample(self: *IoProbe) !void {
         const file = try fs.openFileAbsolute("/proc/diskstats", .{});
         defer file.close();
-        var reader = io.bufferedReader(file.reader());
-        var buf: [1024]u8 = undefined;
+
+        var buf: [2048]u8 = undefined;
+        const amt = try file.readAll(&buf);
 
         var raw = IoStat{};
-        while (try reader.reader().readUntilDelimiterOrEof(&buf, '\n')) |line| {
+
+        var line_it = mem.tokenizeAny(u8, buf[0..amt], "\n");
+        while (line_it.next()) |line| {
+
+            // print("{s:<120} | {d} B\n", .{line,  line.len});
+
             var it = mem.tokenizeAny(u8, line, " ");
             _ = it.next(); // major
             _ = it.next(); // minor
             const dev = it.next() orelse "";
-            
-            // Logic from source: target sd* and mmcblk* but skip partitions
-            if (mem.startsWith(u8, dev, "sd") or mem.startsWith(u8, dev, "mmcblk")) {
-                if (dev[dev.len-1] >= '0' and dev[dev.len-1] <= '9') continue; 
 
-                var i: usize = 0;
-                while (it.next()) |token| : (i += 1) {
-                    if (i == 3) raw.read += try std.fmt.parseInt(u64, token, 10);
-                    if (i == 7) raw.write += try std.fmt.parseInt(u64, token, 10);
+            const is_valid_dev =
+                mem.startsWith(u8, dev, "nvme") // NVMe
+                or mem.startsWith(u8, dev, "sd") // SATA/SCSI
+                or mem.startsWith(u8, dev, "mmcblk") // SD Cards/eMMC
+                // or mem.startsWith(u8, dev, "vd")  // VirtIO (VMs)
+                or mem.startsWith(u8, dev, "sr") // CD/DVD
+                or mem.startsWith(u8, dev, "fd") // Floppy
+                or mem.startsWith(u8, dev, "hd"); // IDE Disks
+
+            if (!is_valid_dev)
+                continue;
+
+            // Skip if it's an NVMe/MMC partition (contains 'p' before the end)
+            if (dev.len > 2 and dev[dev.len - 2] == 'p')
+                continue;
+
+            // Skip if it's an SD/HD/VD partition (e.g., sda1 is len 4, sda is len 3)
+            if ((mem.startsWith(u8, dev, "sd") or mem.startsWith(u8, dev, "hd")) and dev.len > 3)
+                continue;
+
+            var i: usize = 0;
+            while (it.next()) |token| : (i += 1) {
+                if (i == 3) raw.read += try std.fmt.parseInt(u64, token, 10);
+                if (i == 7) {
+                    raw.write += try std.fmt.parseInt(u64, token, 10);
+                    break;
                 }
             }
         }
@@ -166,23 +218,39 @@ pub const NetProbe = struct {
     prev: NetStat = .{},
     current: NetStat = .{},
 
+    const network_class = "/sys/class/net";
+
     pub fn sample(self: *NetProbe) !void {
-        // In a real loop, we would iterate /sys/class/net/ entries[cite: 1]
-        // This version uses fixed buffers to avoid runtime allocation
         var raw = NetStat{};
-        
-        // Simplified example for 'eth0' or similar
-        raw.rx = try readSysfsUint("/sys/class/net/enp0s3/statistics/rx_bytes");
-        raw.tx = try readSysfsUint("/sys/class/net/enp0s3/statistics/tx_bytes");
+
+        var dir = try std.fs.openDirAbsolute(network_class, .{ .iterate = true });
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind == .directory or entry.kind == .sym_link) {
+                if (std.mem.startsWith(u8, entry.name, "enp") or std.mem.startsWith(u8, entry.name, "eth") or std.mem.startsWith(u8, entry.name, "wlan")) {
+                    raw.rx += try readSysfsUint(entry.name, "rx_bytes");
+                    raw.tx += try readSysfsUint(entry.name, "tx_bytes");
+                }
+            }
+        }
 
         self.current = raw.diff(self.prev);
         self.prev = raw;
     }
 
-    fn readSysfsUint(path: []const u8) !u64 {
+    fn readSysfsUint(network_name: []const u8, comptime stat_name: []const u8) !u64 {
+        var buf: [64]u8 = undefined;
+
+        // /sys/class/net/{name}/statistics/tx_bytes
+        const path = std.fmt.bufPrint(&buf, "{s}/{s}/statistics/{s}", .{ network_class, network_name, stat_name }) catch |err| {
+            std.log.warn("error: {any} Interface name '{s}' is too long for buffer", .{ err, network_name });
+            return 0;
+        };
+
         const file = fs.openFileAbsolute(path, .{}) catch return 0;
         defer file.close();
-        var buf: [32]u8 = undefined;
         const amt = try file.readAll(&buf);
         return std.fmt.parseInt(u64, mem.trim(u8, buf[0..amt], " \n"), 10) catch 0;
     }
@@ -191,24 +259,144 @@ pub const NetProbe = struct {
 pub const TempProbe = struct {
     value: u64 = 0,
     pub fn sample(self: *TempProbe) !void {
-        const file = fs.openFileAbsolute("/sys/class/hwmon/hwmon2/temp1_input", .{}) catch return;
-        defer file.close();
-        var buf: [16]u8 = undefined;
-        const amt = try file.readAll(&buf);
-        self.value = (std.fmt.parseInt(u64, mem.trim(u8, buf[0..amt], " \n"), 10) catch 0) / 1000;
+        var buf: [64]u8 = undefined;
+        var dir = try std.fs.openDirAbsolute("/sys/class/hwmon", .{ .iterate = true });
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            const path = try std.fmt.bufPrint(&buf, "/sys/class/hwmon/{s}/name", .{entry.name});
+
+            const file = std.fs.openFileAbsolute(path, .{}) catch continue;
+            defer file.close();
+            const len = try file.readAll(&buf);
+            const driver_name = std.mem.trim(u8, buf[0..len], " \n");
+
+            // k10temp is AMD, coretemp is Intel
+            if (std.mem.eql(u8, driver_name, "k10temp") or std.mem.eql(u8, driver_name, "coretemp")) {
+                // Use this hwmonX directory!
+                const file_path = try std.fmt.bufPrint(&buf, "/sys/class/hwmon/{s}/temp1_input", .{entry.name});
+
+                const temp_file = fs.openFileAbsolute(file_path, .{}) catch return;
+                defer temp_file.close();
+                const amt = try temp_file.readAll(&buf);
+                self.value = (std.fmt.parseInt(u64, mem.trim(u8, buf[0..amt], " \n"), 10) catch 0) / 1000;
+            }
+        }
     }
 };
 
 pub const LoadProbe = struct {
     value: u64 = 0,
     pub fn sample(self: *LoadProbe) !void {
-        var info: std.os.linux.sysinfo = undefined;
+        var info: std.os.linux.Sysinfo = undefined;
         if (std.os.linux.sysinfo(&info) == 0) {
             self.value = info.loads[0] / ((@as(u64, 1) << 16) / 100);
         }
     }
 };
 
+pub const StorageProbe = struct {
+    free_bytes: u64 = 0,
+
+    pub fn sample(self: *StorageProbe) !void {
+        const file = try fs.openFileAbsolute("/proc/mounts", .{});
+        defer file.close();
+
+        // Fixed-size buffer to track seen devices without heap allocation
+        var seen_storage: [16][64]u8 = undefined;
+        var seen_count: usize = 0;
+
+        var total_free: u64 = 0;
+        var buf: [4096]u8 = undefined;
+        const amt = try file.readAll(&buf);
+
+        var line_it = mem.tokenizeAny(u8, buf[0..amt], "\n");
+        while (line_it.next()) |line| {
+            var col_it = mem.tokenizeAny(u8, line, " ");
+            const dev_name = col_it.next() orelse continue;
+            const mnt_dir = col_it.next() orelse continue;
+
+            const is_storage = mem.startsWith(u8, dev_name, "/dev/sd") or
+                mem.startsWith(u8, dev_name, "/dev/nvme") or
+                mem.startsWith(u8, dev_name, "/dev/mmcblk");
+
+            if (is_storage) {
+                // Check if we've seen this device name before
+                var already_seen = false;
+                for (seen_storage[0..seen_count]) |seen_name| {
+                    if (mem.eql(u8, dev_name, mem.sliceTo(&seen_name, 0))) {
+                        already_seen = true;
+                        break;
+                    }
+                }
+
+                if (!already_seen and seen_count < seen_storage.len) {
+                    var stat: c.struct_statvfs  = undefined;
+
+                    // statvfs needs a null-terminated string.
+                    // We can use a small stack buffer for the path.
+                    var path_buf: [256]u8 = undefined;
+                    if (mnt_dir.len < path_buf.len - 1) {
+                        @memcpy(path_buf[0..mnt_dir.len], mnt_dir);
+                        path_buf[mnt_dir.len] = 0;
+
+                        if (c.statvfs(&path_buf, &stat) == 0) {
+                            total_free += stat.f_bavail * stat.f_bsize;
+
+                            // Save device name to seen list
+                            const name_len = @min(dev_name.len, 63);
+                            @memcpy(seen_storage[seen_count][0..name_len], dev_name[0..name_len]);
+                            seen_storage[seen_count][name_len] = 0;
+                            seen_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.free_bytes = total_free;
+    }
+};
+
+pub const TimeProbe = struct {
+    value: [21]u8 = undefined,
+
+    // UTC+3 for bahrain time :)
+    const offset = 60 * 60 * 3;
+    const days = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    /// Formats the date into the provided buffer: "Fri May08 02:48:01 PM"
+    pub fn sample(self: *TimeProbe) !void {
+        const ts = std.time.timestamp() + offset;
+        const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
+        const day_secs = epoch.getDaySeconds();
+        const epoch_day = epoch.getEpochDay();
+        const year_day = epoch_day.calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+
+        // Calculate 12-hour clock
+        var hour = day_secs.getHoursIntoDay();
+        const am_pm = if (hour >= 12) "PM" else "AM";
+        hour = if (hour == 0) 12 else if (hour > 12) hour - 12 else hour;
+
+        // Calculate Day of Week
+        // EpochDay 0 was a Thursday.
+        const day_of_week_index = epoch_day.day % 7;
+
+        _ = try std.fmt.bufPrint(&self.value, "{s} {s}{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {s}", .{
+            days[day_of_week_index],
+            months[@intCast(month_day.month.numeric() - 1)],
+            month_day.day_index + 1,
+            hour,
+            day_secs.getMinutesIntoHour(),
+            day_secs.getSecondsIntoMinute(),
+            am_pm,
+        });
+
+        // print("{s}\n", .{self.value});
+    }
+};
 
 pub const WindowNameProbe = struct {
     display: ?*x11.Display = null,
@@ -230,7 +418,8 @@ pub const WindowNameProbe = struct {
     // This replaces your getActiveWindow loop logic
     pub fn sample(self: *WindowNameProbe) void {
         const display = self.display orelse return;
-        
+        if (self.root == 0) return;
+
         var actual_type: x11.Atom = 0;
         var actual_format: i32 = 0;
         var nitems: u64 = 0;
@@ -241,17 +430,17 @@ pub const WindowNameProbe = struct {
         const net_name = x11.XInternAtom(display, "_NET_WM_NAME", x11.False);
 
         // 1. Get the Active Window ID
-        if (x11.XGetWindowProperty(display, self.root, net_active, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == 0) {
+        if (x11.XGetWindowProperty(display, self.root, net_active, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == x11.Success) {
             if (prop != null and nitems > 0) {
                 const window_id = @as(*x11.Window, @ptrCast(@alignCast(prop))).*;
-                x11.XFree(prop);
+                _ = x11.XFree(prop);
 
                 // 2. Get the name of that Window
-                if (x11.XGetWindowProperty(display, window_id, net_name, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == 0) {
+                if (x11.XGetWindowProperty(display, window_id, net_name, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == x11.Success) {
                     if (prop != null and nitems > 0) {
                         const name_slice = prop[0..@min(nitems, 255)];
                         self.name_len = sanitizeName(name_slice, &self.current_name);
-                        x11.XFree(prop);
+                        _ = x11.XFree(prop);
                     }
                 }
             }
