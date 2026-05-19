@@ -45,7 +45,7 @@ pub const MetricTag = enum {
     temp,
     load,
     window,
-    storage,
+    free_storage,
     time,
 };
 
@@ -57,7 +57,7 @@ pub const Metric = union(MetricTag) {
     temp: TempProbe,
     load: LoadProbe,
     window: WindowNameProbe,
-    storage: StorageProbe,
+    free_storage: StorageProbe,
     time: TimeProbe,
 
     pub fn sample(self: *Metric) !void {
@@ -69,22 +69,8 @@ pub const Metric = union(MetricTag) {
             .temp => |*p| p.sample(),
             .load => |*p| p.sample(),
             .window => |*p| p.sample(),
-            .storage => |*p| p.sample(),
+            .free_storage => |*p| p.sample(),
             .time => |*p| p.sample(),
-        };
-    }
-
-    pub fn init(tag: MetricTag) Metric {
-        return switch (tag) {
-            .cpu => .{ .cpu = .{} },
-            .memory => .{ .memory = .{} },
-            .io => .{ .io = .{} },
-            .net => .{ .net = .{} },
-            .temp => .{ .temp = .{} },
-            .load => .{ .load = .{} },
-            .window => .{ .window = .{} },
-            .storage => .{ .storage = .{} },
-            .time => .{ .time = .{} },
         };
     }
 };

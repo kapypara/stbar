@@ -1,60 +1,86 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+
+const Metric = @import("metrics.zig").Metric;
 const MetricTag = @import("metrics.zig").MetricTag;
 
 pub const SegmentType = enum {
     average,
     rate_of_change,
+    message,
+};
+
+const ValueUnion = union {
+    int: u64,
+    message: []u8,
+};
+
+pub const MetricEntry = struct {
+    metric: Metric,
+    start_index: u16 = undefined, // index of first cell to use from Parent
+    sample: []u64 = undefined, // fetched metric samples
+    frames: []u64 = undefined, // frames to be rendered
 };
 
 pub const Segment = struct {
+    // last_value: ValueUnion = .{ .int = 0 },
+    // state_type: SegmentType = .average,
+    // step_limit: u8 = 0,
 
-    metric_type: MetricTag,
-    last: u64 = 0,
-    state_type: SegmentType = .average,
-    step_limit: u8 = 0,
-    ticks: []u64 = undefined,
-    transition_values: []u64 = undefined,
-
-
-    // From Segment Draw
-    slots: []f32 = undefined,
-    y_offset: f32 = undefined,
-    char_offset: u16 = undefined,
-    limit: u16 = undefined,
+    // ech segment have it's main color
     color: [4]f32 = undefined, // Assuming vec4 is 4 floats
-    allocator: Allocator = undefined,
+
+    cells: []i16 = undefined,
+    metrics: []MetricEntry,
+
+    y_offset: f32 = undefined,
+    // char_offset: u16 = undefined,
+    // limit: u16 = undefined,
+    // allocator: Allocator = undefined,
 
     // Equivalent to operator() setup
-    pub fn initData(self: *Segment, allocator: Allocator, memory_size: u16, transition_size: u16, use: SegmentType, x_pos: []f32, y_pos: f32, offset: u16, color: [4]f32) !void {
-        self.state_type = use;
+    // pub fn init(self: *Segment, allocator: Allocator, memory_size: u16, transition_size: u16, x_pos: []f32, y_pos: f32, offset: u16, color: [4]f32) !void {
+    pub fn init(self: *Segment, allocator: Allocator, memory_size: u16, transition_size: u16) !void {
         self.ticks = try allocator.alloc(u64, memory_size);
         @memset(self.ticks, 0);
-        
+
         self.transition_values = try allocator.alloc(u64, transition_size);
         @memset(self.transition_values, 0);
 
         // log2 for u32
         self.step_limit = @intCast(std.math.log2(@as(u32, transition_size)));
 
-
         // From Segment Draw
-        const slots = try allocator.alloc(f32, x_pos);
-        @memcpy(slots, x_pos);
+        // const slots = try allocator.alloc(f32, x_pos);
+        // @memcpy(slots, x_pos);
+        //
+        // self.slots = slots;
+        // self.y_offset = y_pos;
+        // self.char_offset = offset;
+        // self.limit = @intCast(slots.len);
+        // self.color = color;
+        // self.allocator = allocator;
 
-            self.slots = slots;
-            self.y_offset = y_pos;
-            self.char_offset = offset;
-            self.limit = @intCast(slots.len);
-            self.color = color;
-            self.allocator = allocator;
+        self.metric = Metric.init(self.metric_type);
     }
 
     pub fn deinit(self: *Segment) void {
-        const allocator = self.draw.allocator;
+        const allocator = self.allocator;
         allocator.free(self.ticks);
         allocator.free(self.transition_values);
-        self.draw.deinit();
+        // TODO
+        // self.draw.deinit();
+    }
+
+    pub fn update(self: *Segment) void {
+        // TODO
+        // allocate value in sample array
+        // compute frame array
+        for (self.metrics) |*meteric_entry| {
+            var m = &meteric_entry.metric;
+            _ = m.sample() catch {};
+            std.debug.print("{any}\n", .{m});
+        }
     }
 
     pub fn setSlots(self: *Segment, x_positions: []const f32) !void {

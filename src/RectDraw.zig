@@ -1,8 +1,9 @@
 const std = @import("std");
 
-/// Assuming you are linking against OpenGL via C import
 const c = @cImport({
-    @cInclude("GL/glew.h"); // Or your preferred GL loader
+    @cInclude("GL/glew.h");
+    @cInclude("GL/gl.h");
+    @cInclude("GL/glx.h");
 });
 
 pub const RectDraw = struct {
@@ -77,127 +78,213 @@ pub const RectDraw = struct {
         \\}
     ;
 
-    pub fn init() RectDraw {
-        return .{};
+    pub fn init() !RectDraw {
+        var r: RectDraw = .{};
+        try r.build();
+
+        return r;
     }
 
     pub fn build(self: *RectDraw) !void {
-        const vs = try compileShader(c.GL_VERTEX_SHADER, vs_source);
-        defer c.glDeleteShader(vs);
-        const gs = try compileShader(c.GL_GEOMETRY_SHADER, gs_source);
-        defer c.glDeleteShader(gs);
-        const fs = try compileShader(c.GL_FRAGMENT_SHADER, fs_source);
-        defer c.glDeleteShader(fs);
+        const vs = try compileshader(c.GL_VERTEX_SHADER, vs_source);
+        defer glew(c.glDeleteShader, .{vs}) catch {};
+        const gs = try compileshader(c.GL_GEOMETRY_SHADER, gs_source);
+        defer glew(c.glDeleteShader, .{gs}) catch {};
+        const fs = try compileshader(c.GL_FRAGMENT_SHADER, fs_source);
+        defer glew(c.glDeleteShader, .{fs}) catch {};
 
-        self.program = c.glCreateProgram();
-        c.glAttachShader(self.program, vs);
-        c.glAttachShader(self.program, gs);
-        c.glAttachShader(self.program, fs);
-        c.glLinkProgram(self.program);
+        self.program = try glew(c.glCreateProgram, .{});
+        try glew(c.glAttachShader, .{self.program, vs});
+        try glew(c.glAttachShader, .{self.program, gs});
+        try glew(c.glAttachShader, .{self.program, fs});
+        try glew(c.glLinkProgram, .{self.program});
 
         var status: c.GLint = 0;
-        c.glGetProgramiv(self.program, c.GL_LINK_STATUS, &status);
-        if (status == c.GL_FALSE) return error.ProgramLinkFailed;
+        try glew(c.glGetProgramiv, .{self.program, c.GL_LINK_STATUS, &status});
+        if (status == c.GL_FALSE) return error.programlinkfailed;
 
-        // Uniforms
-        self.u_rect_size = c.glGetUniformLocation(self.program, "rect_size");
-        self.u_tex_size = c.glGetUniformLocation(self.program, "tex_size");
-        self.u_bg = c.glGetUniformLocation(self.program, "bg");
+        // uniforms
+        self.u_rect_size = try glew(c.glGetUniformLocation, .{self.program, "rect_size"});
+        self.u_tex_size = try glew(c.glGetUniformLocation, .{self.program, "tex_size"});
+        self.u_bg = try glew(c.glGetUniformLocation, .{self.program, "bg"});
 
-        // Vertex Setup
-        c.glGenVertexArrays(1, &self.vao);
-        c.glGenBuffers(2, &self.vbos);
+        // vertex setup
+        try glew(c.glGenVertexArrays, .{1, &self.vao});
+        try glew(c.glGenBuffers, .{2, &self.vbos});
 
         self.ready = true;
     }
 
-    /// Calls a GLEW-style function pointer getter and executes it with one argument
-    fn gl(getter: anytype, args: anytype) void {
-        if (getter()) |func| {
-            @call(.auto, func, args);
-        }
-    }
 
     pub fn deinit(self: *RectDraw) void {
-        gl(c.glDeleteProgram, .{self.program});
-        gl(c.glDeleteBuffers, .{2, &self.vbos});
-        gl(c.glDeleteVertexArrays, .{1, &self.vao});
+        glew(c.glDeleteProgram, .{self.program}) catch {};
+        glew(c.glDeleteBuffers, .{2, &self.vbos}) catch {};
+        glew(c.glDeleteVertexArrays, .{1, &self.vao}) catch {};
         self.ready = false;
     }
 
-    pub fn use(self: RectDraw) void {
-        c.glBindVertexArray(self.vao);
-        c.glUseProgram(self.program);
+    pub fn use(self: RectDraw) !void {
+        try glew(c.glBindVertexArray, .{self.vao});
+        try glew(c.glUseProgram, .{self.program});
     }
 
-    pub fn setTexture(self: *RectDraw, tex_id: c.GLuint) void {
-        self.texture_id = tex_id;
+    pub fn loadTexture(self: *RectDraw, width: u16, height: u16, rgba_pixels: []const u8) !void {
+        var tex: c.GLuint = 0;
+        // Generate a texture handle
+        c.glGenTextures(1, &tex);
+        if (tex == 0) return error.TextureGenerationFailed;
+
+        // Temporarily bind it to configure its properties
+        c.glBindTexture(c.GL_TEXTURE_2D, tex);
+
+        // Set texture wrapping parameters (Clamp to edge avoids artifacts on thin borders)
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_S, c.GL_CLAMP_TO_EDGE);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_WRAP_T, c.GL_CLAMP_TO_EDGE);
+
+        // Set texture filtering parameters (GL_LINEAR for smooth scaling, or GL_NEAREST for pixel art)
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MIN_FILTER, c.GL_NEAREST);
+        c.glTexParameteri(c.GL_TEXTURE_2D, c.GL_TEXTURE_MAG_FILTER, c.GL_NEAREST);
+
+        // Upload the raw pixel data byte array without copying it in Zig memory
+        c.glTexImage2D(
+            c.GL_TEXTURE_2D,
+            0,                      // Mipmap level
+            c.GL_RGBA,              // Internal GPU color format
+            width,
+            height,
+            0,                      // Legacy border attribute (must be 0)
+            c.GL_RGBA,              // Format of your source data slice
+            c.GL_UNSIGNED_BYTE,     // Data type per color channel
+            rgba_pixels.ptr,
+        );
+
+        self.texture_id = tex;
     }
 
-    pub fn bindTexture(self: RectDraw) void {
+    fn bindTexture(self: RectDraw) void {
         c.glBindTexture(c.GL_TEXTURE_2D, self.texture_id);
     }
 
-    pub fn unbindTexture(_: RectDraw) void {
+    fn unbindTexture(_: RectDraw) void {
         c.glBindTexture(c.GL_TEXTURE_2D, 0);
     }
 
-    pub fn setRectPoints(self: RectDraw, points: []const f32) void {
-        c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbos[0]);
+    pub fn setRectPoints(self: RectDraw, points: []const f32) !void {
+        try glew(c.glBindBuffer, .{c.GL_ARRAY_BUFFER, self.vbos[0]});
         const size = @as(c.GLsizeiptr, @intCast(points.len * @sizeOf(f32)));
-        c.glBufferData(c.GL_ARRAY_BUFFER, size, points.ptr, c.GL_DYNAMIC_DRAW);
+        try glew(c.glBufferData, .{c.GL_ARRAY_BUFFER, size, points.ptr, c.GL_DYNAMIC_DRAW});
 
-        const loc = @as(c.GLuint, @intCast(c.glGetAttribLocation(self.program, "point")));
-        c.glEnableVertexAttribArray(loc);
-        c.glVertexAttribPointer(loc, 2, c.GL_FLOAT, c.GL_FALSE, 0, null);
+        const loc = @as(c.GLuint, @intCast(try glew(c.glGetAttribLocation, .{self.program, "point"})));
+        try glew(c.glEnableVertexAttribArray, .{loc});
+        try glew(c.glVertexAttribPointer, .{loc, 2, c.GL_FLOAT, c.GL_FALSE, 0, null});
     }
 
-    pub fn setTextureCoordinates(self: RectDraw, coords: []const f32) void {
-        c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbos[1]);
+    pub fn setTextureCoordinates(self: RectDraw, coords: []const f32) !void {
+        try glew(c.glBindBuffer, .{c.GL_ARRAY_BUFFER, self.vbos[1]});
         const size = @as(c.GLsizeiptr, @intCast(coords.len * @sizeOf(f32)));
-        c.glBufferData(c.GL_ARRAY_BUFFER, size, coords.ptr, c.GL_DYNAMIC_DRAW);
+        try glew(c.glBufferData, .{c.GL_ARRAY_BUFFER, size, coords.ptr, c.GL_DYNAMIC_DRAW});
 
-        const loc = @as(c.GLuint, @intCast(c.glGetAttribLocation(self.program, "texcoord")));
-        c.glEnableVertexAttribArray(loc);
-        c.glVertexAttribPointer(loc, 2, c.GL_FLOAT, c.GL_FALSE, 0, null);
+        const loc = @as(c.GLuint, @intCast(try glew(c.glGetAttribLocation, .{self.program, "texcoord"})));
+        try glew(c.glEnableVertexAttribArray, .{loc});
+        try glew(c.glVertexAttribPointer, .{loc, 2, c.GL_FLOAT, c.GL_FALSE, 0, null});
     }
 
-    pub fn setRectSize(self: RectDraw, w: f32, h: f32) void {
-        c.glUniform2f(self.u_rect_size, w, h);
+    pub fn setRectSize(self: RectDraw, w: f32, h: f32) !void {
+        try glew(c.glUniform2f, .{self.u_rect_size, w, h});
     }
 
-    pub fn setTextureSize(self: RectDraw, w: f32, h: f32) void {
-        c.glUniform2f(self.u_tex_size, w, h);
+    pub fn setTextureSize(self: RectDraw, w: f32, h: f32) !void {
+        try glew(c.glUniform2f, .{self.u_tex_size, w, h});
     }
 
-    pub fn setBackgroundColor(self: RectDraw, r: f32, g: f32, b: f32, a: f32) void {
-        c.glUniform4f(self.u_bg, r, g, b, a);
+    pub fn setBackgroundColor(self: RectDraw, r: f32, g: f32, b: f32, a: f32) !void {
+        try glew(c.glUniform4f, .{self.u_bg, r, g, b, a});
     }
 
-    pub fn draw(_: RectDraw, count: u16) void {
+    pub fn draw(_: RectDraw, count: u16) !void {
         c.glDrawArrays(c.GL_POINTS, 0, count);
     }
 
-    pub fn flush(_: RectDraw) void {
+    pub fn flush(_: RectDraw) !void {
+        c.glFlush();
+    }
+
+    pub fn testRender() void {
+
+        const w = @as(f32, @floatFromInt(900));
+        const h = @as(f32, @floatFromInt(700));
+
+        c.glMatrixMode(c.GL_PROJECTION);
+        c.glLoadIdentity();
+        c.glOrtho(0, @floatCast(w - 1), @floatCast(h - 1), 0, 0, 1);
+
+        c.glClearColor(0.0, 0.0, 0.0, 0.0);
+        c.glClear(c.GL_COLOR_BUFFER_BIT);
+
+        // Example: Drawing the Quads from your C++ code
+        c.glEnable(c.GL_BLEND);
+        c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
+
+        c.glColor4f(1.0, 0.0, 0.0, 0.7); // Red
+        c.glBegin(c.GL_QUADS);
+        c.glVertex2i(100, 100);
+        c.glVertex2i(100, 700 - 100);
+        c.glVertex2i(900 - 100, 700 - 100);
+        c.glVertex2i(900 - 100, 100);
+        c.glEnd();
+
         c.glFlush();
     }
 };
 
-fn compileShader(kind: c.GLenum, source: []const u8) !c.GLuint {
-    const id = c.glCreateShader(kind);
+fn compileshader(kind: c.GLenum, source: []const u8) !c.GLuint {
+    const id = try glew(c.glCreateShader, .{kind});
+
     const source_ptr: ?[*]const u8 = source.ptr;
     const source_len = @as(c.GLint, @intCast(source.len));
 
-    c.glShaderSource(id, 1, &source_ptr, &source_len);
-    c.glCompileShader(id);
+    try glew(c.glShaderSource, .{id, 1, &source_ptr, &source_len});
+    try glew(c.glCompileShader, .{id});
 
     var status: c.GLint = 0;
-    c.glGetShaderiv(id, c.GL_COMPILE_STATUS, &status);
+    try glew(c.glGetShaderiv, .{id, c.GL_COMPILE_STATUS, &status});
     if (status == c.GL_FALSE) {
         var log_len: c.GLint = 0;
-        c.glGetShaderiv(id, c.GL_INFO_LOG_LENGTH, &log_len);
-        // In a real app, you'd allocate a buffer and print the log here
+        try glew(c.glGetShaderiv,.{id, c.GL_INFO_LOG_LENGTH, &log_len});
+        // in a real app, you'd allocate a buffer and print the log here
+
+        if (log_len > 0) {
+            var buf: [1024]u8 = undefined;
+            try glew(c.glGetShaderInfoLog, .{ id, buf.len, null, &buf });
+
+            // Safely clamp the slice size so we don't read garbage beyond what OpenGL wrote
+            const print_len = @as(usize, @intCast(log_len));
+            std.debug.print("Shader Compile Error:\n{s}\n", .{buf[0..print_len]});
+        }
+
         return error.ShaderCompileError;
     }
     return id;
+}
+
+/// calls a glew-style function pointer getter and executes it with one argument
+fn glew(getter: anytype, args: anytype) !glReturnType(getter) {
+    if (getter()) |func| {
+        return @call(.auto, func, args);
+    }
+    return error.OpenGlFunctionNotFound;
+}
+
+// helper to extract the return type cleanly
+fn glReturnType(comptime getter: anytype) type {
+    const getter_fn = @TypeOf(getter);
+    const optional_func_ptr = @typeInfo(getter_fn).@"fn".return_type.?;
+    const func_ptr = @typeInfo(optional_func_ptr).optional.child; // this is a pointer type
+    
+    // 1. get the type the pointer points to (.pointer.child)
+    const raw_fn = @typeInfo(func_ptr).pointer.child; 
+    
+    // 2. now we can safely access the function's return type
+    const actual_return_type = @typeInfo(raw_fn).@"fn".return_type.?;
+    return actual_return_type;
 }

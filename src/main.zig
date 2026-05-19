@@ -22,12 +22,15 @@ pub fn main() !void {
     try window.init(0, 0, 1920, 30);
     defer window.deinit(); // Clean up X11/GL resources
 
-    var ticker = try Ticker(60, 10).init();
+    const tr = 10;
+    const rr = 60;
+
+    var ticker = try Ticker(rr, tr).init();
     var isWorkTick = true;
 
-    var monitor: StatusMonitor = .{};
+    var monitor: StatusMonitor = .{ .window = window };
 
-    try monitor.init(allocator, 10, 10);
+    try monitor.init(allocator, tr, rr);
     defer monitor.deinit();
 
     // 4. Main Loop
@@ -38,12 +41,11 @@ pub fn main() !void {
             std.debug.print("Work Time !!\n", .{});
             window.updateViewport();
 
-            // TODO add this
-            // monitor.update();
+            monitor.update();
         }
 
         // TODO add this
-        // monitor.render();
+        try monitor.render();
 
         // optional swap code
         // window.swapBuffers();
@@ -68,14 +70,6 @@ pub fn main() !void {
 
     // c.static_rect_setTexture(&dp, &font_texture);
     // c.static_rect_bindTexture(&dp);
-
-    // var font_glyphs: c.font = undefined;
-    // c.font_load(&font_glyphs, "assets/font/tamzen.json");
-
-    // const tex_char_size = c.vec2{
-    //     .x = c.font_getRelativeWidth(&font_glyphs),
-    //     .y = c.font_getRelativeHeight(&font_glyphs),
-    // };
 
     // c.static_rect_setTextureSize(&dp, tex_char_size);
 
