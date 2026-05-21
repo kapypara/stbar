@@ -1,46 +1,64 @@
 const std = @import("std");
-const nanoTimestamp = @import("std").time.nanoTimestamp;
+const c = std.c;
 
-pub fn Ticker(comptime sleep_freq: u64, comptime work_freq: u64) type {
-    if (sleep_freq % work_freq != 0) {
-        @compileError("For stable intervals, sleep_freq must be divisible by work_freq.");
-    }
+const real = std.Io.Clock.real;
 
-    return struct {
-        next_tick_ns: u64,
-        tick_count: u64 = 0,
+io: std.Io,
+
+pub fn nanoTimestamp(io: std.Io) i96 {
+    // var ts: c.timespec = undefined;
+    
+    // Uses CLOCK.REALTIME for calendar/wall-clock time
+    // const c_res = c.clock_gettime(c.CLOCK.REALTIME, &ts);   
+    // if (c_res != 0) @panic("Can't get realtime from c");
+
+    const ts = std.Io.Clock.now(real, io);
+    return ts.nanoseconds;
+}
+
+pub const Ticker = struct {
+    io: std.Io = undefined,
+
+    next_tick_ns: u64,
+    tick_count: u64,
+
+    period_ns: u64,
+    work_interval: u64,
+
+    // if (sleep_freq % work_freq != 0) {
+    //     @compileError("For stable intervals, sleep_freq must be divisible by work_freq.");
+    // }
+
+    pub fn init(io: std.Io, sleep_freq: u64, work_freq: u64) Ticker {
 
         const period_ns = std.time.ns_per_s / sleep_freq;
         const work_interval = sleep_freq / work_freq;
 
-        pub fn init() !@This() {
-            return .{
-                // Initialize starting point to "now"
-                .next_tick_ns = @intCast(nanoTimestamp()),
-            };
+        return .{
+            .io = io,
+
+            // Initialize starting point to "now"
+            .next_tick_ns = @intCast(nanoTimestamp(io)),
+            .tick_count = 0,
+            .period_ns = period_ns,
+            .work_interval = work_interval,
+        };
+    }
+
+    // sleep current thread and return true if work need to be done
+
+    pub fn tick(self: *Ticker) void {
+        const now = nanoTimestamp(self.io);
+
+        // 1. Calculate Sleep
+        if (now < self.next_tick_ns) {
+            const duration = std.Io.Duration.fromNanoseconds(self.next_tick_ns - now);
+            std.Io.sleep(self.io, duration, real) catch {};
         }
 
-        // sleep current thread and return true if work need to be done
-        pub fn tick(self: *@This()) bool {
-            const now: u64 = @intCast(nanoTimestamp());
-
-            // 1. Calculate Sleep
-            if (now < self.next_tick_ns) {
-                std.Thread.sleep(self.next_tick_ns - now);
-            }
-
-            // 2. Update the absolute deadline for the NEXT tick
-            // This prevents drift because the period is added to the 
-            // intended time, not the actual wake time.
-            self.next_tick_ns += period_ns;
-
-            // 3. Determine if this is a work tick
-            const is_work_tick = (self.tick_count % work_interval == 0);
-            
-            // 4. Increment counter
-            self.tick_count = (self.tick_count + 1) % sleep_freq;
-
-            return is_work_tick;
-        }
-    };
-}
+        // 2. Update the absolute deadline for the NEXT tick
+        // This prevents drift because the period is added to the 
+        // intended time, not the actual wake time.
+        self.next_tick_ns += self.period_ns;
+    }
+};

@@ -72,13 +72,13 @@ pub const Segment = struct {
         // self.draw.deinit();
     }
 
-    pub fn update(self: *Segment) void {
+    pub fn update(self: *Segment, io: std.Io) void {
         // TODO
         // allocate value in sample array
         // compute frame array
         for (self.metrics) |*meteric_entry| {
             var m = &meteric_entry.metric;
-            _ = m.sample() catch {};
+            _ = m.sample(io) catch {};
             std.debug.print("{any}\n", .{m});
         }
     }

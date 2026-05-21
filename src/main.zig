@@ -3,15 +3,28 @@ const Window = @import("Window.zig").Window;
 const Ticker = @import("Ticker.zig").Ticker;
 const StatusMonitor = @import("StatusMonitor.zig").StatusMonitor;
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     // Prints to stderr, ignoring potential errors.
     std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
 
     // 1. Initialize Renderer
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    const gpa = debug_allocator.allocator();
+    defer {
+        const check = debug_allocator.deinit();
+        if (check == .leak) {
+            std.debug.print("⚠️ MEMORY LEAK DETECTED! ⚠️\n", .{});
+        }
+    }
 
-    const allocator = gpa.allocator();
+    // var evented: std.Io.Evented = undefined;
+    // try evented.init(gpa, .{
+    //     .argv0 = .init(init.args),
+    //     .environ = init.environ,
+    //     .backing_allocator_needs_mutex = false,
+    // });
+    // defer evented.deinit();
+    const io = init.io; //evented.io();
 
     // 1. Initialize the struct
     var window = Window{
@@ -25,31 +38,26 @@ pub fn main() !void {
     const tr = 10;
     const rr = 60;
 
-    var ticker = try Ticker(rr, tr).init();
-    var isWorkTick = true;
+    var ticker = Ticker.init(io, rr, tr);
 
     var monitor: StatusMonitor = .{ .window = window };
 
-    try monitor.init(allocator, tr, rr);
+    try monitor.init(io, gpa, tr, rr);
     defer monitor.deinit();
 
     // 4. Main Loop
-    while (window.running) {
+    while (window.running and false) {
         window.updateTheMessageQueue();
         
-        if (isWorkTick) {
-            std.debug.print("Work Time !!\n", .{});
-            window.updateViewport();
-
-            monitor.update();
-        }
+        window.updateViewport();
+        monitor.update();
 
         // TODO add this
         try monitor.render();
 
         // optional swap code
         // window.swapBuffers();
-        isWorkTick = ticker.tick();
+        ticker.tick();
     }
     
     // 2. Setup Static Rect

@@ -126,6 +126,7 @@ pub const RectDraw = struct {
     pub fn use(self: RectDraw) !void {
         try glew(c.glBindVertexArray, .{self.vao});
         try glew(c.glUseProgram, .{self.program});
+        c.glBindTexture(c.GL_TEXTURE_2D, self.texture_id);
     }
 
     pub fn loadTexture(self: *RectDraw, width: u16, height: u16, rgba_pixels: []const u8) !void {
@@ -161,32 +162,28 @@ pub const RectDraw = struct {
         self.texture_id = tex;
     }
 
-    fn bindTexture(self: RectDraw) void {
-        c.glBindTexture(c.GL_TEXTURE_2D, self.texture_id);
-    }
+    pub fn setRectPoints(self: RectDraw, points: []const i16) !void {
+        const size = @as(c.GLsizeiptr, @intCast(points.len * @sizeOf(i16)));
 
-    fn unbindTexture(_: RectDraw) void {
-        c.glBindTexture(c.GL_TEXTURE_2D, 0);
-    }
-
-    pub fn setRectPoints(self: RectDraw, points: []const f32) !void {
         try glew(c.glBindBuffer, .{c.GL_ARRAY_BUFFER, self.vbos[0]});
-        const size = @as(c.GLsizeiptr, @intCast(points.len * @sizeOf(f32)));
         try glew(c.glBufferData, .{c.GL_ARRAY_BUFFER, size, points.ptr, c.GL_DYNAMIC_DRAW});
 
         const loc = @as(c.GLuint, @intCast(try glew(c.glGetAttribLocation, .{self.program, "point"})));
+
         try glew(c.glEnableVertexAttribArray, .{loc});
-        try glew(c.glVertexAttribPointer, .{loc, 2, c.GL_FLOAT, c.GL_FALSE, 0, null});
+        try glew(c.glVertexAttribPointer, .{loc, 2, c.GL_SHORT, c.GL_TRUE, 0, null});
     }
 
-    pub fn setTextureCoordinates(self: RectDraw, coords: []const f32) !void {
+    pub fn setTextureCoordinates(self: RectDraw, coords: []const i16) !void {
+        const size = @as(c.GLsizeiptr, @intCast(coords.len * @sizeOf(u16)));
+
         try glew(c.glBindBuffer, .{c.GL_ARRAY_BUFFER, self.vbos[1]});
-        const size = @as(c.GLsizeiptr, @intCast(coords.len * @sizeOf(f32)));
         try glew(c.glBufferData, .{c.GL_ARRAY_BUFFER, size, coords.ptr, c.GL_DYNAMIC_DRAW});
 
         const loc = @as(c.GLuint, @intCast(try glew(c.glGetAttribLocation, .{self.program, "texcoord"})));
+
         try glew(c.glEnableVertexAttribArray, .{loc});
-        try glew(c.glVertexAttribPointer, .{loc, 2, c.GL_FLOAT, c.GL_FALSE, 0, null});
+        try glew(c.glVertexAttribPointer, .{loc, 2, c.GL_SHORT, c.GL_TRUE, 0, null});
     }
 
     pub fn setRectSize(self: RectDraw, w: f32, h: f32) !void {

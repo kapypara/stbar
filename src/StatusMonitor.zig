@@ -5,6 +5,7 @@ const RectDraw = @import("RectDraw.zig").RectDraw;
 const segment_zig = @import("Segment.zig");
 const meteric = @import("metrics.zig");
 const Window = @import("Window.zig").Window;
+const Texture = @import("Texture.zig").Texture;
 
 const assert = std.debug.assert;
 const print = std.debug.print;
@@ -41,6 +42,8 @@ var window_metrics_storage = [_]MetricEntry{
 
 pub const StatusMonitor = struct {
     allocator: std.mem.Allocator = undefined,
+    io: std.Io = undefined,
+
     rect: RectDraw = undefined,
     font: FontAtlas = undefined,
     window: Window = undefined,
@@ -86,41 +89,40 @@ pub const StatusMonitor = struct {
         self.allocator.free(self.cells);
     }
 
-    pub fn init(self: *StatusMonitor, allocator: std.mem.Allocator, tick: u8, render_rate: u8) !void {
+    pub fn init(self: *StatusMonitor, io: std.Io, allocator: std.mem.Allocator, tick: u8, render_rate: u8) !void {
         // TODO validated Rect
         self.rect = try RectDraw.init();
-        self.font = try FontAtlas.loadFromJson(allocator, "assets/font/tamzen.json");
+        self.font = try FontAtlas.loadFromJson(io, allocator, "assets/font/tamzen.json");
+
+        var texture = try Texture.init(io, allocator, "assets/font/tamzen.png");
+        defer texture.deinit();
 
         //
         // 1. You only want ONE anchor point because your Geometry Shader expands it into 4 vertices
-        const single_anchor_point = [_]f32{
-            -0.5, 0.5, // Top-left anchor position in NDC space
+        // this prepresent the top right corner xy of rect
+        const single_anchor_point = [_]i16{
+            -32768, 32767,
         };
 
         // Even though you don't use textures, your shaders demand texture logic variables to exist
-        const dummy_tex_coords = [_]f32{
+        const dummy_tex_coords = [_]i16{
             0.0, 0.0,
         };
 
         // 2. Activate the shader program and bind the VAO
         try self.rect.use();
+        try self.rect.loadTexture(1, 1, &.{255, 0, 0, 100}); 
+
+        // 6. Set the layout configuration sizes (working relative to NDC limits)
+        try self.rect.setRectSize(0.5, 1.0);  // Width: 1.0, Height: 1.0 in NDC scales
+        try self.rect.setTextureSize(self.font.x_increment, self.font.y_increment); // Dummy texture size
+
+        // 7. Set your color uniform to Red 
+        try self.rect.setBackgroundColor(0.0, 0.0, 0.0, 0.0);
 
         // 3. Upload the single anchor point geometry
         try self.rect.setRectPoints(&single_anchor_point);
-        
-        // 4. Update the layout requirement for your second VBO buffer ("texcoord")
-        // Your Fragment Shader reads this, so the vertex attributes MUST be bound
         try self.rect.setTextureCoordinates(&dummy_tex_coords);
-
-        // 5. Explicitly bind a fallback texture slot (0) so your sampler2D doesn't break your color mix 
-        try self.rect.loadTexture(1, 1, &.{0, 0, 255, 0}); 
-
-        // 6. Set the layout configuration sizes (working relative to NDC limits)
-        try self.rect.setRectSize(1.0, 1.0);  // Width: 1.0, Height: 1.0 in NDC scales
-        try self.rect.setTextureSize(0.0, 0.0); // Dummy texture size
-
-        // 7. Set your color uniform to Red 
-        try self.rect.setBackgroundColor(1.0, 0.0, 0.0, 0);
 
         // 8. CRITICAL: Draw exactly 1 point. 
         // The Geometry shader receives this 1 point and outputs 4 vertices (Triangle Strip)
@@ -130,6 +132,7 @@ pub const StatusMonitor = struct {
         try self.rect.flush();
         //
 
+        self.io = io;
         self.allocator = allocator;
         self.update_rate = if (tick > render_rate) render_rate else tick;
         self.render_rate = render_rate;
@@ -163,7 +166,7 @@ pub const StatusMonitor = struct {
                 }
             }
 
-            segment.update();
+            segment.update(io);
         }
 
         // std.debug.print("Size of segments: {d}\n", .{@sizeOf(Segment)});
@@ -190,6 +193,7 @@ pub const StatusMonitor = struct {
         print("discards: {} fram_len: {} total_len: {any}\n", .{ discards, frame_len, total_len });
 
         var buffer = try allocator.alloc(u64, total_len);
+        defer allocator.free(buffer);
 
         for (buffer, 0..) |*b, i| {
             b.* = i;
@@ -280,7 +284,7 @@ pub const StatusMonitor = struct {
 
     pub fn update(self: *StatusMonitor) void {
         for (self.segments) |segment| {
-            segment.update();
+            segment.update(self.io);
         }
     }
 
@@ -387,4 +391,5 @@ pub const StatusMonitor = struct {
             try self.cycle();
         }
     }
+
 };

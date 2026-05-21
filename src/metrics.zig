@@ -1,6 +1,5 @@
 const std = @import("std");
-const fs = std.fs;
-const io = std.io;
+const Io = std.Io;
 const mem = std.mem;
 const print = std.debug.print;
 
@@ -10,6 +9,8 @@ const c = @cImport({
     // @cInclude("sys/stat.h");
     @cInclude("sys/statvfs.h");
 });
+
+const nanoTimestamp = @import("Ticker.zig").nanoTimestamp;
 
 // --- Data Structures ---
 
@@ -60,17 +61,17 @@ pub const Metric = union(MetricTag) {
     free_storage: StorageProbe,
     time: TimeProbe,
 
-    pub fn sample(self: *Metric) !void {
+    pub fn sample(self: *Metric, io: Io) !void {
         return switch (self.*) {
-            .cpu => |*p| p.sample(),
-            .memory => |*p| p.sample(),
-            .io => |*p| p.sample(),
-            .net => |*p| p.sample(),
-            .temp => |*p| p.sample(),
+            .cpu => |*p| p.sample(io),
+            .memory => |*p| p.sample(io),
+            .io => |*p| p.sample(io),
+            .net => |*p| p.sample(io),
+            .temp => |*p| p.sample(io),
             .load => |*p| p.sample(),
             .window => |*p| p.sample(),
-            .free_storage => |*p| p.sample(),
-            .time => |*p| p.sample(),
+            .free_storage => |*p| p.sample(io),
+            .time => |*p| p.sample(io),
         };
     }
 };
@@ -82,11 +83,12 @@ pub const CpuProbe = struct {
     prev_total: u64 = 0,
     current_pct: u64 = 0,
 
-    pub fn sample(self: *CpuProbe) !void {
-        const file = try fs.openFileAbsolute("/proc/stat", .{});
-        defer file.close();
+    pub fn sample(self: *CpuProbe, io: Io) !void {
+        const file = try Io.Dir.openFileAbsolute(io, "/proc/stat", .{});
+        defer file.close(io);
+
         var buf: [128]u8 = undefined;
-        const amt = try file.readAll(&buf);
+        const amt = try file.readPositionalAll(io, &buf, 0);
 
         var it = mem.tokenizeAny(u8, buf[0..amt], " \n");
         _ = it.next(); // skip "cpu"
@@ -114,12 +116,12 @@ pub const MemProbe = struct {
     free: u64 = 0,
     dirty: u64 = 0,
 
-    pub fn sample(self: *MemProbe) !void {
-        const file = try fs.openFileAbsolute("/proc/meminfo", .{});
-        defer file.close();
+    pub fn sample(self: *MemProbe, io: Io) !void {
+        const file = try Io.Dir.openFileAbsolute(io, "/proc/meminfo", .{});
+        defer file.close(io);
 
         var buf: [2048]u8 = undefined;
-        const amt = try file.readAll(&buf);
+        const amt = try file.readPositionalAll(io, &buf, 0);
 
         var line_it = mem.tokenizeAny(u8, buf[0..amt], "\n");
         while (line_it.next()) |line| {
@@ -144,12 +146,12 @@ pub const IoProbe = struct {
     prev: IoStat = .{},
     current: IoStat = .{},
 
-    pub fn sample(self: *IoProbe) !void {
-        const file = try fs.openFileAbsolute("/proc/diskstats", .{});
-        defer file.close();
+    pub fn sample(self: *IoProbe, io: Io) !void {
+        const file = try Io.Dir.openFileAbsolute(io, "/proc/diskstats", .{});
+        defer file.close(io);
 
         var buf: [2048]u8 = undefined;
-        const amt = try file.readAll(&buf);
+        const amt = try file.readPositionalAll(io, &buf, 0);
 
         var raw = IoStat{};
 
@@ -206,18 +208,18 @@ pub const NetProbe = struct {
 
     const network_class = "/sys/class/net";
 
-    pub fn sample(self: *NetProbe) !void {
+    pub fn sample(self: *NetProbe, io: Io) !void {
         var raw = NetStat{};
 
-        var dir = try std.fs.openDirAbsolute(network_class, .{ .iterate = true });
-        defer dir.close();
+        const dir = try Io.Dir.openDirAbsolute(io, network_class, .{ .iterate = true });
+        defer dir.close(io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(io)) |entry| {
             if (entry.kind == .directory or entry.kind == .sym_link) {
                 if (std.mem.startsWith(u8, entry.name, "enp") or std.mem.startsWith(u8, entry.name, "eth") or std.mem.startsWith(u8, entry.name, "wlan")) {
-                    raw.rx += try readSysfsUint(entry.name, "rx_bytes");
-                    raw.tx += try readSysfsUint(entry.name, "tx_bytes");
+                    raw.rx += try readSysfsUint(io, entry.name, "rx_bytes");
+                    raw.tx += try readSysfsUint(io, entry.name, "tx_bytes");
                 }
             }
         }
@@ -226,7 +228,7 @@ pub const NetProbe = struct {
         self.prev = raw;
     }
 
-    fn readSysfsUint(network_name: []const u8, comptime stat_name: []const u8) !u64 {
+    fn readSysfsUint(io: Io, network_name: []const u8, comptime stat_name: []const u8) !u64 {
         var buf: [64]u8 = undefined;
 
         // /sys/class/net/{name}/statistics/tx_bytes
@@ -235,27 +237,27 @@ pub const NetProbe = struct {
             return 0;
         };
 
-        const file = fs.openFileAbsolute(path, .{}) catch return 0;
-        defer file.close();
-        const amt = try file.readAll(&buf);
+        const file = Io.Dir.openFileAbsolute(io, path, .{}) catch return 0;
+        defer file.close(io);
+        const amt = try file.readPositionalAll(io, &buf, 0);
         return std.fmt.parseInt(u64, mem.trim(u8, buf[0..amt], " \n"), 10) catch 0;
     }
 };
 
 pub const TempProbe = struct {
     value: u64 = 0,
-    pub fn sample(self: *TempProbe) !void {
+    pub fn sample(self: *TempProbe, io: Io) !void {
         var buf: [64]u8 = undefined;
-        var dir = try std.fs.openDirAbsolute("/sys/class/hwmon", .{ .iterate = true });
-        defer dir.close();
+        var dir = try Io.Dir.openDirAbsolute(io, "/sys/class/hwmon", .{ .iterate = true });
+        defer dir.close(io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(io)) |entry| {
             const path = try std.fmt.bufPrint(&buf, "/sys/class/hwmon/{s}/name", .{entry.name});
 
-            const file = std.fs.openFileAbsolute(path, .{}) catch continue;
-            defer file.close();
-            const len = try file.readAll(&buf);
+            const file = Io.Dir.openFileAbsolute(io, path, .{}) catch continue;
+            defer file.close(io);
+            const len = try file.readPositionalAll(io, &buf, 0);
             const driver_name = std.mem.trim(u8, buf[0..len], " \n");
 
             // k10temp is AMD, coretemp is Intel
@@ -263,9 +265,9 @@ pub const TempProbe = struct {
                 // Use this hwmonX directory!
                 const file_path = try std.fmt.bufPrint(&buf, "/sys/class/hwmon/{s}/temp1_input", .{entry.name});
 
-                const temp_file = fs.openFileAbsolute(file_path, .{}) catch return;
-                defer temp_file.close();
-                const amt = try temp_file.readAll(&buf);
+                const temp_file = Io.Dir.openFileAbsolute(io, file_path, .{}) catch return;
+                defer temp_file.close(io);
+                const amt = try temp_file.readPositionalAll(io, &buf, 0);
                 self.value = (std.fmt.parseInt(u64, mem.trim(u8, buf[0..amt], " \n"), 10) catch 0) / 1000;
             }
         }
@@ -285,9 +287,9 @@ pub const LoadProbe = struct {
 pub const StorageProbe = struct {
     free_bytes: u64 = 0,
 
-    pub fn sample(self: *StorageProbe) !void {
-        const file = try fs.openFileAbsolute("/proc/mounts", .{});
-        defer file.close();
+    pub fn sample(self: *StorageProbe, io: Io) !void {
+        const file = try Io.Dir.openFileAbsolute(io, "/proc/mounts", .{});
+        defer file.close(io);
 
         // Fixed-size buffer to track seen devices without heap allocation
         var seen_storage: [16][64]u8 = undefined;
@@ -295,7 +297,7 @@ pub const StorageProbe = struct {
 
         var total_free: u64 = 0;
         var buf: [4096]u8 = undefined;
-        const amt = try file.readAll(&buf);
+        const amt = try file.readPositionalAll(io, &buf, 0);
 
         var line_it = mem.tokenizeAny(u8, buf[0..amt], "\n");
         while (line_it.next()) |line| {
@@ -353,9 +355,11 @@ pub const TimeProbe = struct {
     const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
     /// Formats the date into the provided buffer: "Fri May08 02:48:01 PM"
-    pub fn sample(self: *TimeProbe) !void {
-        const ts = std.time.timestamp() + offset;
-        const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
+    pub fn sample(self: *TimeProbe, io: std.Io) !void {
+        const ts = nanoTimestamp(io) + offset;
+        const seconds: u64 = @intCast(@divTrunc(ts, std.time.ns_per_day));
+
+        const epoch = std.time.epoch.EpochSeconds{ .secs = seconds };
         const day_secs = epoch.getDaySeconds();
         const epoch_day = epoch.getEpochDay();
         const year_day = epoch_day.calculateYearDay();

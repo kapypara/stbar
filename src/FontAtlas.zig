@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 
 /// Represents a mapping of character codes to UV coordinates on a texture atlas.
 pub const FontAtlas = struct {
@@ -23,6 +24,7 @@ pub const FontAtlas = struct {
     y_increment: f32,
 
     columns: u16,
+    rows: u16,
 
     // Sorted slice for efficient O(log n) lookups
     glyphs: []GlyphCoord,
@@ -34,11 +36,16 @@ pub const FontAtlas = struct {
     }
 
     /// Comptue the UV for any given glyph coord
-    fn computeUV(self: *const FontAtlas, g: GlyphCoord) [2]f32 {
-        const col = @as(f32, @floatFromInt(g.index % self.columns));
-        const row = @as(f32, @floatFromInt(g.index / self.columns));
+    fn computeUV(self: *const FontAtlas, g: GlyphCoord) [2]u16 {
+        const col = g.index % self.columns;
+        const row = g.index / self.columns;
 
-        return .{ self.x_increment * col, self.y_increment * row };
+        // Multiply the column/row index by the maximum u16 value, 
+        // then divide by total columns/rows to get the exact scaled coordinate.
+        return .{
+            @intCast((col * 65535) / self.columns),
+            @intCast((row * 65535) / self.rows),
+        };
     }
 
     /// Finds the UV coordinates for a specific character code.
@@ -65,11 +72,16 @@ pub const FontAtlas = struct {
         return null;
     }
 
-    pub fn loadFromJson(allocator: std.mem.Allocator, path: []const u8) !FontAtlas {
-        const file = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
-        defer allocator.free(file);
+    pub fn loadFromJson(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !FontAtlas {
 
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, file, .{});
+        const file = try Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+
+        var buf: [1024*1024]u8 = undefined;
+        const amt = try file.readPositionalAll(io, &buf, 0);
+        const s = buf[0..amt];
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, s, .{});
         defer parsed.deinit();
 
         const root = parsed.value.object;
@@ -120,6 +132,7 @@ pub const FontAtlas = struct {
             .name = try allocator.dupe(u8, root.get("name").?.string),
             .bitmap_path = try allocator.dupe(u8, root.get("file").?.string),
             .columns = columns,
+            .rows = rows,
             .char_width = @as(u16, @intCast(root.get("char_width").?.integer)),
             .char_height = @as(u16, @intCast(root.get("char_height").?.integer)),
             .x_increment = x_inc,

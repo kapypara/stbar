@@ -54,15 +54,22 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
 
+    const zigimg = b.dependency("zigimg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("zigimg", zigimg.module("zigimg"));
+
     // --- ADDED SYSTEM DEPENDENCIES HERE ---
     // Link libc (required for @cImport and system headers)
-    exe.linkLibC();
+    exe.root_module.link_libc = true;
+
     // Link the required system libraries
-    exe.linkSystemLibrary("glew");
-    exe.linkSystemLibrary("GL");
-    exe.linkSystemLibrary("X11");
-    exe.linkSystemLibrary("Xrender");
-    exe.linkSystemLibrary("Xext");
+    const c_lib = [_][]const u8{ "glew", "GL", "X11", "Xrender", "Xext" };
+
+    for (c_lib) |lib| {
+        exe.root_module.linkSystemLibrary(lib, .{});
+    }
     // --------------------------------------
 
     // This declares intent for the executable to be installed into the
