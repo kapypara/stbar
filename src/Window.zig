@@ -129,6 +129,14 @@ pub const Window = struct {
 
         if (self.glx_handle == 0) return error.GlxCreateWindowFailed;
 
+        var hints = std.mem.zeroes(c.XSizeHints);
+        hints.flags = c.USPosition | c.PPosition | c.USSize | c.PSize;
+        hints.x = self.x;
+        hints.y = self.y;
+        hints.width = self.width;
+        hints.height = self.height;
+        c.XSetWMNormalHints(dpy, self.handle, &hints);
+
         // Porting the Dock logic
         if (self.docked) {
             const window_type = c.XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", 0);
@@ -146,6 +154,34 @@ pub const Window = struct {
             const wm_desktop = c.XInternAtom(dpy, "_NET_WM_DESKTOP", 0);
             const all_desktops: u32 = 0xFFFFFFFF;
             _ = c.XChangeProperty(dpy, self.handle, wm_desktop, c.XA_CARDINAL, 32, c.PropModeReplace, @ptrCast(&all_desktops), 1);
+
+            // --- STRUT LOGIC FOR TOP DOCK ---
+            const wm_strut = c.XInternAtom(dpy, "_NET_WM_STRUT", 0);
+            const wm_strut_partial = c.XInternAtom(dpy, "_NET_WM_STRUT_PARTIAL", 0);
+
+            var strut = std.mem.zeroes([12]c.u_long); 
+
+            // 1. Tell the WM to reserve 'height' pixels at the TOP (index 2)
+            strut[2] = @intCast(self.height); 
+
+            // 2. Tell the WM the horizontal start/end of this top strut (indices 8 and 9)
+            // This ensures it reserves space across the entire width of your screen.
+            strut[8] = @intCast(self.x);                       // top_start_x
+            strut[9] = @intCast(self.x + self.width - 1);       // top_end_x
+
+            // _NET_WM_STRUT expects 4 values (left, right, top, bottom)
+            _ = c.XChangeProperty(dpy, self.handle,
+                wm_strut, c.XA_CARDINAL,
+                32, c.PropModeReplace,
+                @ptrCast(&strut), 4
+            );
+
+            // _NET_WM_STRUT_PARTIAL expects all 12 values
+            _ = c.XChangeProperty(dpy, self.handle,
+                wm_strut_partial, c.XA_CARDINAL,
+                32, c.PropModeReplace,
+                @ptrCast(&strut), 12
+            );
         }
 
         _ = c.XMapWindow(dpy, self.handle);
