@@ -54,6 +54,7 @@ pub const Ticker = struct {
         if (now < self.next_tick_ns) {
             const duration = std.Io.Duration.fromNanoseconds(self.next_tick_ns - now);
             std.Io.sleep(self.io, duration, real) catch {};
+            std.debug.print("selpt for {}ms\n", .{duration.toMilliseconds()});
         }
 
         // 2. Update the absolute deadline for the NEXT tick

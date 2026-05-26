@@ -42,14 +42,16 @@ pub const FontAtlas = struct {
 
         // Multiply the column/row index by the maximum u16 value, 
         // then divide by total columns/rows to get the exact scaled coordinate.
+        const max_u16: u32 = 65535; 
+
         return .{
-            @intCast((col * 65535) / self.columns),
-            @intCast((row * 65535) / self.rows),
+            @intCast((col * max_u16) / self.columns),
+            @intCast((row * max_u16) / self.rows),
         };
     }
 
     /// Finds the UV coordinates for a specific character code.
-    pub fn getGlyphUV(self: *const FontAtlas, code: u16) ?[2]f32 {
+    pub fn getGlyphUV(self: *const FontAtlas, code: u32) [2]u16 {
 
         // if (code < 128) {
         //     return self.computeUV(self.glyphs[code]);
@@ -69,7 +71,7 @@ pub const FontAtlas = struct {
                 high = mid;
             }
         }
-        return null;
+        return .{0, 0};
     }
 
     pub fn loadFromJson(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !FontAtlas {

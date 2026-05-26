@@ -32,10 +32,10 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // 3. Call Init
-    try window.init(0, 0, 1920, 30);
+    try window.init(0, 0, 1920, 14 + 3);
     defer window.deinit(); // Clean up X11/GL resources
 
-    const tr = 10;
+    const tr = 8;
     const rr = 60;
 
     var ticker = Ticker.init(io, rr, tr);
@@ -46,13 +46,11 @@ pub fn main(init: std.process.Init) !void {
     defer monitor.deinit();
 
     // 4. Main Loop
-    while (window.running and false) {
+    while (window.running) {
         window.updateTheMessageQueue();
         
         window.updateViewport();
         monitor.update();
-
-        // TODO add this
         try monitor.render();
 
         // optional swap code

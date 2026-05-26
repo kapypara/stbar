@@ -8,8 +8,8 @@ pub const Texture = struct {
 
     allocator: Allocator = undefined,
 
-    width: u64 = undefined,
-    height: u64 = undefined,
+    width: u16 = undefined,
+    height: u16 = undefined,
     rgba: []u8 = undefined,
 
     pub fn init(io: Io, allocator: Allocator, image_path: []const u8) !Texture {
@@ -44,8 +44,8 @@ pub const Texture = struct {
         return .{
             .allocator = allocator,
 
-            .height = image.height,
-            .width = image.width,
+            .height = @intCast(image.height),
+            .width = @intCast(image.width),
             .rgba = owned_rgba,
         };
 

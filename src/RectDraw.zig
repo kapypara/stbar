@@ -174,7 +174,7 @@ pub const RectDraw = struct {
         try glew(c.glVertexAttribPointer, .{loc, 2, c.GL_SHORT, c.GL_TRUE, 0, null});
     }
 
-    pub fn setTextureCoordinates(self: RectDraw, coords: []const i16) !void {
+    pub fn setTextureCoordinates(self: RectDraw, coords: []const u16) !void {
         const size = @as(c.GLsizeiptr, @intCast(coords.len * @sizeOf(u16)));
 
         try glew(c.glBindBuffer, .{c.GL_ARRAY_BUFFER, self.vbos[1]});
@@ -183,7 +183,7 @@ pub const RectDraw = struct {
         const loc = @as(c.GLuint, @intCast(try glew(c.glGetAttribLocation, .{self.program, "texcoord"})));
 
         try glew(c.glEnableVertexAttribArray, .{loc});
-        try glew(c.glVertexAttribPointer, .{loc, 2, c.GL_SHORT, c.GL_TRUE, 0, null});
+        try glew(c.glVertexAttribPointer, .{loc, 2, c.GL_UNSIGNED_SHORT, c.GL_TRUE, 0, null});
     }
 
     pub fn setRectSize(self: RectDraw, w: f32, h: f32) !void {
@@ -195,6 +195,15 @@ pub const RectDraw = struct {
     }
 
     pub fn setBackgroundColor(self: RectDraw, r: f32, g: f32, b: f32, a: f32) !void {
+        try glew(c.glUniform4f, .{self.u_bg, r, g, b, a});
+    }
+
+    pub fn setBackgroundColorU32(self: RectDraw, rgba: u32) !void {
+        const r = @as(f32, @floatFromInt(@as(u8, @truncate(rgba >> 24)))) / 255.0;
+        const g = @as(f32, @floatFromInt(@as(u8, @truncate(rgba >> 16)))) / 255.0;
+        const b = @as(f32, @floatFromInt(@as(u8, @truncate(rgba >> 8)))) / 255.0;
+        const a = @as(f32, @floatFromInt(@as(u8, @truncate(rgba)))) / 255.0;
+
         try glew(c.glUniform4f, .{self.u_bg, r, g, b, a});
     }
 

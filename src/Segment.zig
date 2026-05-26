@@ -17,9 +17,9 @@ const ValueUnion = union {
 
 pub const MetricEntry = struct {
     metric: Metric,
-    start_index: u16 = undefined, // index of first cell to use from Parent
-    sample: []u64 = undefined, // fetched metric samples
-    frames: []u64 = undefined, // frames to be rendered
+    start_index: u8 = undefined, // index of first cell to use from Parent
+    sample: []u128 = undefined, // fetched metric samples
+    frames: []u128 = undefined, // frames to be rendered
 };
 
 pub const Segment = struct {
@@ -28,7 +28,7 @@ pub const Segment = struct {
     // step_limit: u8 = 0,
 
     // ech segment have it's main color
-    color: [4]f32 = undefined, // Assuming vec4 is 4 floats
+    color: u32 = undefined, // RGBA32 color hex
 
     cells: []i16 = undefined,
     metrics: []MetricEntry,
@@ -72,14 +72,22 @@ pub const Segment = struct {
         // self.draw.deinit();
     }
 
-    pub fn update(self: *Segment, io: std.Io) void {
-        // TODO
-        // allocate value in sample array
-        // compute frame array
+    pub fn update(self: *Segment, io: std.Io, sample_idx: u8) void {
         for (self.metrics) |*meteric_entry| {
             var m = &meteric_entry.metric;
-            _ = m.sample(io) catch {};
-            std.debug.print("{any}\n", .{m});
+            m.sample(io) catch {};
+
+            if (m.* == .window or m.* == .time) continue;
+
+            const p1 = m.get(0);
+            if (m.* == .memory or m.* == .io or m.* == .net) {
+                const p2 = m.get(1);
+                meteric_entry.sample[sample_idx] = (@as(u128, p2) << 64) | @as(u128, p1);
+            } else {
+                meteric_entry.sample[sample_idx] = @as(u128, p1);
+            }
+
+            // std.debug.print("{any}\n", .{m});
         }
     }
 

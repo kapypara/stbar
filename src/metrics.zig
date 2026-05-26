@@ -74,6 +74,22 @@ pub const Metric = union(MetricTag) {
             .time => |*p| p.sample(io),
         };
     }
+
+    pub fn get(self: *Metric, idx: u8) u64 {
+        return switch (self.*) {
+            .cpu => |*p| p.current_pct,
+            .temp => |*p| p.value,
+            .load => |*p| p.value,
+            .free_storage => |*p| p.free_bytes,
+
+            .memory => |*p| if (idx == 0) p.free else p.dirty,
+            .io => |*p| if (idx == 0) p.current.read else p.current.write,
+            .net => |*p| if (idx == 0) p.current.rx else p.current.tx,
+
+            .window => 0,
+            .time => 0,
+        };
+    }
 };
 
 // --- Implementation Probes ---
@@ -350,14 +366,14 @@ pub const TimeProbe = struct {
     value: [21]u8 = undefined,
 
     // UTC+3 for bahrain time :)
-    const offset = 60 * 60 * 3;
+    const offset = 3 * std.time.ns_per_hour;
     const days = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
     const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
     /// Formats the date into the provided buffer: "Fri May08 02:48:01 PM"
     pub fn sample(self: *TimeProbe, io: std.Io) !void {
         const ts = nanoTimestamp(io) + offset;
-        const seconds: u64 = @intCast(@divTrunc(ts, std.time.ns_per_day));
+        const seconds: u64 = @intCast(@divTrunc(ts, std.time.ns_per_s));
 
         const epoch = std.time.epoch.EpochSeconds{ .secs = seconds };
         const day_secs = epoch.getDaySeconds();
