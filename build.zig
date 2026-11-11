@@ -79,8 +79,10 @@ pub fn build(b: *std.Build) void {
         \\#include <GL/glxext.h>
         \\#include <X11/Xatom.h>
         \\#include <X11/extensions/Xrender.h>
+        \\#include <X11/extensions/shape.h>
         \\#include <X11/Xutil.h>
         \\#include <sys/statvfs.h>
+        \\#include <poll.h>
         \\
     );
     const translate_c = b.addTranslateC(.{

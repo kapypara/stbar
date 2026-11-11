@@ -1,8 +1,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Window = @import("Window.zig").Window;
-const Ticker = @import("Ticker.zig").Ticker;
-const StatusMonitor = @import("StatusMonitor.zig").StatusMonitor;
+const status_zig = @import("StatusMonitor.zig");
+const StatusMonitor = status_zig.StatusMonitor;
+const BarMode = status_zig.BarMode;
+
+/// Startup bar mode flag:
+/// - `.auto_hide`: overlay (`strut = OFF`), 1px top hover sensor (>1s reveal with fade-in, 1 Hz hidden polling)
+/// - `.pinned_overlay`: overlay (`strut = OFF`), always visible
+/// - `.docked_strut`: reserved 17px top dock (`strut = ON`), always visible
+const initial_mode: BarMode = .auto_hide;
+
+/// Active metric sample frequency while visible (`8 Hz`; automatically slows to `1 Hz` while hidden).
+const visible_sample_hz: u8 = 8;
 
 const use_debug_gpa = switch (builtin.mode) {
     .debug, .safe => true,
@@ -23,26 +33,20 @@ pub fn main(_: std.process.Init.Minimal) !void {
 
     var window = Window{
         .docked = true,
+        .strut_enabled = (initial_mode == .docked_strut),
+        .input_height = if (initial_mode == .auto_hide) 1 else 14 + 3,
     };
 
     // width = 0 auto-detects the active X11 screen width; height = 14 + 3 = 17px
     try window.init(0, 0, 0, 14 + 3);
     defer window.deinit();
 
-    const tr = 8;
-    const rr = 60;
-
-    var ticker = Ticker.init(io, rr, tr);
-
     var monitor: StatusMonitor = .{ .window = &window };
-    try monitor.init(io, gpa, tr, rr);
+    try monitor.init(io, gpa, visible_sample_hz, initial_mode);
     defer monitor.deinit();
 
     while (window.running) {
-        window.updateTheMessageQueue();
-        try monitor.update();
-        try monitor.render();
-        ticker.tick();
+        try monitor.step();
     }
 }
 
