@@ -182,10 +182,19 @@ pub const StatusMonitor = struct {
         setSlots(&self.storage_metrics[1], self.sample_buffer, stride, 5, self.update_rate);
         setSlots(&self.network_metrics[0], self.sample_buffer, stride, 6, self.update_rate);
 
-        // Prime cumulative counters (CPU, Disk I/O, Network) so frame 0 starts without boot spikes
+        // Prime cumulative counters (CPU, Disk I/O, Network) and pre-fill initial gauge buffers
         for (self.segments) |seg| {
             for (seg.metrics) |*entry| {
                 entry.metric.sample(io) catch {};
+                if (entry.metric == .window or entry.metric == .time) continue;
+                const p1 = entry.metric.get(0);
+                const p2 = if (entry.metric == .memory or entry.metric == .io or entry.metric == .net)
+                    entry.metric.get(1)
+                else
+                    0;
+                const packed_init = (@as(u128, p2) << 64) | @as(u128, p1);
+                @memset(entry.sample, packed_init);
+                @memset(entry.frames, packed_init);
             }
         }
 

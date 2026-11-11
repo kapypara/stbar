@@ -6,7 +6,9 @@ const x11 = @import("Window.zig").c;
 
 const c = @import("c");
 
-const nanoTimestamp = @import("Ticker.zig").nanoTimestamp;
+const ticker_zig = @import("Ticker.zig");
+const nanoTimestamp = ticker_zig.nanoTimestamp;
+const monotonicNs = ticker_zig.monotonicNs;
 const formats = @import("formats.zig");
 
 // --- Data Structures ---
@@ -15,10 +17,11 @@ pub const IoStat = struct {
     read: u64 = 0,
     write: u64 = 0,
 
+    /// Saturating delta prevents u64 wraparound spikes if a hot-plugged USB drive is removed.
     pub fn diff(self: IoStat, prev: IoStat) IoStat {
         return .{
-            .read = self.read -% prev.read,
-            .write = self.write -% prev.write,
+            .read = self.read -| prev.read,
+            .write = self.write -| prev.write,
         };
     }
 };
@@ -27,10 +30,11 @@ pub const NetStat = struct {
     rx: u64 = 0,
     tx: u64 = 0,
 
+    /// Saturating delta prevents u64 wraparound spikes if a USB NIC or tether is unplugged.
     pub fn diff(self: NetStat, prev: NetStat) NetStat {
         return .{
-            .rx = self.rx -% prev.rx,
-            .tx = self.tx -% prev.tx,
+            .rx = self.rx -| prev.rx,
+            .tx = self.tx -| prev.tx,
         };
     }
 };
@@ -180,20 +184,23 @@ pub const CpuProbe = struct {
     pub fn sample(self: *CpuProbe, io: Io) !void {
         const file = try ensureOpen(&self.file, io, "/proc/stat");
 
-        var buf: [128]u8 = undefined;
+        var buf: [256]u8 = undefined;
         const amt = try preadOnce(file, io, &buf);
+        const first_line = mem.sliceTo(buf[0..amt], '\n');
 
-        var it = mem.tokenizeAny(u8, buf[0..amt], " \n");
+        var it = mem.tokenizeAny(u8, first_line, " \t");
         _ = it.next(); // skip "cpu"
 
         var total: u64 = 0;
         var idle: u64 = 0;
         var i: usize = 0;
+        // Sum fields 0..7 (user, nice, system, idle, iowait, irq, softirq, steal).
+        // Fields 8..9 (guest, guest_nice) are already accounted inside user/nice by Linux.
         while (it.next()) |token| : (i += 1) {
-            if (i >= 10) break;
+            if (i >= 8) break;
             const val = std.fmt.parseInt(u64, token, 10) catch 0;
             total += val;
-            if (i == 3) idle = val;
+            if (i == 3 or i == 4) idle += val; // idle + iowait
         }
 
         if (!self.primed) {
@@ -204,12 +211,15 @@ pub const CpuProbe = struct {
             return;
         }
 
-        const diff_idle = idle -% self.prev_idle;
-        const diff_total = total -% self.prev_total;
+        const diff_idle = idle -| self.prev_idle;
+        const diff_total = total -| self.prev_total;
         self.prev_idle = idle;
         self.prev_total = total;
 
-        self.current_pct = if (diff_total == 0) 0 else 100 - (100 * diff_idle / diff_total);
+        self.current_pct = if (diff_total == 0 or diff_idle >= diff_total)
+            0
+        else
+            (100 * (diff_total - diff_idle)) / diff_total;
     }
 };
 
@@ -228,25 +238,25 @@ pub const MemProbe = struct {
         var buf: [2048]u8 = undefined;
         const amt = try preadOnce(file, io, &buf);
 
-        var found_free = false;
+        var found_avail = false;
         var found_dirty = false;
 
-        var line_it = mem.tokenizeAny(u8, buf[0..amt], "\n");
+        var line_it = mem.tokenizeScalar(u8, buf[0..amt], '\n');
         while (line_it.next()) |line| {
-            var col_it = mem.tokenizeAny(u8, line, " :kbKB");
-            const label = col_it.next() orelse continue;
-            const val_str = col_it.next() orelse continue;
+            const colon = mem.indexOfScalar(u8, line, ':') orelse continue;
+            const label = mem.trim(u8, line[0..colon], " \t");
+            const val_str = mem.trim(u8, line[colon + 1 ..], " \tkBKB");
             const val = std.fmt.parseInt(u64, val_str, 10) catch 0;
 
-            if (mem.eql(u8, label, "MemFree")) {
-                self.free = val >> 10; // Convert KB to MB
-                found_free = true;
+            if (mem.eql(u8, label, "MemAvailable")) {
+                self.free = val >> 10; // KiB -> MiB
+                found_avail = true;
             } else if (mem.eql(u8, label, "Dirty")) {
-                self.dirty = val << 10; // Convert KB to bytes for generic formatter
+                self.dirty = val << 10; // KiB -> bytes for generic formatter
                 found_dirty = true;
             }
 
-            if (found_free and found_dirty)
+            if (found_avail and found_dirty)
                 break;
         }
     }
@@ -255,6 +265,7 @@ pub const MemProbe = struct {
 pub const IoProbe = struct {
     file: ?Io.File = null,
     prev: IoStat = .{},
+    prev_ns: i96 = 0,
     current: IoStat = .{},
     primed: bool = false,
 
@@ -262,67 +273,81 @@ pub const IoProbe = struct {
         closeSlot(&self.file, io);
     }
 
+    pub fn isWholeDisk(dev: []const u8) bool {
+        if (mem.startsWith(u8, dev, "nvme")) {
+            return dev.len > 4 and mem.indexOfScalar(u8, dev, 'p') == null;
+        }
+        if (mem.startsWith(u8, dev, "mmcblk")) {
+            // Whole SD/eMMC device is mmcblk<digits> (excludes mmcblk0p1, mmcblk0boot0, mmcblk0rpmb)
+            if (dev.len <= 6) return false;
+            for (dev[6..]) |ch| {
+                if (!std.ascii.isDigit(ch)) return false;
+            }
+            return true;
+        }
+        if (mem.startsWith(u8, dev, "sd") or mem.startsWith(u8, dev, "hd") or mem.startsWith(u8, dev, "vd")) {
+            return dev.len > 2 and !std.ascii.isDigit(dev[dev.len - 1]);
+        }
+        if (mem.startsWith(u8, dev, "xvd")) {
+            return dev.len > 3 and !std.ascii.isDigit(dev[dev.len - 1]);
+        }
+        return false;
+    }
+
     pub fn sample(self: *IoProbe, io: Io) !void {
         const file = try ensureOpen(&self.file, io, "/proc/diskstats");
+        const now_ns = monotonicNs(io);
 
-        var buf: [4096]u8 = undefined;
+        var buf: [8192]u8 = undefined;
         const amt = try preadOnce(file, io, &buf);
 
         var raw = IoStat{};
 
-        var line_it = mem.tokenizeAny(u8, buf[0..amt], "\n");
+        var line_it = mem.tokenizeScalar(u8, buf[0..amt], '\n');
         while (line_it.next()) |line| {
-            var it = mem.tokenizeAny(u8, line, " ");
+            var it = mem.tokenizeAny(u8, line, " \t");
             _ = it.next(); // major
             _ = it.next(); // minor
-            const dev = it.next() orelse "";
+            const dev = it.next() orelse continue;
 
-            const is_valid_dev =
-                mem.startsWith(u8, dev, "nvme") // NVMe
-                or mem.startsWith(u8, dev, "sd") // SATA/SCSI
-                or mem.startsWith(u8, dev, "mmcblk") // SD Cards/eMMC
-                // or mem.startsWith(u8, dev, "vd")  // VirtIO (VMs)
-                or mem.startsWith(u8, dev, "sr") // CD/DVD
-                or mem.startsWith(u8, dev, "fd") // Floppy
-                or mem.startsWith(u8, dev, "hd"); // IDE Disks
+            if (!isWholeDisk(dev)) continue;
 
-            if (!is_valid_dev)
-                continue;
-
-            // Skip if it's an NVMe/MMC partition (contains 'p' before the end)
-            if (dev.len > 2 and dev[dev.len - 2] == 'p')
-                continue;
-
-            // Skip if it's an SD/HD/VD partition (e.g., sda1 is len 4, sda is len 3)
-            if ((mem.startsWith(u8, dev, "sd") or mem.startsWith(u8, dev, "hd")) and dev.len > 3)
-                continue;
-
+            // Remaining fields (0-indexed):
+            // 0: reads completed, 1: reads merged, 2: sectors read, 3: ms reading,
+            // 4: writes completed, 5: writes merged, 6: sectors written
             var i: usize = 0;
             while (it.next()) |token| : (i += 1) {
-                if (i == 3) raw.read += try std.fmt.parseInt(u64, token, 10);
-                if (i == 7) {
-                    raw.write += try std.fmt.parseInt(u64, token, 10);
+                if (i == 2) raw.read += std.fmt.parseInt(u64, token, 10) catch 0;
+                if (i == 6) {
+                    raw.write += std.fmt.parseInt(u64, token, 10) catch 0;
                     break;
                 }
             }
         }
+
         if (!self.primed) {
             self.prev = raw;
+            self.prev_ns = now_ns;
             self.current = .{};
             self.primed = true;
             return;
         }
-        self.current = raw.diff(self.prev);
-        // Apply 512 byte sector shift
-        self.current.read <<= 9;
-        self.current.write <<= 9;
+
+        const dt_ns: u64 = @intCast(@max(1, now_ns - self.prev_ns));
+        self.prev_ns = now_ns;
+        const delta = raw.diff(self.prev);
         self.prev = raw;
+
+        // Sectors are 512 bytes (<< 9), normalized to exact bytes/second
+        self.current.read = @intCast(((@as(u128, delta.read) << 9) * std.time.ns_per_s) / dt_ns);
+        self.current.write = @intCast(((@as(u128, delta.write) << 9) * std.time.ns_per_s) / dt_ns);
     }
 };
 
 pub const NetProbe = struct {
     file: ?Io.File = null,
     prev: NetStat = .{},
+    prev_ns: i96 = 0,
     current: NetStat = .{},
     primed: bool = false,
 
@@ -330,20 +355,31 @@ pub const NetProbe = struct {
         closeSlot(&self.file, io);
     }
 
+    pub fn isPhysicalNetIface(iface: []const u8) bool {
+        // Match real NICs (Ethernet, Wi-Fi, WWAN LTE/5G, USB tethering, InfiniBand) while
+        // excluding loopback (lo), VPN tunnels (wg*, tun*, tap*, tailscale*), and container
+        // bridges (docker*, veth*, br-*, virbr*) whose traffic also traverses the physical NIC.
+        return mem.startsWith(u8, iface, "en") or
+            mem.startsWith(u8, iface, "eth") or
+            mem.startsWith(u8, iface, "wl") or
+            mem.startsWith(u8, iface, "ww") or
+            mem.startsWith(u8, iface, "usb") or
+            mem.startsWith(u8, iface, "ib");
+    }
+
     pub fn sample(self: *NetProbe, io: Io) !void {
         const file = try ensureOpen(&self.file, io, "/proc/net/dev");
+        const now_ns = monotonicNs(io);
 
-        var buf: [2048]u8 = undefined;
+        var buf: [4096]u8 = undefined;
         const amt = try preadOnce(file, io, &buf);
 
         var raw = NetStat{};
-        var line_it = mem.tokenizeAny(u8, buf[0..amt], "\n");
+        var line_it = mem.tokenizeScalar(u8, buf[0..amt], '\n');
         while (line_it.next()) |line| {
             const colon = mem.indexOfScalar(u8, line, ':') orelse continue;
             const iface = mem.trim(u8, line[0..colon], " \t");
-            if (!(mem.startsWith(u8, iface, "en") or mem.startsWith(u8, iface, "eth") or mem.startsWith(u8, iface, "wl"))) {
-                continue;
-            }
+            if (!isPhysicalNetIface(iface)) continue;
 
             var fields = mem.tokenizeAny(u8, line[colon + 1 ..], " \t");
             var col: usize = 0;
@@ -359,12 +395,19 @@ pub const NetProbe = struct {
 
         if (!self.primed) {
             self.prev = raw;
+            self.prev_ns = now_ns;
             self.current = .{};
             self.primed = true;
             return;
         }
-        self.current = raw.diff(self.prev);
+
+        const dt_ns: u64 = @intCast(@max(1, now_ns - self.prev_ns));
+        self.prev_ns = now_ns;
+        const delta = raw.diff(self.prev);
         self.prev = raw;
+
+        self.current.rx = @intCast((@as(u128, delta.rx) * std.time.ns_per_s) / dt_ns);
+        self.current.tx = @intCast((@as(u128, delta.tx) * std.time.ns_per_s) / dt_ns);
     }
 };
 
@@ -436,63 +479,121 @@ pub const StorageProbe = struct {
         closeSlot(&self.file, io);
     }
 
+    pub fn isRealStorageMount(fs_type: []const u8, source: []const u8) bool {
+        if (mem.startsWith(u8, fs_type, "fuse") or
+            mem.eql(u8, fs_type, "squashfs") or
+            mem.eql(u8, fs_type, "erofs") or
+            mem.eql(u8, fs_type, "iso9660") or
+            mem.eql(u8, fs_type, "udf") or
+            mem.eql(u8, fs_type, "tmpfs") or
+            mem.eql(u8, fs_type, "devtmpfs") or
+            mem.eql(u8, fs_type, "overlay"))
+        {
+            return false;
+        }
+
+        if (!mem.startsWith(u8, source, "/dev/")) return false;
+
+        const excluded_devs = [_][]const u8{
+            "/dev/loop",
+            "/dev/ram",
+            "/dev/zram",
+            "/dev/sr",
+            "/dev/cdrom",
+            "/dev/fd",
+            "/dev/shm",
+            "/dev/pts",
+            "/dev/mqueue",
+            "/dev/hugepages",
+            "/dev/fuse",
+        };
+        for (excluded_devs) |prefix| {
+            if (mem.startsWith(u8, source, prefix)) return false;
+        }
+        return true;
+    }
+
+    fn parseDevId(dev_str: []const u8) ?u64 {
+        const colon = mem.indexOfScalar(u8, dev_str, ':') orelse return null;
+        const major = std.fmt.parseInt(u32, dev_str[0..colon], 10) catch return null;
+        const minor = std.fmt.parseInt(u32, dev_str[colon + 1 ..], 10) catch return null;
+        return (@as(u64, major) << 32) | @as(u64, minor);
+    }
+
+    /// Decodes Linux mountinfo octal escapes (e.g. "\040" -> ' ') into a NUL-terminated path.
+    pub fn unescapeMountPath(raw: []const u8, out: []u8) ?usize {
+        if (out.len == 0) return null;
+        var r: usize = 0;
+        var w: usize = 0;
+        while (r < raw.len) {
+            if (w >= out.len - 1) return null;
+            if (raw[r] == '\\' and r + 3 < raw.len and
+                raw[r + 1] >= '0' and raw[r + 1] <= '3' and
+                raw[r + 2] >= '0' and raw[r + 2] <= '7' and
+                raw[r + 3] >= '0' and raw[r + 3] <= '7')
+            {
+                const d1: u8 = raw[r + 1] - '0';
+                const d2: u8 = raw[r + 2] - '0';
+                const d3: u8 = raw[r + 3] - '0';
+                out[w] = (d1 << 6) | (d2 << 3) | d3;
+                r += 4;
+            } else {
+                out[w] = raw[r];
+                r += 1;
+            }
+            w += 1;
+        }
+        out[w] = 0;
+        return w;
+    }
+
     pub fn sample(self: *StorageProbe, io: Io) !void {
-        const now = nanoTimestamp(io);
+        const now = monotonicNs(io);
         if (self.last_sample_ns != 0 and now - self.last_sample_ns < refresh_interval_ns) {
             return;
         }
         self.last_sample_ns = now;
 
-        const file = try ensureOpen(&self.file, io, "/proc/mounts");
+        const file = try ensureOpen(&self.file, io, "/proc/self/mountinfo");
 
-        // Fixed-size buffer to track seen devices without heap allocation
-        var seen_storage: [16][64]u8 = undefined;
+        // Deduplicate by kernel superblock major:minor so Btrfs subvolumes, multi-device pools,
+        // bind mounts, and /dev/mapper vs /dev/dm-* aliases are counted once.
+        var seen_sb: [64]u64 = undefined;
         var seen_count: usize = 0;
 
         var total_free: u64 = 0;
-        var buf: [4096]u8 = undefined;
+        var buf: [16384]u8 = undefined;
         const amt = try preadOnce(file, io, &buf);
 
-        var line_it = mem.tokenizeAny(u8, buf[0..amt], "\n");
+        var line_it = mem.tokenizeScalar(u8, buf[0..amt], '\n');
         while (line_it.next()) |line| {
-            var col_it = mem.tokenizeAny(u8, line, " ");
-            const dev_name = col_it.next() orelse continue;
-            const mnt_dir = col_it.next() orelse continue;
+            const sep = mem.indexOf(u8, line, " - ") orelse continue;
+            var left_it = mem.tokenizeScalar(u8, line[0..sep], ' ');
+            _ = left_it.next() orelse continue; // mount_id
+            _ = left_it.next() orelse continue; // parent_id
+            const dev_id_str = left_it.next() orelse continue; // major:minor
+            _ = left_it.next() orelse continue; // root
+            const mnt_dir = left_it.next() orelse continue; // mount_point
 
-            const is_storage = mem.startsWith(u8, dev_name, "/dev/sd") or
-                mem.startsWith(u8, dev_name, "/dev/nvme") or
-                mem.startsWith(u8, dev_name, "/dev/mmcblk");
+            var right_it = mem.tokenizeScalar(u8, line[sep + 3 ..], ' ');
+            const fs_type = right_it.next() orelse continue;
+            const source = right_it.next() orelse continue;
 
-            if (is_storage) {
-                // Check if we've seen this device name before
-                var already_seen = false;
-                for (seen_storage[0..seen_count]) |seen_name| {
-                    if (mem.eql(u8, dev_name, mem.sliceTo(&seen_name, 0))) {
-                        already_seen = true;
-                        break;
-                    }
-                }
+            if (!isRealStorageMount(fs_type, source)) continue;
 
-                if (!already_seen and seen_count < seen_storage.len) {
-                    var stat: c.struct_statvfs = undefined;
+            const sb_id = parseDevId(dev_id_str) orelse continue;
+            if (mem.indexOfScalar(u64, seen_sb[0..seen_count], sb_id) != null) continue;
 
-                    // statvfs needs a null-terminated string.
-                    // We can use a small stack buffer for the path.
-                    var path_buf: [256]u8 = undefined;
-                    if (mnt_dir.len < path_buf.len - 1) {
-                        @memcpy(path_buf[0..mnt_dir.len], mnt_dir);
-                        path_buf[mnt_dir.len] = 0;
+            var path_buf: [512]u8 = undefined;
+            if (unescapeMountPath(mnt_dir, &path_buf) == null) continue;
 
-                        if (c.statvfs(&path_buf, &stat) == 0) {
-                            total_free += stat.f_bavail * stat.f_bsize;
-
-                            // Save device name to seen list
-                            const name_len = @min(dev_name.len, 63);
-                            @memcpy(seen_storage[seen_count][0..name_len], dev_name[0..name_len]);
-                            seen_storage[seen_count][name_len] = 0;
-                            seen_count += 1;
-                        }
-                    }
+            var stat: c.struct_statvfs = undefined;
+            if (c.statvfs(&path_buf, &stat) == 0 and stat.f_blocks > 0) {
+                const block_size: u64 = if (stat.f_frsize != 0) stat.f_frsize else stat.f_bsize;
+                total_free += stat.f_bavail * block_size;
+                if (seen_count < seen_sb.len) {
+                    seen_sb[seen_count] = sb_id;
+                    seen_count += 1;
                 }
             }
         }
@@ -701,4 +802,58 @@ test "System probes sample without errors" {
     try time_probe.sample(std.testing.io);
     try std.testing.expect(time_probe.changed);
     try std.testing.expectEqual(@as(usize, 21), time_probe.value.len);
+}
+
+test "Device filters, mount path unescaping, and hot-unplug saturating diffs" {
+    // Whole disks vs partitions & virtual block devices
+    try std.testing.expect(IoProbe.isWholeDisk("nvme0n1"));
+    try std.testing.expect(!IoProbe.isWholeDisk("nvme0n1p1"));
+    try std.testing.expect(!IoProbe.isWholeDisk("nvme0n1p12"));
+    try std.testing.expect(IoProbe.isWholeDisk("sda"));
+    try std.testing.expect(IoProbe.isWholeDisk("sdaa"));
+    try std.testing.expect(!IoProbe.isWholeDisk("sda1"));
+    try std.testing.expect(!IoProbe.isWholeDisk("sda12"));
+    try std.testing.expect(IoProbe.isWholeDisk("vda"));
+    try std.testing.expect(IoProbe.isWholeDisk("xvda"));
+    try std.testing.expect(IoProbe.isWholeDisk("mmcblk0"));
+    try std.testing.expect(!IoProbe.isWholeDisk("mmcblk0p1"));
+    try std.testing.expect(!IoProbe.isWholeDisk("mmcblk0boot0"));
+    try std.testing.expect(!IoProbe.isWholeDisk("dm-0"));
+    try std.testing.expect(!IoProbe.isWholeDisk("loop0"));
+    try std.testing.expect(!IoProbe.isWholeDisk("zram0"));
+
+    // Network interfaces: physical vs virtual/tunnels
+    try std.testing.expect(NetProbe.isPhysicalNetIface("enp2s0"));
+    try std.testing.expect(NetProbe.isPhysicalNetIface("eth0"));
+    try std.testing.expect(NetProbe.isPhysicalNetIface("wlp3s0"));
+    try std.testing.expect(NetProbe.isPhysicalNetIface("wwan0"));
+    try std.testing.expect(NetProbe.isPhysicalNetIface("usb0"));
+    try std.testing.expect(!NetProbe.isPhysicalNetIface("lo"));
+    try std.testing.expect(!NetProbe.isPhysicalNetIface("wg0"));
+    try std.testing.expect(!NetProbe.isPhysicalNetIface("tun0"));
+    try std.testing.expect(!NetProbe.isPhysicalNetIface("docker0"));
+    try std.testing.expect(!NetProbe.isPhysicalNetIface("veth1234"));
+
+    // Storage mount filtering & octal escape decoding
+    try std.testing.expect(StorageProbe.isRealStorageMount("btrfs", "/dev/nvme0n1p2"));
+    try std.testing.expect(StorageProbe.isRealStorageMount("ext4", "/dev/mapper/cryptroot"));
+    try std.testing.expect(StorageProbe.isRealStorageMount("xfs", "/dev/md0"));
+    try std.testing.expect(!StorageProbe.isRealStorageMount("squashfs", "/dev/loop0"));
+    try std.testing.expect(!StorageProbe.isRealStorageMount("fuse.AppImage", "OpenIDEA.AppImage"));
+    try std.testing.expect(!StorageProbe.isRealStorageMount("ext4", "/dev/zram0"));
+
+    var unescaped: [64]u8 = undefined;
+    const len = StorageProbe.unescapeMountPath("/run/media/moon/My\\040USB\\040Drive", &unescaped).?;
+    try std.testing.expectEqualStrings("/run/media/moon/My USB Drive", unescaped[0..len]);
+
+    // Hot-unplugging a USB drive or NIC must clamp to 0 instead of wrapping u64
+    const prev_io = IoStat{ .read = 50_000, .write = 80_000 };
+    const after_unplug_io = (IoStat{ .read = 10_000, .write = 20_000 }).diff(prev_io);
+    try std.testing.expectEqual(@as(u64, 0), after_unplug_io.read);
+    try std.testing.expectEqual(@as(u64, 0), after_unplug_io.write);
+
+    const prev_net = NetStat{ .rx = 1_000_000, .tx = 500_000 };
+    const after_unplug_net = (NetStat{ .rx = 200_000, .tx = 100_000 }).diff(prev_net);
+    try std.testing.expectEqual(@as(u64, 0), after_unplug_net.rx);
+    try std.testing.expectEqual(@as(u64, 0), after_unplug_net.tx);
 }

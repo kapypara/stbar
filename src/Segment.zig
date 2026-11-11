@@ -46,13 +46,14 @@ pub const Segment = struct {
                 sum_p2 +%= @truncate(s_val >> 64);
             }
 
+            const sample_len_f = @as(f64, @floatFromInt(entry.sample.len));
             const target_p1: f64 = switch (entry.mode) {
-                .average => @as(f64, @floatFromInt(sum_p1)) / @as(f64, @floatFromInt(entry.sample.len)),
-                .rate_of_change, .message => @as(f64, @floatFromInt(sum_p1)),
+                .average, .rate_of_change => @as(f64, @floatFromInt(sum_p1)) / sample_len_f,
+                .message => @as(f64, @floatFromInt(sum_p1)),
             };
             const target_p2: f64 = switch (entry.mode) {
-                .average => @as(f64, @floatFromInt(sum_p2)) / @as(f64, @floatFromInt(entry.sample.len)),
-                .rate_of_change, .message => @as(f64, @floatFromInt(sum_p2)),
+                .average, .rate_of_change => @as(f64, @floatFromInt(sum_p2)) / sample_len_f,
+                .message => @as(f64, @floatFromInt(sum_p2)),
             };
 
             const total_frames = @as(f64, @floatFromInt(entry.frames.len));
