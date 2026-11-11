@@ -1,7 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
 const mem = std.mem;
-const print = std.debug.print;
 
 const x11 = @import("Window.zig").c;
 
@@ -230,9 +229,6 @@ pub const IoProbe = struct {
 
         var line_it = mem.tokenizeAny(u8, buf[0..amt], "\n");
         while (line_it.next()) |line| {
-
-            // print("{s:<120} | {d} B\n", .{line,  line.len});
-
             var it = mem.tokenizeAny(u8, line, " ");
             _ = it.next(); // major
             _ = it.next(); // minor
@@ -488,17 +484,6 @@ pub const WindowNameProbe = struct {
         self.display = display;
         self.root = root;
         _ = x11.XSetErrorHandler(xErrorHandler);
-    }
-
-    pub fn init(self: *WindowNameProbe) !void {
-        self.display = x11.XOpenDisplay(null) orelse return error.XOpenDisplayFailed;
-        const screen = x11.DefaultScreen(self.display);
-        self.root = x11.XRootWindow(self.display, screen);
-        _ = x11.XSetErrorHandler(xErrorHandler);
-    }
-
-    pub fn deinit(self: *WindowNameProbe) void {
-        if (self.display) |d| _ = x11.XCloseDisplay(d);
     }
 
     pub fn slice(self: *const WindowNameProbe) []const u8 {

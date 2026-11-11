@@ -194,20 +194,7 @@ pub const Window = struct {
 
     pub fn createTheRenderContext(self: *Window) !void {
         const dpy = self.display orelse return error.NoDisplay;
-        
-        // ARB Context Creation logic
-        const major_attr = 0x2091; // GLX_CONTEXT_MAJOR_VERSION_ARB
-        const minor_attr = 0x2092; // GLX_CONTEXT_MINOR_VERSION_ARB
-        
-        const context_attribs = [_]i32{
-            major_attr, 2,
-            minor_attr, 1,
-            c.None,
-        };
 
-        _ = context_attribs;
-
-        // Simplified: Try glXCreateNewContext (Fallback in your C++)
         self.render_context = c.glXCreateNewContext(dpy, self.fbconfig, c.GLX_RGBA_TYPE, null, c.True);
         
         if (self.render_context == null) return error.ContextCreationFailed;

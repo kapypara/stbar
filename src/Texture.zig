@@ -28,9 +28,7 @@ pub const Texture = struct {
         // This safely normalizes grayscale or RGB inputs into RGBA
         try image.convert(allocator, .rgba32);
 
-        // 4. Access the raw byte data
-        // Under the hood, image.pixels.rgba32 is a slice of zigimg.color.Rgba32
-        // const pixel_count = image.width * image.height;
+        // Access the raw byte data
         const raw_pixels: []zigimg.color.Rgba32 = image.pixels.rgba32;
         const flat_bytes: []const u8 = std.mem.sliceAsBytes(raw_pixels);
 
@@ -39,28 +37,10 @@ pub const Texture = struct {
 
         return .{
             .allocator = allocator,
-
             .height = @intCast(image.height),
             .width = @intCast(image.width),
             .rgba = owned_rgba,
         };
-
-        // 5. Example: Read the top-left pixel
-        // if (pixel_count > 0) {
-        //     const first_pixel = raw_pixels[0];
-        //     std.debug.print("Top-Left Pixel - R: {}, G: {}, B: {}, A: {}\n", .{
-        //         first_pixel.r,
-        //         first_pixel.g,
-        //         first_pixel.b,
-        //         first_pixel.a,
-        //     });
-        // }
-
-        // 6. Need it as a flat []u8 array for WebGL / OpenGL / Vulkan?
-        // You can safely cast the slice because Rgba32 is a tightly packed extern struct
-        // const flat_bytes: []u8 = std.mem.sliceAsBytes(raw_pixels);
-        // std.debug.print("Total raw byte array length: {}\n", .{flat_bytes.len});
-        // return flat_bytes;
     }
 
     pub fn deinit(self: *Texture) void {

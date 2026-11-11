@@ -114,16 +114,6 @@ pub const FontAtlas = struct {
         // Sort for binary search lookups
         std.sort.pdq(GlyphCoord, glyph_list.items, {}, GlyphCoord.compareByCode);
 
-        // std.debug.print("{any}\n", .{x.allocator});
-        // std.debug.print("Name: {s}\n", .{x.name});
-        // std.debug.print("Path: {s}\n", .{x.bitmap_path});
-        // std.debug.print("CW: {d}\n", .{x.char_width});
-        // std.debug.print("CH: {d}\n", .{x.char_height});
-        // std.debug.print("XInc: {d}\n", .{x.x_increment});
-        // std.debug.print("YInc: {d}\n", .{x.y_increment});
-        // std.debug.print("{any}\n", .{x.glyphs});
-        // std.process.exit(0);
-
         return FontAtlas{
             .allocator = allocator,
             .name = try allocator.dupe(u8, root.get("name").?.string),

@@ -214,33 +214,6 @@ pub const RectDraw = struct {
     pub fn flush(_: RectDraw) !void {
         c.glFlush();
     }
-
-    pub fn testRender() void {
-
-        const w = @as(f32, @floatFromInt(900));
-        const h = @as(f32, @floatFromInt(700));
-
-        c.glMatrixMode(c.GL_PROJECTION);
-        c.glLoadIdentity();
-        c.glOrtho(0, @floatCast(w - 1), @floatCast(h - 1), 0, 0, 1);
-
-        c.glClearColor(0.0, 0.0, 0.0, 0.0);
-        c.glClear(c.GL_COLOR_BUFFER_BIT);
-
-        // Example: Drawing the Quads from your C++ code
-        c.glEnable(c.GL_BLEND);
-        c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
-
-        c.glColor4f(1.0, 0.0, 0.0, 0.7); // Red
-        c.glBegin(c.GL_QUADS);
-        c.glVertex2i(100, 100);
-        c.glVertex2i(100, 700 - 100);
-        c.glVertex2i(900 - 100, 700 - 100);
-        c.glVertex2i(900 - 100, 100);
-        c.glEnd();
-
-        c.glFlush();
-    }
 };
 
 fn compileshader(kind: c.GLenum, source: []const u8) !c.GLuint {
