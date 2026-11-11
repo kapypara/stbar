@@ -117,10 +117,7 @@ pub const Metric = union(MetricTag) {
 
         switch (self.*) {
             .cpu => write(&result, formats.cpuUsage(value)),
-            .temp => {
-                const x = formats.none(value);
-                write(&result, x.buf[0..x.len]);
-            },
+            .temp => write(&result, formats.temperature(value)),
             .load => write(&result, formats.systemLoad(value)),
             .free_storage => write(&result, formats.freeSpace(value)),
 

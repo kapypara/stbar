@@ -344,7 +344,7 @@ pub const StatusMonitor = struct {
                 if (v1 != m.last_p1) {
                     m.last_p1 = v1;
                     const s1 = m.metric.print(v1, 0);
-                    if (try self.drawSegment(segment, s1.slice(), m.start_index)) {
+                    if (self.drawSegment(segment, s1.slice(), m.start_index)) {
                         drew_anything = true;
                     }
                 }
@@ -355,7 +355,7 @@ pub const StatusMonitor = struct {
                         m.last_p2 = v2;
                         const target_seg = m.secondary_segment orelse segment;
                         const s2 = m.metric.print(v2, 1);
-                        if (try self.drawSegment(target_seg, s2.slice(), sec_offset)) {
+                        if (self.drawSegment(target_seg, s2.slice(), sec_offset)) {
                             drew_anything = true;
                         }
                     }
@@ -367,13 +367,13 @@ pub const StatusMonitor = struct {
         const time_probe = &self.time_metrics[0].metric.time;
         if (time_probe.changed) {
             time_probe.changed = false;
-            if (try self.drawSegment(&self.time_segment, &time_probe.value, self.time_metrics[0].start_index)) {
+            if (self.drawSegment(&self.time_segment, &time_probe.value, self.time_metrics[0].start_index)) {
                 drew_anything = true;
             }
         }
 
         // 3. Active window title + marquee rotation for overflowing titles
-        if (try self.renderWindowTitle()) {
+        if (self.renderWindowTitle()) {
             drew_anything = true;
         }
 
@@ -386,7 +386,30 @@ pub const StatusMonitor = struct {
         self.ticks +%= 1;
     }
 
-    fn renderWindowTitle(self: *StatusMonitor) !bool {
+    fn decodeNextCodepoint(input: []const u8, index: *usize) u32 {
+        const i = index.*;
+        const b = input[i];
+        if (b < 0x80) {
+            index.* = i + 1;
+            return b;
+        }
+        const seq_len = std.unicode.utf8ByteSequenceLength(b) catch {
+            index.* = i + 1;
+            return 0xFFFD;
+        };
+        if (i + seq_len > input.len) {
+            index.* = input.len;
+            return 0xFFFD;
+        }
+        const cp = std.unicode.utf8Decode(input[i .. i + seq_len]) catch {
+            index.* = i + 1;
+            return 0xFFFD;
+        };
+        index.* = i + seq_len;
+        return cp;
+    }
+
+    fn renderWindowTitle(self: *StatusMonitor) bool {
         const win_probe = &self.window_metrics[0].metric.window;
         const max_chars = self.window_title_segment.cells.len -| 2;
         if (max_chars == 0) return false;
@@ -395,23 +418,16 @@ pub const StatusMonitor = struct {
             win_probe.changed = false;
             var changed = self.clearSegment(&self.window_title_segment);
 
-            // Filter UTF-8 title down to codepoints present in FontAtlas
+            // Single-pass filter of title bytes/UTF-8 down to codepoints present in FontAtlas
             self.title_len = 0;
-            if (std.unicode.Utf8View.init(win_probe.slice())) |view| {
-                var it = view.iterator();
-                while (it.nextCodepoint()) |cp| {
-                    if (cp == '\n' or cp == '\r') continue;
-                    if (self.font.getGlyphUV(cp) != null and self.title_len < 252) {
-                        self.title_codepoints[self.title_len] = cp;
-                        self.title_len += 1;
-                    }
-                }
-            } else |_| {
-                for (win_probe.slice()) |b| {
-                    if (b >= 32 and b < 127 and self.font.getGlyphUV(b) != null and self.title_len < 252) {
-                        self.title_codepoints[self.title_len] = b;
-                        self.title_len += 1;
-                    }
+            const raw = win_probe.slice();
+            var byte_idx: usize = 0;
+            while (byte_idx < raw.len and self.title_len < 252) {
+                const cp = decodeNextCodepoint(raw, &byte_idx);
+                if (cp == '\n' or cp == '\r') continue;
+                if (self.font.getGlyphUV(cp) != null) {
+                    self.title_codepoints[self.title_len] = cp;
+                    self.title_len += 1;
                 }
             }
 
@@ -450,18 +466,18 @@ pub const StatusMonitor = struct {
         return false;
     }
 
-    pub fn drawSegment(self: *StatusMonitor, seg: *const Segment, input: []const u8, offset: u8) !bool {
+    pub fn drawSegment(self: *StatusMonitor, seg: *const Segment, input: []const u8, offset: u8) bool {
         if (input.len == 0 or offset >= seg.cells.len or self.quad_buffer.len == 0) return false;
 
         const base = self.segments.len + seg.cell_start;
-        const view = try std.unicode.Utf8View.init(input);
-        var iterator = view.iterator();
+        var byte_idx: usize = 0;
         var cell_idx: usize = 0;
         var changed = false;
 
-        while (iterator.nextCodepoint()) |cp| {
+        while (byte_idx < input.len) {
             const target_cell = cell_idx + offset;
             if (target_cell >= seg.cells.len) break;
+            const cp = decodeNextCodepoint(input, &byte_idx);
             cell_idx += 1;
 
             if (cp == '\n') continue; // Preserve existing static glyph in this cell
@@ -560,7 +576,7 @@ pub const StatusMonitor = struct {
             }
 
             if (seg.static_overlay.len > 0) {
-                _ = try self.drawSegment(seg, seg.static_overlay, seg.static_offset);
+                _ = self.drawSegment(seg, seg.static_overlay, seg.static_offset);
             }
         }
     }

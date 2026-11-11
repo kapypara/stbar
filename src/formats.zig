@@ -1,69 +1,22 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
-/// Bitwise selection: (ifTrue & -condition) | (ifFalse & ~(-condition))
-/// In Zig, we cast the bool to a integer to create the mask.
-fn bitSelect(condition: bool, ifTrue: u8, ifFalse: u8) u8 {
-    const mask = if (@intFromBool(condition) == 1) @as(u8, 0xFF) else @as(u8, 0);
-    return (ifTrue & mask) | (ifFalse & ~mask);
-}
-
-pub fn toBCD(binary_num: u64) u64 {
-    if (comptime builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86) {
-        var bcd: [10]u8 align(16) = @splat(0);
-        var num: i64 = @intCast(@min(binary_num, std.math.maxInt(i64)));
-
-        // Using x86 inline assembly for FBSTP (FPU BCD Store and Pop).
-        // `bcd` must be an output memory operand so LLVM sees the write.
-        asm volatile (
-            \\ fildq (%[num])
-            \\ fbstp (%[bcd])
-            :
-            : [bcd] "r" (&bcd),
-              [num] "r" (&num),
-            : .{ .memory = true, .st0 = true, .fpsr = true }
-        );
-
-        return std.mem.readInt(u64, bcd[0..8], .little);
-    } else {
-        var n = binary_num;
-        var bcd: u64 = 0;
-        var shift: u6 = 0;
-        while (n != 0 and shift <= 60) : (shift += 4) {
-            bcd |= (n % 10) << shift;
-            n /= 10;
-            if (shift == 60) break;
-        }
-        return bcd;
+inline fn extractDigits(comptime N: usize, value: u64) [N]u8 {
+    var digits: [N]u8 = undefined;
+    var v = value;
+    inline for (0..N) |i| {
+        digits[i] = @intCast(v % 10);
+        v /= 10;
     }
-}
-
-pub fn fromBCD(bcd_num_in: u64) u64 {
-    var bcd_num = bcd_num_in;
-    var binary: u64 = 0;
-    var digit_place: u64 = 1;
-    while (bcd_num != 0) : ({
-        digit_place *= 10;
-        bcd_num >>= 4;
-    }) {
-        binary += (bcd_num & 0xf) * digit_place;
-    }
-    return binary;
+    return digits;
 }
 
 pub fn cpuUsage(input: u64) [3]u8 {
-    var buffer: [3]u8 = undefined;
-    const digits = toBCD(input);
+    if (input == 0) return " --".*;
+    if (input >= 100) return "100".*;
 
-    buffer[2] = @intCast(digits & 0xf);
-    buffer[2] += bitSelect(digits > 0, '0', '-');
-
-    buffer[1] = @intCast((digits >> 4) & 0xf);
-    buffer[1] += bitSelect(digits > 0, '0', '-');
-
-    buffer[0] = bitSelect(digits > 0xff, '1', ' ');
-    
-    return buffer;
+    const tens: u8 = @intCast(input / 10);
+    const ones: u8 = @intCast(input % 10);
+    return .{ ' ', '0' + tens, '0' + ones };
 }
 
 pub const MemoryString = struct {
@@ -81,78 +34,62 @@ pub fn memory(input: u64) MemoryString {
         .len = 6,
     };
 
-    const digits = toBCD(input);
-    const d0: u8 = @intCast((digits & 0xf) + '0');
-    const d1: u8 = @intCast(((digits >> 4) & 0xf) + '0');
-    const d2: u8 = @intCast(((digits >> 8) & 0xf) + '0');
-
-    if (((digits >> 12) & 0xff) != 0) {
-        result.buf[0] = @intCast(((digits >> 16) & 0xf) + '0');
-        result.buf[1] = @intCast(((digits >> 12) & 0xf) + '0');
+    if (input >= 1000) {
+        const d = extractDigits(5, @min(input, 99_999));
+        result.buf[0] = '0' + d[4];
+        result.buf[1] = '0' + d[3];
         // result.buf[2] stays '\n' to preserve the static ',' glyph
-        result.buf[3] = d2;
-        result.buf[4] = d1;
-        result.buf[5] = d0;
+        result.buf[3] = '0' + d[2];
+        result.buf[4] = '0' + d[1];
+        result.buf[5] = '0' + d[0];
         result.len = 6;
     } else {
-        // Low-memory warning icons (U+E017, U+E018) encoded as valid UTF-8 + '\n' comma skip
+        // Low-memory warning icons (U+E017, U+E018) + '\n' comma skip
+        const d = extractDigits(3, input);
         const prefix = "\u{e017}\u{e018}\n";
         @memcpy(result.buf[0..prefix.len], prefix);
-        result.buf[7] = d2;
-        result.buf[8] = d1;
-        result.buf[9] = d0;
+        result.buf[7] = '0' + d[2];
+        result.buf[8] = '0' + d[1];
+        result.buf[9] = '0' + d[0];
         result.len = 10;
     }
     return result;
 }
 
 pub fn systemLoad(input: u64) [5]u8 {
-    var buffer: [5]u8 = undefined;
-    @memset(&buffer, '\n');
-
-    const digits = toBCD(input);
-
-    buffer[4] = @intCast((digits & 0xf) + '0');
-    buffer[3] = @intCast(((digits >> 4) & 0xf) + '0');
-    buffer[1] = @intCast(((digits >> 8) & 0xf) + '0');
-
-    const first_digit: u8 = @intCast((digits >> 12) & 0xf);
-    buffer[0] = first_digit + (if (first_digit != 0) @as(u8, '0') else @as(u8, ' '));
-
-    return buffer;
+    const d = extractDigits(4, @min(input, 9999));
+    return .{
+        if (d[3] != 0) '0' + d[3] else ' ',
+        '0' + d[2],
+        '\n',
+        '0' + d[1],
+        '0' + d[0],
+    };
 }
 
 pub fn freeSpace(input_raw: u64) [8]u8 {
-    var buffer: [8]u8 = undefined;
-    @memset(&buffer, '\n');
+    const scaled = ((input_raw >> 20) * 1000) >> 10;
+    const d = extractDigits(7, @min(scaled, 9_999_999));
 
-    const input = ((input_raw >> 20) * 1000) >> 10;
-    const digits = toBCD(input);
+    // Leading-zero suppression using '\x02' Tamzen spacer glyph
+    const b0: u8 = if (d[6] == 0) '\x02' else '0' + d[6];
+    const b1: u8 = if (d[5] == 0 and b0 == '\x02') '\x02' else '0' + d[5];
+    const b2: u8 = if (d[4] == 0 and b1 == '\x02') '\x02' else '0' + d[4];
+    const b3: u8 = if (d[3] == 0 and b2 == '\x02') '\x02' else '0' + d[3];
 
-    // Logic for leading zero suppression using '\2' special char
-    const d0: u8 = @intCast((digits >> 24) & 0xf);
-    buffer[0] = d0 + bitSelect(d0 == 0, '\x02', '0');
-
-    const d1: u8 = @intCast((digits >> 20) & 0xf);
-    buffer[1] = d1 + bitSelect(d1 == 0 and buffer[0] == '\x02', '\x02', '0');
-
-    const d2: u8 = @intCast((digits >> 16) & 0xf);
-    buffer[2] = d2 + bitSelect(d2 == 0 and buffer[1] == '\x02', '\x02', '0');
-
-    const d3: u8 = @intCast((digits >> 12) & 0xf);
-    buffer[3] = d3 + bitSelect(d3 == 0 and buffer[2] == '\x02', '\x02', '0');
-
-    buffer[5] = @intCast(((digits >> 8) & 0xf) + '0');
-    buffer[6] = @intCast(((digits >> 4) & 0xf) + '0');
-    buffer[7] = @intCast((digits & 0xf) + '0');
-
-    return buffer;
+    return .{
+        b0,
+        b1,
+        b2,
+        b3,
+        '\n',
+        '0' + d[2],
+        '0' + d[1],
+        '0' + d[0],
+    };
 }
 
 pub fn generic(num_in: u64) [6]u8 {
-    var buffer: [6]u8 = undefined;
-    @memset(&buffer, '\n');
-
     var num = num_in;
     var suffix: u8 = ' ';
 
@@ -187,39 +124,30 @@ pub fn generic(num_in: u64) [6]u8 {
         },
     }
 
-    const digits = toBCD(num);
-    buffer[5] = suffix;
-    buffer[4] = @intCast((digits & 0xf) + '0');
-    buffer[2] = @intCast(((digits >> 4) & 0xf) + '0');
-    buffer[1] = @intCast(((digits >> 8) & 0xf) + '0');
-    buffer[0] = @intCast(((digits >> 12) & 0xf) + '0');
-
-    return buffer;
-}
-
-const NoneStruct = struct {
-    buf: [21]u8,
-    len: usize,
-};
-
-pub fn none(input: u64) NoneStruct {
-
-    var result: NoneStruct = .{
-        .buf = undefined,
-        .len = undefined,
+    const d = extractDigits(4, @min(num, 9999));
+    return .{
+        '0' + d[3],
+        '0' + d[2],
+        '0' + d[1],
+        '\n',
+        '0' + d[0],
+        suffix,
     };
-
-    // Converts to standard decimal string then to u8 slice
-    const str = std.fmt.bufPrint(&result.buf, "{d: >2}", .{input}) catch "--";
-    result.len = str.len;
-
-    return result;
 }
 
-test "BCD roundtrip and metric formatters" {
-    try std.testing.expectEqual(@as(u64, 19072), fromBCD(toBCD(19072)));
+pub fn temperature(input: u64) [2]u8 {
+    const clamped = @min(input, 99);
+    const tens: u8 = @intCast(clamped / 10);
+    const ones: u8 = @intCast(clamped % 10);
+    return .{
+        if (clamped >= 10) '0' + tens else ' ',
+        '0' + ones,
+    };
+}
 
+test "Pure integer metric formatters" {
     try std.testing.expectEqualStrings(" --", &cpuUsage(0));
+    try std.testing.expectEqualStrings(" 05", &cpuUsage(5));
     try std.testing.expectEqualStrings(" 13", &cpuUsage(13));
     try std.testing.expectEqualStrings("100", &cpuUsage(100));
 
@@ -227,10 +155,16 @@ test "BCD roundtrip and metric formatters" {
     try std.testing.expectEqualStrings("19\n072", mem_hi.slice());
     try std.testing.expectEqual(@as(usize, 6), try std.unicode.utf8CountCodepoints(mem_hi.slice()));
 
+    const mem_100g = memory(100_000);
+    try std.testing.expectEqualStrings("99\n999", mem_100g.slice());
+
     const mem_lo = memory(512);
     try std.testing.expectEqualStrings("\u{e017}\u{e018}\n512", mem_lo.slice());
     try std.testing.expectEqual(@as(usize, 6), try std.unicode.utf8CountCodepoints(mem_lo.slice()));
 
     try std.testing.expectEqualStrings(" 1\n34", &systemLoad(134));
+    try std.testing.expectEqualStrings("12\n34", &systemLoad(1234));
     try std.testing.expectEqualStrings("000\n0B", &generic(0));
+    try std.testing.expectEqualStrings(" 9", &temperature(9));
+    try std.testing.expectEqualStrings("54", &temperature(54));
 }
