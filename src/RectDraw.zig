@@ -1,6 +1,9 @@
 const std = @import("std");
 
 const c = @import("c");
+const gl_procs_zig = @import("GlProcs.zig");
+const GlProcs = gl_procs_zig.GlProcs;
+const ProcLoader = gl_procs_zig.ProcLoader;
 
 pub const RectDraw = struct {
     pub const uv_solid: [2]u16 = .{ 65535, 65535 };
@@ -12,6 +15,8 @@ pub const RectDraw = struct {
         uv: [2]u16,
         color: [4]u8,
     };
+
+    gl: GlProcs = undefined,
 
     // OpenGL Handles
     program: c.GLuint = 0,
@@ -110,77 +115,80 @@ pub const RectDraw = struct {
         \\}
     ;
 
-    pub fn init() !RectDraw {
-        var r: RectDraw = .{};
+    pub fn init(loader: ProcLoader) !RectDraw {
+        var r: RectDraw = .{
+            .gl = try GlProcs.load(loader),
+        };
         try r.build();
         return r;
     }
 
     pub fn build(self: *RectDraw) !void {
-        const vs = try compileshader(c.GL_VERTEX_SHADER, vs_source);
-        defer glew(c.glDeleteShader, .{vs}) catch {};
-        const gs = try compileshader(c.GL_GEOMETRY_SHADER, gs_source);
-        defer glew(c.glDeleteShader, .{gs}) catch {};
-        const fs = try compileshader(c.GL_FRAGMENT_SHADER, fs_source);
-        defer glew(c.glDeleteShader, .{fs}) catch {};
+        const vs = try self.compileShader(c.GL_VERTEX_SHADER, vs_source);
+        defer self.gl.DeleteShader(vs);
+        const gs = try self.compileShader(c.GL_GEOMETRY_SHADER, gs_source);
+        defer self.gl.DeleteShader(gs);
+        const fs = try self.compileShader(c.GL_FRAGMENT_SHADER, fs_source);
+        defer self.gl.DeleteShader(fs);
 
-        self.program = try glew(c.glCreateProgram, .{});
-        try glew(c.glAttachShader, .{ self.program, vs });
-        try glew(c.glAttachShader, .{ self.program, gs });
-        try glew(c.glAttachShader, .{ self.program, fs });
-        try glew(c.glLinkProgram, .{self.program});
+        self.program = self.gl.CreateProgram();
+        self.gl.AttachShader(self.program, vs);
+        self.gl.AttachShader(self.program, gs);
+        self.gl.AttachShader(self.program, fs);
+        self.gl.LinkProgram(self.program);
 
         var status: c.GLint = 0;
-        try glew(c.glGetProgramiv, .{ self.program, c.GL_LINK_STATUS, &status });
-        if (status == c.GL_FALSE) return error.programlinkfailed;
+        self.gl.GetProgramiv(self.program, c.GL_LINK_STATUS, &status);
+        if (status == c.GL_FALSE) return error.ProgramLinkFailed;
 
-        self.u_tex_size = try glew(c.glGetUniformLocation, .{ self.program, "tex_size" });
-        self.u_opacity = try glew(c.glGetUniformLocation, .{ self.program, "u_opacity" });
+        self.u_tex_size = self.gl.GetUniformLocation(self.program, "tex_size");
+        self.u_opacity = self.gl.GetUniformLocation(self.program, "u_opacity");
 
-        try glew(c.glGenVertexArrays, .{ 1, &self.vao });
-        try glew(c.glGenBuffers, .{ 1, &self.vbo });
+        self.gl.GenVertexArrays(1, &self.vao);
+        self.gl.GenBuffers(1, &self.vbo);
 
-        try glew(c.glBindVertexArray, .{self.vao});
-        try glew(c.glBindBuffer, .{ c.GL_ARRAY_BUFFER, self.vbo });
+        self.gl.BindVertexArray(self.vao);
+        self.gl.BindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
 
         const stride: c.GLsizei = @sizeOf(QuadVertex);
-        const loc_size: c.GLuint = @intCast(try glew(c.glGetAttribLocation, .{ self.program, "rect_size" }));
-        const loc_point: c.GLuint = @intCast(try glew(c.glGetAttribLocation, .{ self.program, "point" }));
-        const loc_tex: c.GLuint = @intCast(try glew(c.glGetAttribLocation, .{ self.program, "texcoord" }));
-        const loc_bg: c.GLuint = @intCast(try glew(c.glGetAttribLocation, .{ self.program, "bg_color" }));
+        const loc_size: c.GLuint = @intCast(self.gl.GetAttribLocation(self.program, "rect_size"));
+        const loc_point: c.GLuint = @intCast(self.gl.GetAttribLocation(self.program, "point"));
+        const loc_tex: c.GLuint = @intCast(self.gl.GetAttribLocation(self.program, "texcoord"));
+        const loc_bg: c.GLuint = @intCast(self.gl.GetAttribLocation(self.program, "bg_color"));
 
-        try glew(c.glEnableVertexAttribArray, .{loc_size});
-        try glew(c.glVertexAttribPointer, .{ loc_size, 2, c.GL_FLOAT, c.GL_FALSE, stride, @as(?*const anyopaque, null) });
+        self.gl.EnableVertexAttribArray(loc_size);
+        self.gl.VertexAttribPointer(loc_size, 2, c.GL_FLOAT, c.GL_FALSE, stride, null);
 
-        try glew(c.glEnableVertexAttribArray, .{loc_point});
-        try glew(c.glVertexAttribPointer, .{ loc_point, 2, c.GL_SHORT, c.GL_TRUE, stride, @as(?*const anyopaque, @ptrFromInt(@offsetOf(QuadVertex, "pos"))) });
+        self.gl.EnableVertexAttribArray(loc_point);
+        self.gl.VertexAttribPointer(loc_point, 2, c.GL_SHORT, c.GL_TRUE, stride, @ptrFromInt(@offsetOf(QuadVertex, "pos")));
 
-        try glew(c.glEnableVertexAttribArray, .{loc_tex});
-        try glew(c.glVertexAttribPointer, .{ loc_tex, 2, c.GL_UNSIGNED_SHORT, c.GL_TRUE, stride, @as(?*const anyopaque, @ptrFromInt(@offsetOf(QuadVertex, "uv"))) });
+        self.gl.EnableVertexAttribArray(loc_tex);
+        self.gl.VertexAttribPointer(loc_tex, 2, c.GL_UNSIGNED_SHORT, c.GL_TRUE, stride, @ptrFromInt(@offsetOf(QuadVertex, "uv")));
 
-        try glew(c.glEnableVertexAttribArray, .{loc_bg});
-        try glew(c.glVertexAttribPointer, .{ loc_bg, 4, c.GL_UNSIGNED_BYTE, c.GL_TRUE, stride, @as(?*const anyopaque, @ptrFromInt(@offsetOf(QuadVertex, "color"))) });
+        self.gl.EnableVertexAttribArray(loc_bg);
+        self.gl.VertexAttribPointer(loc_bg, 4, c.GL_UNSIGNED_BYTE, c.GL_TRUE, stride, @ptrFromInt(@offsetOf(QuadVertex, "color")));
 
         self.ready = true;
     }
 
     pub fn deinit(self: *RectDraw) void {
+        if (!self.ready) return;
         if (self.texture_id != 0) {
             c.glDeleteTextures(1, &self.texture_id);
             self.texture_id = 0;
         }
-        glew(c.glDeleteProgram, .{self.program}) catch {};
-        glew(c.glDeleteBuffers, .{ 1, &self.vbo }) catch {};
-        glew(c.glDeleteVertexArrays, .{ 1, &self.vao }) catch {};
+        self.gl.DeleteProgram(self.program);
+        self.gl.DeleteBuffers(1, &self.vbo);
+        self.gl.DeleteVertexArrays(1, &self.vao);
         self.ready = false;
     }
 
-    pub fn use(self: *RectDraw) !void {
-        try glew(c.glBindVertexArray, .{self.vao});
-        try glew(c.glBindBuffer, .{ c.GL_ARRAY_BUFFER, self.vbo });
-        try glew(c.glUseProgram, .{self.program});
+    pub fn use(self: *RectDraw) void {
+        self.gl.BindVertexArray(self.vao);
+        self.gl.BindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
+        self.gl.UseProgram(self.program);
         c.glBindTexture(c.GL_TEXTURE_2D, self.texture_id);
-        try self.setOpacity(1.0);
+        self.setOpacity(1.0);
     }
 
     pub fn loadTexture(self: *RectDraw, width: u16, height: u16, rgba_pixels: []const u8) !void {
@@ -209,76 +217,60 @@ pub const RectDraw = struct {
         self.texture_id = tex;
     }
 
-    pub fn setTextureSize(self: RectDraw, w: f32, h: f32) !void {
-        try glew(c.glUniform2f, .{ self.u_tex_size, w, h });
+    pub fn setTextureSize(self: RectDraw, w: f32, h: f32) void {
+        self.gl.Uniform2f(self.u_tex_size, w, h);
     }
 
-    pub fn setOpacity(self: *RectDraw, opacity: f32) !void {
+    pub fn setOpacity(self: *RectDraw, opacity: f32) void {
         if (opacity == self.last_opacity) return;
         self.last_opacity = opacity;
-        try glew(c.glUniform1f, .{ self.u_opacity, opacity });
+        self.gl.Uniform1f(self.u_opacity, opacity);
     }
 
-    pub fn ensureCapacity(self: *RectDraw, quad_count: usize) !void {
+    pub fn ensureCapacity(self: *RectDraw, quad_count: usize) void {
         if (quad_count <= self.vbo_capacity) return;
         const byte_size: c.GLsizeiptr = @intCast(quad_count * @sizeOf(QuadVertex));
-        try glew(c.glBufferData, .{ c.GL_ARRAY_BUFFER, byte_size, null, c.GL_STREAM_DRAW });
+        self.gl.BufferData(c.GL_ARRAY_BUFFER, byte_size, null, c.GL_STREAM_DRAW);
         self.vbo_capacity = quad_count;
     }
 
-    pub fn drawBatch(self: *RectDraw, quads: []const QuadVertex, opacity: f32) !void {
+    pub fn drawBatch(self: *RectDraw, quads: []const QuadVertex, opacity: f32) void {
         c.glClear(c.GL_COLOR_BUFFER_BIT);
         if (quads.len == 0 or opacity <= 0.0) return;
 
-        try self.ensureCapacity(quads.len);
-        try self.setOpacity(opacity);
+        self.ensureCapacity(quads.len);
+        self.setOpacity(opacity);
 
         const byte_size: c.GLsizeiptr = @intCast(quads.len * @sizeOf(QuadVertex));
-        try glew(c.glBufferSubData, .{ c.GL_ARRAY_BUFFER, 0, byte_size, quads.ptr });
+        self.gl.BufferSubData(c.GL_ARRAY_BUFFER, 0, byte_size, quads.ptr);
         c.glDrawArrays(c.GL_POINTS, 0, @intCast(quads.len));
     }
-};
 
-fn compileshader(kind: c.GLenum, source: []const u8) !c.GLuint {
-    const id = try glew(c.glCreateShader, .{kind});
+    fn compileShader(self: *const RectDraw, kind: c.GLenum, source: []const u8) !c.GLuint {
+        const id = self.gl.CreateShader(kind);
 
-    const source_ptr: ?[*]const u8 = source.ptr;
-    const source_len = @as(c.GLint, @intCast(source.len));
+        const source_ptr: ?[*]const u8 = source.ptr;
+        const source_len = @as(c.GLint, @intCast(source.len));
 
-    try glew(c.glShaderSource, .{ id, 1, &source_ptr, &source_len });
-    try glew(c.glCompileShader, .{id});
+        self.gl.ShaderSource(id, 1, &source_ptr, &source_len);
+        self.gl.CompileShader(id);
 
-    var status: c.GLint = 0;
-    try glew(c.glGetShaderiv, .{ id, c.GL_COMPILE_STATUS, &status });
-    if (status == c.GL_FALSE) {
-        var log_len: c.GLint = 0;
-        try glew(c.glGetShaderiv, .{ id, c.GL_INFO_LOG_LENGTH, &log_len });
+        var status: c.GLint = 0;
+        self.gl.GetShaderiv(id, c.GL_COMPILE_STATUS, &status);
+        if (status == c.GL_FALSE) {
+            var log_len: c.GLint = 0;
+            self.gl.GetShaderiv(id, c.GL_INFO_LOG_LENGTH, &log_len);
 
-        if (log_len > 0) {
-            var buf: [1024]u8 = undefined;
-            try glew(c.glGetShaderInfoLog, .{ id, buf.len, null, &buf });
+            if (log_len > 0) {
+                var buf: [1024]u8 = undefined;
+                self.gl.GetShaderInfoLog(id, buf.len, null, &buf);
 
-            const print_len = @min(buf.len, @as(usize, @intCast(log_len)));
-            std.debug.print("Shader Compile Error:\n{s}\n", .{buf[0..print_len]});
+                const print_len = @min(buf.len, @as(usize, @intCast(log_len)));
+                std.debug.print("Shader Compile Error:\n{s}\n", .{buf[0..print_len]});
+            }
+
+            return error.ShaderCompileError;
         }
-
-        return error.ShaderCompileError;
+        return id;
     }
-    return id;
-}
-
-/// calls a glew-style function pointer getter and executes it
-fn glew(getter: anytype, args: anytype) !glReturnType(getter) {
-    if (getter()) |func| {
-        return @call(.auto, func, args);
-    }
-    return error.OpenGlFunctionNotFound;
-}
-
-fn glReturnType(comptime getter: anytype) type {
-    const getter_fn = @TypeOf(getter);
-    const optional_func_ptr = @typeInfo(getter_fn).@"fn".return_type.?;
-    const func_ptr = @typeInfo(optional_func_ptr).optional.child;
-    const raw_fn = @typeInfo(func_ptr).pointer.child;
-    return @typeInfo(raw_fn).@"fn".return_type.?;
-}
+};

@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.link_libc = true;
 
     // Link the required system libraries
-    const c_lib = [_][]const u8{ "glew", "GL", "X11", "Xrender", "Xext" };
+    const c_lib = [_][]const u8{ "GL", "X11", "Xrender", "Xext" };
 
     for (c_lib) |lib| {
         exe.root_module.linkSystemLibrary(lib, .{});
@@ -73,8 +73,8 @@ pub fn build(b: *std.Build) void {
 
     const wf = b.addWriteFiles();
     const c_header = wf.add("c.h",
-        \\#include <GL/glew.h>
         \\#include <GL/gl.h>
+        \\#include <GL/glext.h>
         \\#include <GL/glx.h>
         \\#include <GL/glxext.h>
         \\#include <X11/Xatom.h>

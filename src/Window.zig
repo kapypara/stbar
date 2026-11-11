@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const c = @import("c");
+const ProcLoader = @import("GlProcs.zig").ProcLoader;
 
 const USE_GLX_CREATE_WINDOW = 1;
 
@@ -258,19 +259,35 @@ pub const Window = struct {
         _ = c.XFlush(dpy);
     }
 
+    pub fn getProcLoader(_: *const Window) ProcLoader {
+        return glxLoadProc;
+    }
+
+    fn glxLoadProc(name: [*:0]const u8) callconv(.c) ?*const anyopaque {
+        return @ptrCast(c.glXGetProcAddressARB(@ptrCast(name)));
+    }
+
     pub fn createTheRenderContext(self: *Window) !void {
         const dpy = self.display orelse return error.NoDisplay;
 
-        self.render_context = c.glXCreateNewContext(dpy, self.fbconfig, c.GLX_RGBA_TYPE, null, c.True);
+        const CreateCtxAttribsFn = *const fn (?*c.Display, c.GLXFBConfig, c.GLXContext, c_int, [*c]const c_int) callconv(.c) c.GLXContext;
+        if (c.glXGetProcAddressARB("glXCreateContextAttribsARB")) |ptr| {
+            const createAttribs: CreateCtxAttribsFn = @ptrCast(ptr);
+            const ctx_attribs = [_]c_int{
+                c.GLX_CONTEXT_MAJOR_VERSION_ARB, 3,
+                c.GLX_CONTEXT_MINOR_VERSION_ARB, 2,
+                c.GLX_CONTEXT_PROFILE_MASK_ARB,  c.GLX_CONTEXT_CORE_PROFILE_BIT_ARB,
+                c.None,
+            };
+            self.render_context = createAttribs(dpy, self.fbconfig, null, c.True, &ctx_attribs);
+        }
+        if (self.render_context == null) {
+            self.render_context = c.glXCreateNewContext(dpy, self.fbconfig, c.GLX_RGBA_TYPE, null, c.True);
+        }
         if (self.render_context == null) return error.ContextCreationFailed;
 
         if (c.glXMakeContextCurrent(dpy, self.glx_handle, self.glx_handle, self.render_context) == 0) {
             return error.MakeContextCurrentFailed;
-        }
-
-        if (USE_GLX_CREATE_WINDOW == 1) {
-            c.glewExperimental = c.GL_TRUE;
-            _ = c.glewInit();
         }
 
         // Enable hardware VSync (interval = 1) so dirty/fading swaps pace cleanly to monitor VBlank

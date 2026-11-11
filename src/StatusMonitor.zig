@@ -166,15 +166,15 @@ pub const StatusMonitor = struct {
         self.font = try FontAtlas.loadFromJson(io, allocator, "assets/font/tamzen.json");
         errdefer self.font.deinit();
 
-        self.rect = try RectDraw.init();
+        self.rect = try RectDraw.init(self.window.getProcLoader());
         errdefer self.rect.deinit();
 
         var texture = try Texture.init(io, allocator, "assets/font/tamzen.png");
         defer texture.deinit();
 
-        try self.rect.use();
+        self.rect.use();
         try self.rect.loadTexture(texture.width, texture.height, texture.rgba);
-        try self.rect.setTextureSize(self.font.x_increment, self.font.y_increment);
+        self.rect.setTextureSize(self.font.x_increment, self.font.y_increment);
 
         // Bind metric slices to segments
         self.time_segment.metrics = &self.time_metrics;
@@ -331,7 +331,7 @@ pub const StatusMonitor = struct {
         // Allocate single batched vertex buffer: 6 segment background rects + N glyph cells
         const bg_quads = self.segments.len;
         self.quad_buffer = try self.allocator.alloc(RectDraw.QuadVertex, bg_quads + cells_count);
-        try self.rect.ensureCapacity(self.quad_buffer.len);
+        self.rect.ensureCapacity(self.quad_buffer.len);
 
         self.clearAllAndDrawStatic();
         for (self.segments) |seg| {
@@ -663,7 +663,7 @@ pub const StatusMonitor = struct {
         if (drew_anything) {
             self.frame_dirty = false;
             const pre_swap_ns = now_ns;
-            try self.rect.drawBatch(self.quad_buffer, self.opacity);
+            self.rect.drawBatch(self.quad_buffer, self.opacity);
             self.window.swapBuffers();
 
             // Fallback pacing only if a software/uncomposited driver ignores swap_interval=1 during fade
