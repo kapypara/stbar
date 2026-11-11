@@ -80,14 +80,36 @@ pub const Segment = struct {
             if (m.* == .window or m.* == .time) continue;
 
             const p1 = m.get(0);
-            if (m.* == .memory or m.* == .io or m.* == .net) {
-                const p2 = m.get(1);
-                meteric_entry.sample[sample_idx] = (@as(u128, p2) << 64) | @as(u128, p1);
-            } else {
-                meteric_entry.sample[sample_idx] = @as(u128, p1);
+            const p2 = if (m.* == .memory or m.* == .io or m.* == .net) m.get(1) else 0;
+            meteric_entry.sample[sample_idx] = (@as(u128, p2) << 64) | @as(u128, p1);
+
+            var sum_p1: u64 = 0;
+            var sum_p2: u64 = 0;
+            for (meteric_entry.sample) |s_val| {
+                sum_p1 += @truncate(s_val);         // Extracts the lower 64 bits
+                sum_p2 += @truncate(s_val >> 64);   // Extracts the higher 64 bits
             }
 
-            // std.debug.print("{any}\n", .{m});
+            const sample_len_f = @as(f64, @floatFromInt(meteric_entry.sample.len));
+            const avg_p1 = @as(f64, @floatFromInt(sum_p1)) / sample_len_f;
+            const avg_p2 = @as(f64, @floatFromInt(sum_p2)) / sample_len_f;
+
+            const total_frames = @as(f64, @floatFromInt(meteric_entry.frames.len));
+
+            const last_frame = meteric_entry.frames[meteric_entry.frames.len - 1];
+            const start_f1 = @as(f64, @floatFromInt(@as(u64, @truncate(last_frame))));
+            const start_f2 = @as(f64, @floatFromInt(@as(u64, @truncate(last_frame >> 64))));
+
+            for (meteric_entry.frames, 0..) |*frame_val, i| {
+                const pct = @as(f64, @floatFromInt(i)) / (total_frames - 1.0);
+
+                const next_f1 = @as(u64, @ceil(start_f1 + (pct * (avg_p1 - start_f1))));
+                const next_f2 = @as(u64, @ceil(start_f2 + (avg_p2 - start_f2) * pct));
+
+                frame_val.* = (@as(u128, next_f2) << 64) | @as(u128, next_f1);
+            }
+
+            // std.debug.print("{any}\n", .{meteric_entry.frames});
         }
     }
 

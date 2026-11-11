@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // 3. Call Init
-    try window.init(0, 0, 1920, 14 + 3);
+    try window.init(0, 14+3, 1920, 14 + 3);
     defer window.deinit(); // Clean up X11/GL resources
 
     const tr = 8;

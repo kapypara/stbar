@@ -117,7 +117,7 @@ pub const StatusMonitor = struct {
         const char_width = @as(f32, @floatFromInt(self.font.char_width));
 
         self.rect_width_f = char_width / screen_width * 2;
-        self.rect_width_i = @as(i16, @intFromFloat(self.rect_width_f * 32767));
+        self.rect_width_i = @as(i16, @ceil(self.rect_width_f * 32767));
 
         // 0.52 to make text slightly higher
         self.rect_y_pos = @intFromFloat(self.rect_height * 32767 * 0.52);
@@ -189,7 +189,7 @@ pub const StatusMonitor = struct {
         }
 
         // TODO hardcod these indexes somewhere else. DISGUSTING
-        const time_cells_index = cells_count - 22;
+        const time_cells_index = cells_count - 23;
 
         self.time_segment.cells = self.cells[time_cells_index..];
         self.time_segment.metrics[0].start_index = 1;
@@ -199,50 +199,50 @@ pub const StatusMonitor = struct {
         print("frames_len: {any}\n", .{frame_len});
         print("time segment: {any}\n", .{self.time_segment.metrics[0]});
 
-        const processor_cells_index = time_cells_index - 12; // FIXME
+        const processor_cells_index = time_cells_index - 15;
 
         self.processor_segment.cells = self.cells[processor_cells_index..time_cells_index];
 
-        self.processor_segment.metrics[0].start_index = 1; // FIXME
+        self.processor_segment.metrics[0].start_index = 1;
         setSlots(&self.processor_segment.metrics[0], &self.sample_buffer, stride, 0, self.update_rate);
 
-        self.processor_segment.metrics[1].start_index = 1; // FIXME
+        self.processor_segment.metrics[1].start_index = 6;
         setSlots(&self.processor_segment.metrics[1], &self.sample_buffer, stride, 1, self.update_rate);
 
         print("cpu segment: {any}\n", .{self.processor_segment.metrics[0]});
         print("mem segment: {any}\n", .{self.processor_segment.metrics[1]});
 
-        const thermal_cells_index = processor_cells_index - 12; // FIXME
+        const thermal_cells_index = processor_cells_index - 13;
 
         self.thermal_load_segment.cells = self.cells[thermal_cells_index..processor_cells_index];
 
-        self.thermal_load_segment.metrics[0].start_index = 1; // FIXME
+        self.thermal_load_segment.metrics[0].start_index = 8;
         setSlots(&self.thermal_load_segment.metrics[0], &self.sample_buffer, stride, 2, self.update_rate);
 
-        self.thermal_load_segment.metrics[1].start_index = 1; // FIXME
+        self.thermal_load_segment.metrics[1].start_index = 1;
         setSlots(&self.thermal_load_segment.metrics[1], &self.sample_buffer, stride, 3, self.update_rate);
 
         print("thermal segment: {any}\n", .{self.thermal_load_segment.metrics[0]});
         print("load segment: {any}\n", .{self.thermal_load_segment.metrics[1]});
 
-        const storage_metrics_index = thermal_cells_index - 12; // FIXME
+        const storage_metrics_index = thermal_cells_index - 40;
 
         self.storage_load_segment.cells = self.cells[storage_metrics_index..thermal_cells_index];
 
-        self.storage_load_segment.metrics[0].start_index = 1; // FIXME
+        self.storage_load_segment.metrics[0].start_index = 28;
         setSlots(&self.storage_load_segment.metrics[0], &self.sample_buffer, stride, 4, self.update_rate);
 
-        self.storage_load_segment.metrics[1].start_index = 1; // FIXME
+        self.storage_load_segment.metrics[1].start_index = 1;
         setSlots(&self.storage_load_segment.metrics[1], &self.sample_buffer, stride, 5, self.update_rate);
 
         print("free segment: {any}\n", .{self.storage_load_segment.metrics[0]});
         print("IO segment: {any}\n", .{self.storage_load_segment.metrics[1]});
 
-        const network_metrics_index = storage_metrics_index - 12; // FIXME
+        const network_metrics_index = storage_metrics_index - 19;
 
         self.network_load_segment.cells = self.cells[network_metrics_index..storage_metrics_index];
 
-        self.network_load_segment.metrics[0].start_index = 1; // FIXME
+        self.network_load_segment.metrics[0].start_index = 1;
         setSlots(&self.network_load_segment.metrics[0], &self.sample_buffer, stride, 6, self.update_rate);
 
         print("NET segment: {any}\n", .{self.network_load_segment.metrics[0]});
@@ -268,10 +268,13 @@ pub const StatusMonitor = struct {
 
     pub fn update(self: *StatusMonitor) void {
 
-        const sample_idx = @as(u8, @intCast(self.ticks % self.update_rate));
+        if (self.ticks % self.update_rate == 0) {
 
-        for (self.segments) |segment| {
-            segment.update(self.io, sample_idx);
+            const sample_idx = @as(u8, @intCast(self.ticks / self.update_rate % self.update_rate));
+
+            for (self.segments) |segment| {
+                segment.update(self.io, sample_idx);
+            }
         }
 
         self.ticks += 1;
@@ -281,14 +284,14 @@ pub const StatusMonitor = struct {
     fn generateCells(self: *StatusMonitor) !void {
         const cell_size: u16 = @intCast(self.rect_width_i);
         const char_count: usize = @divTrunc(65535, cell_size);
-        self.cells = try self.allocator.alloc(i16, char_count);
+        self.cells = try self.allocator.alloc(i16, char_count + 1);
 
         // Starting point: -1.0 in i16 space is -32768
         var current_x: i16 = -32768;
 
         for (self.cells) |*cell| {
             cell.* = current_x;
-            current_x += self.rect_width_i;
+            current_x +%= self.rect_width_i;
         }
 
         print("total cells length {}\n", .{self.cells.len});
@@ -351,19 +354,28 @@ pub const StatusMonitor = struct {
 
     pub fn render(self: *StatusMonitor) !void {
 
+        const rate: u16 = self.render_rate / self.update_rate - 1;
+        const idx = self.ticks % (rate);
+        print("\nidx:{}\n", .{idx});
+
         for (self.segments) |segment| {
-            for (segment.metrics) |metric| {
-                // const mm = metric.
-                // try self.drawSegment(&self.time_segment, x, metric.start_index);
-                _ = metric.start_index;
+            for (segment.metrics) |*m| {
+
+                if (m.metric == .time or m.metric == .window) continue;
+                print("{any}\n", .{m});
+
+                const frame_value = m.frames[idx];
+
+                const m_string = m.metric.print(@as(u64, @intCast(frame_value & std.math.maxInt(u64))), 0).slice();
+                self.drawSegment(segment, m_string, m.start_index) catch {};
             }
         }
-        const x = &self.time_segment.metrics[0].metric.time.value;
-        const o = self.time_segment.metrics[0].start_index;
+        // const x = &self.time_segment.metrics[0].metric.time.value;
+        // const o = self.time_segment.metrics[0].start_index;
 
         const word = "Waterfox DICKs Hello world HATE HATE HATE HATE HATE HATE HATE HATE HATE HATE penis, Prase the omni messiah 0123456789!";
 
-        try self.drawSegment(&self.time_segment, x, o);
+        // try self.drawSegment(&self.time_segment, x, o);
         try self.drawSegment(&self.window_title_segment, word, 1);
 
         try self.rect.flush();
@@ -372,15 +384,21 @@ pub const StatusMonitor = struct {
     pub fn clear(self: *StatusMonitor) !void {
         const y_pos = self.rect_y_pos; // saving it for later
 
-        self.rect_y_pos = 32767;
-        try self.rect.setRectSize(self.rect_width_f, 2.0);
+        // rednering is garbage. so I'm increasing the rect size and redering in the opssite way
+        // this only to hide one line of dead pixels
 
-        for (self.segments) |segment| {
+        self.rect_y_pos = 32767;
+        try self.rect.setRectSize(self.rect_width_f * 1.01, 2.0); 
+
+        var i = self.segments.len;
+        while (i>0) {
+            const segment = self.segments[i-1];
 
             const empty_string = try self.allocator.alloc(u8, segment.cells.len);
             @memset(empty_string, ' ');
 
             try self.drawSegment(segment, empty_string, 0);
+            i -= 1;
         }
 
         self.rect_y_pos = y_pos;

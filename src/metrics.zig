@@ -11,6 +11,7 @@ const c = @cImport({
 });
 
 const nanoTimestamp = @import("Ticker.zig").nanoTimestamp;
+const formats = @import("formats.zig");
 
 // --- Data Structures ---
 
@@ -89,6 +90,47 @@ pub const Metric = union(MetricTag) {
             .window => 0,
             .time => 0,
         };
+    }
+
+    pub fn print(self: *Metric, value: u64, idx: u8) MetricString {
+        var result = MetricString{ .buf = undefined, .len = 0 };
+
+        // A small helper to copy the fixed arrays into our return struct
+        const write = struct {
+            fn do(out: *MetricString, src: anytype) void {
+                @memcpy(out.buf[0..src.len], src[0..]);
+                out.len = src.len;
+            }
+        }.do;
+
+        switch (self.*) {
+            .cpu => write(&result, formats.cpuUsage(value)),
+            .temp => {
+                const x = formats.none(value);
+                write(&result, x.buf[0..x.len]);
+            },
+            .load => write(&result, formats.systemLoad(value)),
+            .free_storage => write(&result, formats.freeSpace(value)),
+
+            .memory => if (idx == 0) write(&result, formats.memory(value)) else write(&result, formats.generic(value)),
+            .io => write(&result, formats.generic(value)),
+            .net => write(&result, formats.generic(value)),
+
+            else => unreachable,
+        }
+
+        return result;
+    }
+};
+
+// Define a small container for the output
+pub const MetricString = struct {
+    buf: [24]u8, // Set this to your maximum possible metric string length
+    len: usize,
+
+    // Helper to easily view it as a standard slice
+    pub fn slice(self: *const MetricString) []const u8 {
+        return self.buf[0..self.len];
     }
 };
 
@@ -336,7 +378,7 @@ pub const StorageProbe = struct {
                 }
 
                 if (!already_seen and seen_count < seen_storage.len) {
-                    var stat: c.struct_statvfs  = undefined;
+                    var stat: c.struct_statvfs = undefined;
 
                     // statvfs needs a null-terminated string.
                     // We can use a small stack buffer for the path.

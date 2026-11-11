@@ -162,7 +162,7 @@ pub const Window = struct {
             var strut = std.mem.zeroes([12]c.u_long); 
 
             // 1. Tell the WM to reserve 'height' pixels at the TOP (index 2)
-            strut[2] = @intCast(self.height); 
+            strut[2] = @intCast(self.height * 2); 
 
             // 2. Tell the WM the horizontal start/end of this top strut (indices 8 and 9)
             // This ensures it reserves space across the entire width of your screen.
