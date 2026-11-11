@@ -547,24 +547,49 @@ pub const TimeProbe = struct {
 pub const WindowNameProbe = struct {
     display: ?*x11.Display = null,
     root: x11.Window = 0,
+    self_window: x11.Window = 0,
+    tracked_window: x11.Window = 0,
+    net_active_atom: x11.Atom = 0,
+    net_name_atom: x11.Atom = 0,
+    wm_name_atom: x11.Atom = 0,
+    dirty: bool = true,
     current_name: [256]u8 = @splat(0),
     name_len: usize = 0,
     changed: bool = true,
 
-    pub fn attach(self: *WindowNameProbe, display: ?*x11.Display, root: x11.Window) void {
+    pub fn attach(
+        self: *WindowNameProbe,
+        display: ?*x11.Display,
+        root: x11.Window,
+        self_window: x11.Window,
+        net_active_atom: x11.Atom,
+        net_name_atom: x11.Atom,
+        wm_name_atom: x11.Atom,
+    ) void {
         self.display = display;
         self.root = root;
+        self.self_window = self_window;
+        self.net_active_atom = net_active_atom;
+        self.net_name_atom = net_name_atom;
+        self.wm_name_atom = wm_name_atom;
+        self.dirty = true;
         _ = x11.XSetErrorHandler(xErrorHandler);
+    }
+
+    pub fn markDirty(self: *WindowNameProbe) void {
+        self.dirty = true;
     }
 
     pub fn slice(self: *const WindowNameProbe) []const u8 {
         return self.current_name[0..self.name_len];
     }
 
-    // This replaces your getActiveWindow loop logic
+    // Event-driven active window query: executes X11 roundtrips only when marked dirty via PropertyNotify
     pub fn sample(self: *WindowNameProbe) void {
+        if (!self.dirty) return;
         const display = self.display orelse return;
         if (self.root == 0) return;
+        self.dirty = false;
 
         var actual_type: x11.Atom = 0;
         var actual_format: i32 = 0;
@@ -572,29 +597,36 @@ pub const WindowNameProbe = struct {
         var bytes_after: u64 = 0;
         var prop: [*c]u8 = null;
 
-        const net_active = x11.XInternAtom(display, "_NET_ACTIVE_WINDOW", x11.False);
-        const net_name = x11.XInternAtom(display, "_NET_WM_NAME", x11.False);
-        const wm_name = x11.XInternAtom(display, "WM_NAME", x11.False);
-
         var next_buf: [256]u8 = @splat(0);
         var next_len: usize = 0;
 
         // 1. Get the Active Window ID
-        if (x11.XGetWindowProperty(display, self.root, net_active, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == x11.Success) {
+        if (x11.XGetWindowProperty(display, self.root, self.net_active_atom, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == x11.Success) {
             if (prop != null and nitems > 0) {
                 const window_id = @as(*x11.Window, @ptrCast(@alignCast(prop))).*;
                 _ = x11.XFree(prop);
                 prop = null;
 
+                if (window_id != self.tracked_window) {
+                    if (self.tracked_window != 0 and self.tracked_window != self.self_window and self.tracked_window != self.root) {
+                        _ = x11.XSelectInput(display, self.tracked_window, x11.NoEventMask);
+                    }
+                    self.tracked_window = window_id;
+                    if (window_id != 0 and window_id != self.self_window and window_id != self.root) {
+                        _ = x11.XSelectInput(display, window_id, x11.PropertyChangeMask);
+                    }
+                    _ = x11.XFlush(display);
+                }
+
                 if (window_id != 0) {
                     // 2. Get _NET_WM_NAME, falling back to WM_NAME
-                    if (x11.XGetWindowProperty(display, window_id, net_name, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == x11.Success and prop != null and nitems > 0) {
+                    if (x11.XGetWindowProperty(display, window_id, self.net_name_atom, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == x11.Success and prop != null and nitems > 0) {
                         next_len = sanitizeName(prop[0..@min(nitems, 255)], &next_buf);
                         _ = x11.XFree(prop);
                     } else {
                         if (prop != null) _ = x11.XFree(prop);
                         prop = null;
-                        if (x11.XGetWindowProperty(display, window_id, wm_name, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == x11.Success and prop != null and nitems > 0) {
+                        if (x11.XGetWindowProperty(display, window_id, self.wm_name_atom, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == x11.Success and prop != null and nitems > 0) {
                             next_len = sanitizeName(prop[0..@min(nitems, 255)], &next_buf);
                             _ = x11.XFree(prop);
                         } else if (prop != null) {

@@ -144,8 +144,16 @@ pub const StatusMonitor = struct {
         // Dirty memory is sampled alongside free memory in MemProbe, rendered in storage_load_segment
         self.processor_metrics[1].secondary_segment = &self.storage_load_segment;
 
-        // Wire X11 connection into WindowNameProbe by pointer
-        self.window_metrics[0].metric.window.attach(self.window.display, self.window.root);
+        // Wire X11 connection and cached atoms into WindowNameProbe
+        self.window_metrics[0].metric.window.attach(
+            self.window.display,
+            self.window.root,
+            self.window.handle,
+            self.window.net_active_window_atom,
+            self.window.net_wm_name_atom,
+            self.window.wm_name_atom,
+        );
+        self.window.title_dirty = false;
 
         self.segments = .{
             &self.time_segment,
@@ -258,6 +266,12 @@ pub const StatusMonitor = struct {
         if (self.window.clicked) {
             self.window.clicked = false;
             self.handleClick(self.window.last_click.x, self.window.last_click.button);
+        }
+
+        if (self.window.title_dirty) {
+            self.window.title_dirty = false;
+            self.window_metrics[0].metric.window.markDirty();
+            self.window_metrics[0].metric.window.sample();
         }
 
         if (self.ticks % self.frames_per_sample == 0) {

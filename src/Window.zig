@@ -16,6 +16,9 @@ pub const Window = struct {
     fbconfig: c.GLXFBConfig = null,
     cmap: c.Colormap = 0,
     del_atom: c.Atom = 0,
+    net_active_window_atom: c.Atom = 0,
+    net_wm_name_atom: c.Atom = 0,
+    wm_name_atom: c.Atom = 0,
 
     width: i32 = 800,
     height: i32 = 600,
@@ -26,6 +29,7 @@ pub const Window = struct {
     docked: bool = false,
     clicked: bool = false,
     resized: bool = false,
+    title_dirty: bool = true,
     last_click: Click = .{ .x = 0, .y = 0, .button = 0 },
 
     const Click = struct { x: i32, y: i32, button: u32 };
@@ -190,6 +194,11 @@ pub const Window = struct {
 
         self.del_atom = c.XInternAtom(dpy, "WM_DELETE_WINDOW", 0);
         _ = c.XSetWMProtocols(dpy, self.handle, &self.del_atom, 1);
+
+        self.net_active_window_atom = c.XInternAtom(dpy, "_NET_ACTIVE_WINDOW", c.False);
+        self.net_wm_name_atom = c.XInternAtom(dpy, "_NET_WM_NAME", c.False);
+        self.wm_name_atom = c.XInternAtom(dpy, "WM_NAME", c.False);
+        _ = c.XSelectInput(dpy, self.root, c.PropertyChangeMask);
     }
 
     pub fn createTheRenderContext(self: *Window) !void {
@@ -210,9 +219,11 @@ pub const Window = struct {
     }
 
     pub fn updateTheMessageQueue(self: *Window) void {
+        const dpy = self.display orelse return;
         var event: c.XEvent = undefined;
-        while (c.XPending(self.display) > 0) {
-            _ = c.XNextEvent(self.display, &event);
+        var pending = c.XEventsQueued(dpy, c.QueuedAfterReading);
+        while (pending > 0) : (pending = c.XEventsQueued(dpy, c.QueuedAlready)) {
+            _ = c.XNextEvent(dpy, &event);
             switch (event.type) {
                 c.ClientMessage => {
                     if (event.xclient.data.l[0] == @as(i64, @intCast(self.del_atom))) {
@@ -233,6 +244,15 @@ pub const Window = struct {
                         .button = event.xbutton.button,
                     };
                     self.clicked = true;
+                },
+                c.PropertyNotify => {
+                    const atom = event.xproperty.atom;
+                    if (atom == self.net_active_window_atom or
+                        atom == self.net_wm_name_atom or
+                        atom == self.wm_name_atom)
+                    {
+                        self.title_dirty = true;
+                    }
                 },
                 else => {},
             }
