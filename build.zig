@@ -50,15 +50,30 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
+            .strip = optimize != .debug,
         }),
         .use_llvm = true,
     });
 
-    const zigimg = b.dependency("zigimg", .{
+    // Bake `assets/font/tamzen.json` + `assets/font/tamzen.png` into `.rodata` at build time (zero runtime asset files)
+    const bake_font_exe = b.addExecutable(.{
+        .name = "bake_font",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bake_font.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
+        .use_llvm = true,
+    });
+    const run_bake = b.addRunArtifact(bake_font_exe);
+    run_bake.addFileArg(b.path("assets/font/tamzen.json"));
+    run_bake.addFileArg(b.path("assets/font/tamzen.png"));
+    const baked_font_file = run_bake.addOutputFileArg("tamzen_embedded.zig");
+    exe.root_module.addImport("tamzen_embedded", b.createModule(.{
+        .root_source_file = baked_font_file,
         .target = target,
         .optimize = optimize,
-    });
-    exe.root_module.addImport("zigimg", zigimg.module("zigimg"));
+    }));
 
     // --- ADDED SYSTEM DEPENDENCIES HERE ---
     // Link libc (required for C headers and system libraries)
@@ -125,6 +140,7 @@ pub fn build(b: *std.Build) void {
         \\#include <unistd.h>
         \\#include <fcntl.h>
         \\#include <signal.h>
+        \\#include <time.h>
         \\#include <systemd/sd-bus.h>
         \\
     );

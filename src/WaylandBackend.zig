@@ -448,9 +448,10 @@ pub const WaylandBackend = struct {
         }
     }
 
+    /// `timeout_ms < 0` sleeps indefinitely in kernel `poll()` until an input/compositor/title event arrives.
     pub fn waitForEventsOrTimeout(self: *WaylandBackend, timeout_ms: i32) void {
         const wl_dpy = self.wl_display orelse return;
-        if (timeout_ms <= 0) {
+        if (timeout_ms == 0) {
             _ = c.wl_display_flush(wl_dpy);
             if (self.aux_x11_dpy) |x_dpy| _ = c.XFlush(x_dpy);
             return;

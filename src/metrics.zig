@@ -603,39 +603,38 @@ pub const TimeProbe = struct {
     last_sec: u64 = std.math.maxInt(u64),
     changed: bool = true,
 
-    // UTC+3 for bahrain time :)
-    const offset = 3 * std.time.ns_per_hour;
     const days = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
     const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
-    /// Formats the date into the provided buffer: "Fri May08 02:48:01 PM"
+    /// Formats system local time (`/etc/localtime` / `$TZ`) as: "Fri May08 02:48:01 PM"
     pub fn sample(self: *TimeProbe, io: std.Io) !void {
-        const ts = nanoTimestamp(io) + offset;
-        const seconds: u64 = @intCast(@divTrunc(ts, std.time.ns_per_s));
-        if (seconds == self.last_sec) return;
-        self.last_sec = seconds;
+        const ts = nanoTimestamp(io);
+        const unix_secs: i64 = @intCast(@divFloor(ts, std.time.ns_per_s));
+        const sec_key: u64 = @bitCast(unix_secs);
+        if (sec_key == self.last_sec) return;
+        self.last_sec = sec_key;
 
-        const epoch = std.time.epoch.EpochSeconds{ .secs = seconds };
-        const day_secs = epoch.getDaySeconds();
-        const epoch_day = epoch.getEpochDay();
-        const year_day = epoch_day.calculateYearDay();
-        const month_day = year_day.calculateMonthDay();
+        var t: c.time_t = @intCast(unix_secs);
+        var tm: c.struct_tm = undefined;
+        if (c.localtime_r(&t, &tm) == null) return;
 
-        // Calculate 12-hour clock
-        var hour = day_secs.getHoursIntoDay();
-        const am_pm = if (hour >= 12) "PM" else "AM";
-        hour = if (hour == 0) 12 else if (hour > 12) hour - 12 else hour;
+        const raw_hour: u32 = @intCast(@max(0, tm.tm_hour));
+        const am_pm = if (raw_hour >= 12) "PM" else "AM";
+        const hour12: u32 = if (raw_hour == 0) 12 else if (raw_hour > 12) raw_hour - 12 else raw_hour;
 
-        // Calculate Day of Week (EpochDay 0 = Thursday = index 4)
-        const day_of_week_index = (epoch_day.day + 4) % 7;
+        const wday: usize = @intCast(std.math.clamp(tm.tm_wday, 0, 6));
+        const mon: usize = @intCast(std.math.clamp(tm.tm_mon, 0, 11));
+        const mday: u32 = @intCast(std.math.clamp(tm.tm_mday, 1, 31));
+        const min: u32 = @intCast(std.math.clamp(tm.tm_min, 0, 59));
+        const sec: u32 = @intCast(std.math.clamp(tm.tm_sec, 0, 60));
 
         _ = try std.fmt.bufPrint(&self.value, "{s} {s}{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} {s}", .{
-            days[day_of_week_index],
-            months[@intCast(month_day.month.numeric() - 1)],
-            month_day.day_index + 1,
-            hour,
-            day_secs.getMinutesIntoHour(),
-            day_secs.getSecondsIntoMinute(),
+            days[wday],
+            months[mon],
+            mday,
+            hour12,
+            min,
+            sec,
             am_pm,
         });
         self.changed = true;

@@ -371,9 +371,10 @@ pub const X11Backend = struct {
         }
     }
 
+    /// `timeout_ms < 0` sleeps indefinitely in kernel `poll()` until an X11 event arrives.
     pub fn waitForEventsOrTimeout(self: *X11Backend, timeout_ms: i32) void {
         const dpy = self.display orelse return;
-        if (timeout_ms <= 0) {
+        if (timeout_ms == 0) {
             _ = c.XFlush(dpy);
             return;
         }

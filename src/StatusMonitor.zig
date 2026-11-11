@@ -1,10 +1,10 @@
 const std = @import("std");
 
-const FontAtlas = @import("FontAtlas.zig").FontAtlas;
+const font_zig = @import("FontAtlas.zig");
+const FontAtlas = font_zig.FontAtlas;
 const RectDraw = @import("RectDraw.zig").RectDraw;
 const segment_zig = @import("Segment.zig");
 const Window = @import("Window.zig").Window;
-const Texture = @import("Texture.zig").Texture;
 const ticker_zig = @import("Ticker.zig");
 
 const assert = std.debug.assert;
@@ -14,11 +14,12 @@ const monotonicNs = ticker_zig.monotonicNs;
 const sleepNs = ticker_zig.sleepNs;
 
 pub const BarMode = enum {
-    /// Overlay (`strut = OFF`): hides to top 1px strip (`1 Hz` polling) and fades in after >1s continuous hover.
+    /// Overlay (`strut = OFF`): hides to top 1px strip (zero background polling; sleeps indefinitely in `poll(-1)`)
+    /// and fades in after >1s continuous hover.
     auto_hide,
     /// Overlay (`strut = OFF`): stays visible without auto-hiding (toggled via right-click).
     pinned_overlay,
-    /// Dock (`strut = ON`): reserves 17px top `_NET_WM_STRUT_PARTIAL` and stays visible at all times (toggled via middle-click).
+    /// Dock (`strut = ON`): reserves 17px top exclusive zone / strut and stays visible (toggled via middle-click).
     docked_strut,
 };
 
@@ -30,7 +31,6 @@ pub const StatusMonitor = struct {
     pub const network_width = 19;
     pub const right_fixed_cells = time_width + processor_width + thermal_width + storage_width + network_width; // 110
 
-    const hidden_sample_ns: i96 = std.time.ns_per_s; // 1 Hz while hidden
     const hover_reveal_ns: i96 = 1 * std.time.ns_per_s; // >1.0s continuous top-1px hover
     const leave_grace_ns: i96 = 120 * std.time.ns_per_ms; // brief anti-twitch grace on exit
     const fade_in_ns: i96 = 250 * std.time.ns_per_ms; // smooth cubic ease-out reveal
@@ -165,17 +165,17 @@ pub const StatusMonitor = struct {
         self.mode = initial_mode;
         self.visible_sample_ns = @divTrunc(std.time.ns_per_s, @as(i96, sample_hz));
 
-        self.font = try FontAtlas.loadFromJson(io, allocator, "assets/font/tamzen.json");
+        self.font = FontAtlas.initEmbedded();
         errdefer self.font.deinit();
 
         self.rect = try RectDraw.init(self.window.getProcLoader());
         errdefer self.rect.deinit();
 
-        var texture = try Texture.init(io, allocator, "assets/font/tamzen.png");
-        defer texture.deinit();
+        var embedded_rgba: [@as(usize, font_zig.embedded.width) * @as(usize, font_zig.embedded.height) * 4]u8 = undefined;
+        font_zig.embedded.unpackRgba(&embedded_rgba);
 
         self.rect.use();
-        try self.rect.loadTexture(texture.width, texture.height, texture.rgba);
+        try self.rect.loadTexture(font_zig.embedded.width, font_zig.embedded.height, &embedded_rgba);
         self.rect.setTextureSize(self.font.x_increment, self.font.y_increment);
 
         // Bind metric slices to segments
@@ -227,27 +227,10 @@ pub const StatusMonitor = struct {
         setSlots(&self.storage_metrics[1], self.sample_buffer, ring_len, 5);
         setSlots(&self.network_metrics[0], self.sample_buffer, ring_len, 6);
 
-        // Prime cumulative counters (CPU, Disk I/O, Network) and pre-fill initial gauge buffers
-        for (self.segments) |seg| {
-            for (seg.metrics) |*entry| {
-                entry.metric.sample(io) catch {};
-                if (entry.metric == .window or entry.metric == .time) continue;
-                const p1 = entry.metric.get(0);
-                const p2 = if (entry.metric == .memory or entry.metric == .io or entry.metric == .net)
-                    entry.metric.get(1)
-                else
-                    0;
-                const packed_init = (@as(u128, p2) << 64) | @as(u128, p1);
-                @memset(entry.sample, packed_init);
-                entry.prev = packed_init;
-                entry.target = packed_init;
-            }
-        }
-
         try self.recomputeLayout();
 
         const now_ns = monotonicNs(io);
-        self.sample_start_ns = now_ns;
+        self.seedInitialMetrics(now_ns);
         self.window.setStrut(initial_mode == .docked_strut);
         if (initial_mode == .auto_hide) {
             self.window.setInputHeight(1);
@@ -260,14 +243,32 @@ pub const StatusMonitor = struct {
             } else {
                 self.state = .hidden;
             }
-            self.next_sample_ns = now_ns + hidden_sample_ns;
         } else {
             self.window.setInputHeight(self.window.height);
             self.opacity = 1.0;
             self.state = .visible;
             self.frame_dirty = true;
-            self.next_sample_ns = now_ns;
         }
+    }
+
+    fn seedInitialMetrics(self: *StatusMonitor, now_ns: i96) void {
+        for (self.segments) |seg| {
+            for (seg.metrics) |*entry| {
+                entry.metric.sample(self.io) catch {};
+                if (entry.metric == .window or entry.metric == .time) continue;
+                const p1 = entry.metric.get(0);
+                const p2 = if (entry.metric == .memory or entry.metric == .io or entry.metric == .net)
+                    entry.metric.get(1)
+                else
+                    0;
+                const packed_init = (@as(u128, p2) << 64) | @as(u128, p1);
+                @memset(entry.sample, packed_init);
+                entry.prev = packed_init;
+                entry.target = packed_init;
+            }
+        }
+        self.sample_start_ns = now_ns;
+        self.next_sample_ns = now_ns + self.visible_sample_ns;
     }
 
     fn setSlots(entry: *MetricEntry, buffer: []u128, ring_len: usize, position: usize) void {
@@ -366,7 +367,12 @@ pub const StatusMonitor = struct {
     }
 
     fn beginFadeIn(self: *StatusMonitor, now_ns: i96) void {
+        const was_asleep = (self.state == .hidden or self.state == .hover_armed);
         self.window.setInputHeight(self.window.height);
+        if (was_asleep) {
+            // Preserve last-viewed ring buffer & `prev` values so reveal glimpses last state and smoothly catches up
+            self.next_sample_ns = now_ns;
+        }
         if (self.opacity >= 0.999) {
             self.opacity = 1.0;
             self.state = .visible;
@@ -383,7 +389,7 @@ pub const StatusMonitor = struct {
 
     fn beginFadeOut(self: *StatusMonitor, now_ns: i96) void {
         if (self.opacity <= 0.001) {
-            self.finishHide(now_ns);
+            self.finishHide();
             return;
         }
         self.state = .fading_out;
@@ -394,13 +400,12 @@ pub const StatusMonitor = struct {
         self.frame_dirty = true;
     }
 
-    fn finishHide(self: *StatusMonitor, now_ns: i96) void {
+    fn finishHide(self: *StatusMonitor) void {
         self.opacity = 0.0;
         self.state = .hidden;
         self.frame_dirty = false;
         self.window.clearTransparent();
         self.window.setInputHeight(1);
-        self.next_sample_ns = now_ns + hidden_sample_ns;
     }
 
     pub fn setMode(self: *StatusMonitor, next_mode: BarMode, now_ns: i96) void {
@@ -409,12 +414,10 @@ pub const StatusMonitor = struct {
             .docked_strut => {
                 self.window.setStrut(true);
                 self.beginFadeIn(now_ns);
-                self.next_sample_ns = @min(self.next_sample_ns, now_ns);
             },
             .pinned_overlay => {
                 self.window.setStrut(false);
                 self.beginFadeIn(now_ns);
-                self.next_sample_ns = @min(self.next_sample_ns, now_ns);
             },
             .auto_hide => {
                 self.window.setStrut(false);
@@ -473,7 +476,6 @@ pub const StatusMonitor = struct {
                 if (!self.window.pointer_inside) {
                     self.state = .hidden;
                 } else if (now_ns - self.hover_start_ns >= hover_reveal_ns) {
-                    self.next_sample_ns = now_ns;
                     self.beginFadeIn(now_ns);
                 }
             },
@@ -525,7 +527,7 @@ pub const StatusMonitor = struct {
                     self.opacity = self.fade_from * (1.0 - eased);
                     self.frame_dirty = true;
                     if (t >= 1.0) {
-                        self.finishHide(now_ns);
+                        self.finishHide();
                     }
                 }
             },
@@ -561,20 +563,36 @@ pub const StatusMonitor = struct {
             self.handleClick(self.window.last_click.x, self.window.last_click.button, now_ns);
         }
 
+        self.advanceVisibility(now_ns);
+
         if (self.window.title_dirty) {
-            self.window.title_dirty = false;
             if (self.window.waylandTitle()) |wl_title| {
+                self.window.title_dirty = false;
                 self.window_metrics[0].metric.window.setExternalTitle(wl_title);
-            } else {
+            } else if (self.state != .hidden and self.state != .hover_armed) {
+                self.window.title_dirty = false;
                 self.window_metrics[0].metric.window.markDirty();
                 self.window_metrics[0].metric.window.sample();
             }
         }
 
-        self.advanceVisibility(now_ns);
+        // Zero polling while hidden: suspend indefinitely in kernel `poll(-1)` until an input event arrives
+        if (self.state == .hidden) {
+            self.window.waitForEventsOrTimeout(-1);
+            return;
+        }
+        if (self.state == .hover_armed) {
+            const hover_rem = (self.hover_start_ns + hover_reveal_ns) - now_ns;
+            if (hover_rem > 0) {
+                const ceil_ms = @divTrunc(hover_rem + std.time.ns_per_ms - 1, std.time.ns_per_ms);
+                self.window.waitForEventsOrTimeout(@intCast(@min(@as(i96, 60_000), ceil_ms)));
+            } else {
+                self.window.waitForEventsOrTimeout(0);
+            }
+            return;
+        }
 
-        const is_hidden = (self.state == .hidden or self.state == .hover_armed);
-        const sample_interval_ns = if (is_hidden) hidden_sample_ns else self.visible_sample_ns;
+        const sample_interval_ns = self.visible_sample_ns;
 
         if (now_ns >= self.next_sample_ns) {
             const prior_progress = self.interpolationProgress(now_ns);
@@ -589,12 +607,9 @@ pub const StatusMonitor = struct {
             }
         }
 
-        var drew = false;
-        if (!is_hidden) {
-            drew = try self.renderVisible(now_ns);
-            if (drew) {
-                now_ns = monotonicNs(self.io);
-            }
+        const drew = try self.renderVisible(now_ns);
+        if (drew) {
+            now_ns = monotonicNs(self.io);
         }
 
         // During active fades, let hardware VSync (`swapBuffers`) pace frames directly without polling delay
@@ -604,24 +619,20 @@ pub const StatusMonitor = struct {
 
         // Otherwise, sleep in kernel `poll()` until the exact next scheduled deadline or input/title event
         var deadline_ns = self.next_sample_ns;
-        if (self.state == .hover_armed) {
-            deadline_ns = @min(deadline_ns, self.hover_start_ns + hover_reveal_ns);
-        } else if (self.state == .leave_grace) {
+        if (self.state == .leave_grace) {
             deadline_ns = @min(deadline_ns, self.leave_start_ns + leave_grace_ns);
         }
 
-        if (!is_hidden) {
-            if (self.hasActiveMarquee()) {
-                deadline_ns = @min(deadline_ns, self.marquee_next_ns);
+        if (self.hasActiveMarquee()) {
+            deadline_ns = @min(deadline_ns, self.marquee_next_ns);
+        }
+        if (self.minNextInterpolationStepNs(now_ns)) |interp_ns| {
+            if (drew and interp_ns <= now_ns) {
+                // `swapBuffers()` just paced to hardware VSync; render next interpolated frame immediately
+                return;
             }
-            if (self.minNextInterpolationStepNs(now_ns)) |interp_ns| {
-                if (drew and interp_ns <= now_ns) {
-                    // `swapBuffers()` just paced to hardware VSync; render next interpolated frame immediately
-                    return;
-                }
-                const safe_interp_ns = if (!drew) @max(now_ns + 4 * std.time.ns_per_ms, interp_ns) else interp_ns;
-                deadline_ns = @min(deadline_ns, safe_interp_ns);
-            }
+            const safe_interp_ns = if (!drew) @max(now_ns + 4 * std.time.ns_per_ms, interp_ns) else interp_ns;
+            deadline_ns = @min(deadline_ns, safe_interp_ns);
         }
 
         const rem_ns = deadline_ns - now_ns;
