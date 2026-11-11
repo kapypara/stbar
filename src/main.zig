@@ -1,9 +1,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const Window = @import("Window.zig").Window;
+const c = @import("c");
+const window_zig = @import("Window.zig");
+const Window = window_zig.Window;
+const BackendPreference = window_zig.BackendPreference;
 const status_zig = @import("StatusMonitor.zig");
 const StatusMonitor = status_zig.StatusMonitor;
 const BarMode = status_zig.BarMode;
+
+/// Display server backend preference:
+/// - `.auto`: native Wayland `zwlr_layer_shell_v1` + `EGL` when `WAYLAND_DISPLAY` is set, else X11/GLX
+/// - `.wayland`: require native Wayland layer-shell
+/// - `.x11`: force X11 / Xwayland + GLX
+const backend_mode: BackendPreference = .auto;
 
 /// Startup bar mode flag:
 /// - `.auto_hide`: overlay (`strut = OFF`), 1px top hover sensor (>1s reveal with fade-in, 1 Hz hidden polling)
@@ -19,7 +28,17 @@ const use_debug_gpa = switch (builtin.mode) {
     .fast, .small => false,
 };
 
+var stop_requested: std.atomic.Value(bool) = .init(false);
+
+fn onSignal(_: c_int) callconv(.c) void {
+    stop_requested.store(true, .release);
+}
+
 pub fn main(_: std.process.Init.Minimal) !void {
+    var sa: c.struct_sigaction = std.mem.zeroes(c.struct_sigaction);
+    sa.__sigaction_handler.sa_handler = onSignal;
+    _ = c.sigaction(c.SIGINT, &sa, null);
+    _ = c.sigaction(c.SIGTERM, &sa, null);
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer if (use_debug_gpa) {
         if (debug_allocator.deinit() == .leak) {
@@ -32,12 +51,13 @@ pub fn main(_: std.process.Init.Minimal) !void {
     const io = single_threaded_io.io();
 
     var window = Window{
+        .backend_preference = backend_mode,
         .docked = true,
         .strut_enabled = (initial_mode == .docked_strut),
         .input_height = if (initial_mode == .auto_hide) 1 else 14 + 3,
     };
 
-    // width = 0 auto-detects the active X11 screen width; height = 14 + 3 = 17px
+    // width = 0 auto-detects the active output width; height = 14 + 3 = 17px
     try window.init(0, 0, 0, 14 + 3);
     defer window.deinit();
 
@@ -45,7 +65,7 @@ pub fn main(_: std.process.Init.Minimal) !void {
     try monitor.init(io, gpa, visible_sample_hz, initial_mode);
     defer monitor.deinit();
 
-    while (window.running) {
+    while (window.running and !stop_requested.load(.acquire)) {
         try monitor.step();
     }
 }

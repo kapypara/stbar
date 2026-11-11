@@ -57,8 +57,10 @@ pub const StatusMonitor = struct {
     mode: BarMode = .auto_hide,
     state: VisibilityState = .hidden,
     visible_sample_ns: i96 = std.time.ns_per_s / 8,
+    sample_start_ns: i96 = 0,
     next_sample_ns: i96 = 0,
     sample_count: usize = 0,
+    consecutive_unpaced_swaps: u8 = 0,
 
     hover_start_ns: i96 = 0,
     leave_start_ns: i96 = 0,
@@ -187,15 +189,19 @@ pub const StatusMonitor = struct {
         // Dirty memory is sampled alongside free memory in MemProbe, rendered in storage_load_segment
         self.processor_metrics[1].secondary_segment = &self.storage_load_segment;
 
-        // Wire X11 connection and cached atoms into WindowNameProbe
-        self.window_metrics[0].metric.window.attach(
-            self.window.display,
-            self.window.root,
-            self.window.handle,
-            self.window.net_active_window_atom,
-            self.window.net_wm_name_atom,
-            self.window.wm_name_atom,
-        );
+        // Wire active-window title source (native Wayland toplevel protocol or event-driven X11 atoms)
+        if (self.window.waylandTitle()) |wl_title| {
+            self.window_metrics[0].metric.window.setExternalTitle(wl_title);
+        } else {
+            self.window_metrics[0].metric.window.attach(
+                self.window.display,
+                self.window.root,
+                self.window.handle,
+                self.window.net_active_window_atom,
+                self.window.net_wm_name_atom,
+                self.window.wm_name_atom,
+            );
+        }
         self.window.title_dirty = false;
 
         self.segments = .{
@@ -233,13 +239,15 @@ pub const StatusMonitor = struct {
                     0;
                 const packed_init = (@as(u128, p2) << 64) | @as(u128, p1);
                 @memset(entry.sample, packed_init);
-                entry.current = packed_init;
+                entry.prev = packed_init;
+                entry.target = packed_init;
             }
         }
 
         try self.recomputeLayout();
 
         const now_ns = monotonicNs(io);
+        self.sample_start_ns = now_ns;
         self.window.setStrut(initial_mode == .docked_strut);
         if (initial_mode == .auto_hide) {
             self.window.setInputHeight(1);
@@ -555,8 +563,12 @@ pub const StatusMonitor = struct {
 
         if (self.window.title_dirty) {
             self.window.title_dirty = false;
-            self.window_metrics[0].metric.window.markDirty();
-            self.window_metrics[0].metric.window.sample();
+            if (self.window.waylandTitle()) |wl_title| {
+                self.window_metrics[0].metric.window.setExternalTitle(wl_title);
+            } else {
+                self.window_metrics[0].metric.window.markDirty();
+                self.window_metrics[0].metric.window.sample();
+            }
         }
 
         self.advanceVisibility(now_ns);
@@ -565,18 +577,21 @@ pub const StatusMonitor = struct {
         const sample_interval_ns = if (is_hidden) hidden_sample_ns else self.visible_sample_ns;
 
         if (now_ns >= self.next_sample_ns) {
+            const prior_progress = self.interpolationProgress(now_ns);
             for (self.segments) |segment| {
-                segment.update(self.io, self.sample_count);
+                segment.update(self.io, self.sample_count, prior_progress);
             }
             self.sample_count +%= 1;
+            self.sample_start_ns = now_ns;
             self.next_sample_ns += sample_interval_ns;
             if (self.next_sample_ns <= now_ns) {
                 self.next_sample_ns = now_ns + sample_interval_ns;
             }
         }
 
+        var drew = false;
         if (!is_hidden) {
-            const drew = try self.renderVisible(now_ns);
+            drew = try self.renderVisible(now_ns);
             if (drew) {
                 now_ns = monotonicNs(self.io);
             }
@@ -587,7 +602,7 @@ pub const StatusMonitor = struct {
             return;
         }
 
-        // Otherwise, sleep in kernel `poll()` until the exact next scheduled deadline or X11 input event
+        // Otherwise, sleep in kernel `poll()` until the exact next scheduled deadline or input/title event
         var deadline_ns = self.next_sample_ns;
         if (self.state == .hover_armed) {
             deadline_ns = @min(deadline_ns, self.hover_start_ns + hover_reveal_ns);
@@ -595,8 +610,18 @@ pub const StatusMonitor = struct {
             deadline_ns = @min(deadline_ns, self.leave_start_ns + leave_grace_ns);
         }
 
-        if (!is_hidden and self.hasActiveMarquee()) {
-            deadline_ns = @min(deadline_ns, self.marquee_next_ns);
+        if (!is_hidden) {
+            if (self.hasActiveMarquee()) {
+                deadline_ns = @min(deadline_ns, self.marquee_next_ns);
+            }
+            if (self.minNextInterpolationStepNs(now_ns)) |interp_ns| {
+                if (drew and interp_ns <= now_ns) {
+                    // `swapBuffers()` just paced to hardware VSync; render next interpolated frame immediately
+                    return;
+                }
+                const safe_interp_ns = if (!drew) @max(now_ns + 4 * std.time.ns_per_ms, interp_ns) else interp_ns;
+                deadline_ns = @min(deadline_ns, safe_interp_ns);
+            }
         }
 
         const rem_ns = deadline_ns - now_ns;
@@ -609,6 +634,68 @@ pub const StatusMonitor = struct {
         }
     }
 
+    fn interpolationProgress(self: *const StatusMonitor, now_ns: i96) f64 {
+        const span = self.next_sample_ns - self.sample_start_ns;
+        if (span <= 0) return 1.0;
+        const elapsed = now_ns - self.sample_start_ns;
+        if (elapsed <= 0) return 0.0;
+        if (elapsed >= span) return 1.0;
+        return @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(span));
+    }
+
+    fn channelNextStepNs(
+        sample_start_ns: i96,
+        span_ns: i96,
+        now_ns: i96,
+        prev_v: u64,
+        target_v: u64,
+        last_v: u64,
+    ) ?i96 {
+        if (last_v == target_v) return null;
+        const diff: u64 = if (target_v > prev_v) target_v - prev_v else prev_v - target_v;
+        if (diff == 0) return now_ns;
+
+        const capped_diff: i96 = @intCast(@min(diff, 1_000_000));
+        const step_ns = @divTrunc(span_ns, capped_diff);
+        // Fast-changing metrics (>= ~125 integer steps/sec) ride hardware VSync every frame
+        if (step_ns <= 8 * std.time.ns_per_ms) {
+            return now_ns;
+        }
+
+        const done_steps: i96 = @intCast(@min(
+            if (target_v > prev_v) (last_v -| prev_v) else (prev_v -| last_v),
+            diff,
+        ));
+        return sample_start_ns + @divTrunc((2 * done_steps + 1) * span_ns, 2 * capped_diff) + 1;
+    }
+
+    fn minNextInterpolationStepNs(self: *const StatusMonitor, now_ns: i96) ?i96 {
+        if (now_ns >= self.next_sample_ns) return null;
+        const span_ns = @max(1, self.next_sample_ns - self.sample_start_ns);
+        var earliest: ?i96 = null;
+
+        for (self.segments) |segment| {
+            for (segment.metrics) |*m| {
+                if (m.metric == .time or m.metric == .window) continue;
+
+                const prev_p1: u64 = @truncate(m.prev);
+                const target_p1: u64 = @truncate(m.target);
+                if (channelNextStepNs(self.sample_start_ns, span_ns, now_ns, prev_p1, target_p1, m.last_p1)) |t1| {
+                    earliest = if (earliest) |e| @min(e, t1) else t1;
+                }
+
+                if (m.secondary_index != null) {
+                    const prev_p2: u64 = @truncate(m.prev >> 64);
+                    const target_p2: u64 = @truncate(m.target >> 64);
+                    if (channelNextStepNs(self.sample_start_ns, span_ns, now_ns, prev_p2, target_p2, m.last_p2)) |t2| {
+                        earliest = if (earliest) |e| @min(e, t2) else t2;
+                    }
+                }
+            }
+        }
+        return earliest;
+    }
+
     fn hasActiveMarquee(self: *const StatusMonitor) bool {
         const max_chars = self.window_title_segment.cells.len -| 2;
         return max_chars > 0 and self.title_len > max_chars;
@@ -616,13 +703,14 @@ pub const StatusMonitor = struct {
 
     fn renderVisible(self: *StatusMonitor, now_ns: i96) !bool {
         var drew_anything = self.frame_dirty;
+        const progress = self.interpolationProgress(now_ns);
 
-        // 1. Numeric smoothed metrics (both primary and optional secondary channels)
+        // 1. Numeric interpolated metrics (both primary and optional secondary channels)
         for (self.segments) |segment| {
             for (segment.metrics) |*m| {
                 if (m.metric == .time or m.metric == .window) continue;
 
-                const packed_val = m.current;
+                const packed_val = m.interpolateAt(progress);
                 const v1: u64 = @truncate(packed_val);
                 if (v1 != m.last_p1) {
                     m.last_p1 = v1;
@@ -666,15 +754,20 @@ pub const StatusMonitor = struct {
             self.rect.drawBatch(self.quad_buffer, self.opacity);
             self.window.swapBuffers();
 
-            // Fallback pacing only if a software/uncomposited driver ignores swap_interval=1 during fade
-            if (self.state == .fading_in or self.state == .fading_out) {
-                const post_swap_ns = monotonicNs(self.io);
-                if (post_swap_ns - pre_swap_ns < 2 * std.time.ns_per_ms) {
+            const post_swap_ns = monotonicNs(self.io);
+            if (post_swap_ns - pre_swap_ns < 2 * std.time.ns_per_ms) {
+                self.consecutive_unpaced_swaps +|= 1;
+                if (self.consecutive_unpaced_swaps >= 2 and
+                    (self.state == .fading_in or self.state == .fading_out or self.minNextInterpolationStepNs(post_swap_ns) != null))
+                {
                     sleepNs(self.io, 8 * std.time.ns_per_ms);
                 }
+            } else {
+                self.consecutive_unpaced_swaps = 0;
             }
             return true;
         }
+        self.consecutive_unpaced_swaps = 0;
         return false;
     }
 

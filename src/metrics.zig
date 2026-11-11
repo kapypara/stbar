@@ -671,7 +671,20 @@ pub const WindowNameProbe = struct {
         self.net_name_atom = net_name_atom;
         self.wm_name_atom = wm_name_atom;
         self.dirty = true;
-        _ = x11.XSetErrorHandler(xErrorHandler);
+        if (display != null) {
+            _ = x11.XSetErrorHandler(xErrorHandler);
+        }
+    }
+
+    pub fn setExternalTitle(self: *WindowNameProbe, raw_title: []const u8) void {
+        self.dirty = false;
+        var next_buf: [256]u8 = @splat(0);
+        const next_len = sanitizeName(raw_title, &next_buf);
+        if (!mem.eql(u8, self.current_name[0..self.name_len], next_buf[0..next_len])) {
+            self.current_name = next_buf;
+            self.name_len = next_len;
+            self.changed = true;
+        }
     }
 
     pub fn markDirty(self: *WindowNameProbe) void {
@@ -748,7 +761,7 @@ pub const WindowNameProbe = struct {
         return 0; // Equivalent to your ignoreErrors
     }
 
-    fn sanitizeName(src: []u8, dest: *[256]u8) usize {
+    fn sanitizeName(src: []const u8, dest: *[256]u8) usize {
         var j: usize = 0;
         for (src) |char| {
             if (char != '\n' and char != '\r') { // From your sanitizeName logic

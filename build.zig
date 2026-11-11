@@ -64,15 +64,54 @@ pub fn build(b: *std.Build) void {
     // Link libc (required for C headers and system libraries)
     exe.root_module.link_libc = true;
 
-    // Link the required system libraries
-    const c_lib = [_][]const u8{ "GL", "X11", "Xrender", "Xext" };
+    // Link the required system libraries (Wayland + EGL + OpenGL + sd-bus + X11 fallback)
+    const c_lib = [_][]const u8{
+        "wayland-client",
+        "wayland-egl",
+        "EGL",
+        "GL",
+        "libsystemd",
+        "X11",
+        "Xrender",
+        "Xext",
+    };
 
     for (c_lib) |lib| {
         exe.root_module.linkSystemLibrary(lib, .{});
     }
 
     const wf = b.addWriteFiles();
+
+    const protocols = [_]struct { xml: []const u8, stem: []const u8 }{
+        .{ .xml = "protocols/xdg-shell.xml", .stem = "xdg-shell" },
+        .{ .xml = "protocols/wlr-layer-shell-unstable-v1.xml", .stem = "wlr-layer-shell-unstable-v1" },
+        .{ .xml = "protocols/wlr-foreign-toplevel-management-unstable-v1.xml", .stem = "wlr-foreign-toplevel-management-unstable-v1" },
+    };
+
+    for (protocols) |proto| {
+        const header_name = b.fmt("{s}-client-protocol.h", .{proto.stem});
+        const code_name = b.fmt("{s}-protocol.c", .{proto.stem});
+
+        const gen_h = b.addSystemCommand(&.{ "wayland-scanner", "client-header" });
+        gen_h.addFileArg(b.path(proto.xml));
+        const h_file = gen_h.addOutputFileArg(header_name);
+        _ = wf.addCopyFile(h_file, header_name);
+
+        const gen_c = b.addSystemCommand(&.{ "wayland-scanner", "private-code" });
+        gen_c.addFileArg(b.path(proto.xml));
+        const c_file = gen_c.addOutputFileArg(code_name);
+        exe.root_module.addCSourceFile(.{ .file = c_file });
+    }
+
+    exe.root_module.addIncludePath(wf.getDirectory());
+
     const c_header = wf.add("c.h",
+        \\#include <wayland-client.h>
+        \\#include <wayland-egl.h>
+        \\#include <EGL/egl.h>
+        \\#include "xdg-shell-client-protocol.h"
+        \\#include "wlr-layer-shell-unstable-v1-client-protocol.h"
+        \\#include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
         \\#include <GL/gl.h>
         \\#include <GL/glext.h>
         \\#include <GL/glx.h>
@@ -83,6 +122,10 @@ pub fn build(b: *std.Build) void {
         \\#include <X11/Xutil.h>
         \\#include <sys/statvfs.h>
         \\#include <poll.h>
+        \\#include <unistd.h>
+        \\#include <fcntl.h>
+        \\#include <signal.h>
+        \\#include <systemd/sd-bus.h>
         \\
     );
     const translate_c = b.addTranslateC(.{
@@ -91,6 +134,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    translate_c.addIncludePath(wf.getDirectory());
     for (c_lib) |lib| {
         translate_c.linkSystemLibrary(lib, .{});
     }
