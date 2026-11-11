@@ -21,6 +21,7 @@ pub const MetricEntry = struct {
 
 pub const Segment = struct {
     color: u32 = 0, // RGBA32 hex color
+    cell_start: usize = 0,
     cells: []i16 = &.{},
     metrics: []MetricEntry = &.{},
     static_overlay: []const u8 = "",

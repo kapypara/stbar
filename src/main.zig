@@ -40,7 +40,6 @@ pub fn main(_: std.process.Init.Minimal) !void {
 
     while (window.running) {
         window.updateTheMessageQueue();
-        window.updateViewport();
         try monitor.update();
         try monitor.render();
         ticker.tick();

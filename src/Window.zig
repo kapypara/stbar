@@ -29,6 +29,7 @@ pub const Window = struct {
     docked: bool = false,
     clicked: bool = false,
     resized: bool = false,
+    exposed: bool = false,
     title_dirty: bool = true,
     last_click: Click = .{ .x = 0, .y = 0, .button = 0 },
 
@@ -70,12 +71,12 @@ pub const Window = struct {
         const vis_attribs = [_]i32{
             c.GLX_RENDER_TYPE,   c.GLX_RGBA_BIT,
             c.GLX_DRAWABLE_TYPE, c.GLX_WINDOW_BIT,
-            c.GLX_DOUBLEBUFFER,  c.False,
+            c.GLX_DOUBLEBUFFER,  c.True,
             c.GLX_RED_SIZE,      8,
             c.GLX_GREEN_SIZE,    8,
             c.GLX_BLUE_SIZE,     8,
             c.GLX_ALPHA_SIZE,    8,
-            c.GLX_DEPTH_SIZE,    16,
+            c.GLX_DEPTH_SIZE,    0,
             c.None,
         };
 
@@ -216,6 +217,20 @@ pub const Window = struct {
             c.glewExperimental = c.GL_TRUE;
             _ = c.glewInit();
         }
+
+        // Enable hardware VSync (interval = 1) so dirty/fading swaps pace cleanly to monitor VBlank
+        const SwapExtFn = *const fn (?*c.Display, c.GLXDrawable, c_int) callconv(.c) void;
+        const SwapMesaFn = *const fn (c_uint) callconv(.c) c_int;
+        if (c.glXGetProcAddressARB("glXSwapIntervalEXT")) |ptr| {
+            const setSwapExt: SwapExtFn = @ptrCast(ptr);
+            setSwapExt(dpy, self.glx_handle, 1);
+        } else if (c.glXGetProcAddressARB("glXSwapIntervalMESA")) |ptr| {
+            const setSwapMesa: SwapMesaFn = @ptrCast(ptr);
+            _ = setSwapMesa(1);
+        }
+
+        c.glClearColor(0.0, 0.0, 0.0, 0.0);
+        self.updateViewport();
     }
 
     pub fn updateTheMessageQueue(self: *Window) void {
@@ -235,6 +250,11 @@ pub const Window = struct {
                         self.width = event.xconfigure.width;
                         self.height = event.xconfigure.height;
                         self.resized = true;
+                    }
+                },
+                c.Expose => {
+                    if (event.xexpose.count == 0) {
+                        self.exposed = true;
                     }
                 },
                 c.ButtonPress => {

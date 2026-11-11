@@ -38,7 +38,10 @@ pub const StatusMonitor = struct {
     rect_y_pos: i16 = 0, // y pos for glyph rect in fixed-point NDC
 
     cells: []i16 = &.{},
+    quad_buffer: []RectDraw.QuadVertex = &.{},
     sample_buffer: []u128 = &.{},
+    opacity: f32 = 1.0,
+    frame_dirty: bool = true,
 
     // Metric storage owned per StatusMonitor instance
     time_metrics: [1]MetricEntry = .{
@@ -107,6 +110,7 @@ pub const StatusMonitor = struct {
         self.rect.deinit();
         self.font.deinit();
         if (self.cells.len > 0) self.allocator.free(self.cells);
+        if (self.quad_buffer.len > 0) self.allocator.free(self.quad_buffer);
         if (self.sample_buffer.len > 0) self.allocator.free(self.sample_buffer);
     }
 
@@ -197,11 +201,26 @@ pub const StatusMonitor = struct {
         entry.frames = buffer[mid..end];
     }
 
+    fn rgbaBytes(rgba: u32) [4]u8 {
+        return .{
+            @truncate(rgba >> 24),
+            @truncate(rgba >> 16),
+            @truncate(rgba >> 8),
+            @truncate(rgba),
+        };
+    }
+
     pub fn recomputeLayout(self: *StatusMonitor) !void {
         if (self.cells.len > 0) {
             self.allocator.free(self.cells);
             self.cells = &.{};
         }
+        if (self.quad_buffer.len > 0) {
+            self.allocator.free(self.quad_buffer);
+            self.quad_buffer = &.{};
+        }
+
+        self.window.updateViewport();
 
         const window_height = @as(f32, @floatFromInt(@max(1, self.window.height)));
         const char_height = @as(f32, @floatFromInt(self.font.char_height));
@@ -216,7 +235,6 @@ pub const StatusMonitor = struct {
         // 0.52 vertically centers Tamzen inside the 17px bar
         self.rect_y_pos = @intFromFloat(self.rect_height * 32767.0 * 0.52);
 
-        try self.rect.setRectSize(self.rect_width_f, self.rect_height);
         try self.generateCells();
 
         const cells_count = self.cells.len;
@@ -226,14 +244,29 @@ pub const StatusMonitor = struct {
         const stor_idx = therm_idx -| storage_width;
         const net_idx = stor_idx -| network_width;
 
+        self.time_segment.cell_start = time_idx;
         self.time_segment.cells = self.cells[time_idx..cells_count];
+
+        self.processor_segment.cell_start = proc_idx;
         self.processor_segment.cells = self.cells[proc_idx..time_idx];
+
+        self.thermal_load_segment.cell_start = therm_idx;
         self.thermal_load_segment.cells = self.cells[therm_idx..proc_idx];
+
+        self.storage_load_segment.cell_start = stor_idx;
         self.storage_load_segment.cells = self.cells[stor_idx..therm_idx];
+
+        self.network_load_segment.cell_start = net_idx;
         self.network_load_segment.cells = self.cells[net_idx..stor_idx];
+
+        self.window_title_segment.cell_start = 0;
         self.window_title_segment.cells = self.cells[0..net_idx];
 
-        // Force full clear + static icon redraw + metric redraw
+        // Allocate single batched vertex buffer: 6 segment background rects + N glyph cells
+        const bg_quads = self.segments.len;
+        self.quad_buffer = try self.allocator.alloc(RectDraw.QuadVertex, bg_quads + cells_count);
+        try self.rect.ensureCapacity(self.quad_buffer.len);
+
         try self.clearAllAndDrawStatic();
         for (self.segments) |seg| {
             for (seg.metrics) |*m| {
@@ -243,6 +276,7 @@ pub const StatusMonitor = struct {
         }
         self.time_metrics[0].metric.time.changed = true;
         self.window_metrics[0].metric.window.changed = true;
+        self.frame_dirty = true;
     }
 
     fn generateCells(self: *StatusMonitor) !void {
@@ -261,6 +295,11 @@ pub const StatusMonitor = struct {
         if (self.window.resized) {
             self.window.resized = false;
             try self.recomputeLayout();
+        }
+
+        if (self.window.exposed) {
+            self.window.exposed = false;
+            self.frame_dirty = true;
         }
 
         if (self.window.clicked) {
@@ -284,7 +323,7 @@ pub const StatusMonitor = struct {
 
     pub fn render(self: *StatusMonitor) !void {
         const sub_frame = self.ticks % self.frames_per_sample;
-        var drew_anything = false;
+        var drew_anything = self.frame_dirty;
 
         // 1. Numeric interpolated metrics (both primary and optional secondary channels)
         for (self.segments) |segment| {
@@ -296,8 +335,9 @@ pub const StatusMonitor = struct {
                 if (v1 != m.last_p1) {
                     m.last_p1 = v1;
                     const s1 = m.metric.print(v1, 0);
-                    try self.drawSegment(segment, s1.slice(), m.start_index);
-                    drew_anything = true;
+                    if (try self.drawSegment(segment, s1.slice(), m.start_index)) {
+                        drew_anything = true;
+                    }
                 }
 
                 if (m.secondary_index) |sec_offset| {
@@ -306,8 +346,9 @@ pub const StatusMonitor = struct {
                         m.last_p2 = v2;
                         const target_seg = m.secondary_segment orelse segment;
                         const s2 = m.metric.print(v2, 1);
-                        try self.drawSegment(target_seg, s2.slice(), sec_offset);
-                        drew_anything = true;
+                        if (try self.drawSegment(target_seg, s2.slice(), sec_offset)) {
+                            drew_anything = true;
+                        }
                     }
                 }
             }
@@ -317,8 +358,9 @@ pub const StatusMonitor = struct {
         const time_probe = &self.time_metrics[0].metric.time;
         if (time_probe.changed) {
             time_probe.changed = false;
-            try self.drawSegment(&self.time_segment, &time_probe.value, self.time_metrics[0].start_index);
-            drew_anything = true;
+            if (try self.drawSegment(&self.time_segment, &time_probe.value, self.time_metrics[0].start_index)) {
+                drew_anything = true;
+            }
         }
 
         // 3. Active window title + marquee rotation for overflowing titles
@@ -327,7 +369,9 @@ pub const StatusMonitor = struct {
         }
 
         if (drew_anything) {
-            try self.rect.flush();
+            self.frame_dirty = false;
+            try self.rect.drawBatch(self.quad_buffer, self.opacity);
+            self.window.swapBuffers();
         }
 
         self.ticks +%= 1;
@@ -340,7 +384,7 @@ pub const StatusMonitor = struct {
 
         if (win_probe.changed) {
             win_probe.changed = false;
-            try self.clearSegment(&self.window_title_segment);
+            var changed = self.clearSegment(&self.window_title_segment);
 
             // Filter UTF-8 title down to codepoints present in FontAtlas
             self.title_len = 0;
@@ -372,8 +416,10 @@ pub const StatusMonitor = struct {
             self.title_fetch_tick = self.ticks;
             self.title_rotations = 0;
 
-            try self.drawCodepoints(&self.window_title_segment, self.title_codepoints[0..@min(self.title_len, max_chars)], 1);
-            return true;
+            if (self.drawCodepoints(&self.window_title_segment, self.title_codepoints[0..@min(self.title_len, max_chars)], 1)) {
+                changed = true;
+            }
+            return changed;
         }
 
         // Marquee scroll after 1 second if title exceeds available cells
@@ -382,51 +428,27 @@ pub const StatusMonitor = struct {
             (self.ticks - self.title_fetch_tick) % self.frames_per_sample == 0)
         {
             std.mem.rotate(u32, self.title_codepoints[0..self.title_len], 1);
-            try self.drawCodepoints(&self.window_title_segment, self.title_codepoints[0..max_chars], 1);
+            const changed = self.drawCodepoints(&self.window_title_segment, self.title_codepoints[0..max_chars], 1);
 
             self.title_rotations += 1;
             if (self.title_rotations >= self.title_len * 2) {
                 self.title_fetch_tick = self.ticks + 60 * @as(usize, self.render_rate);
                 self.title_rotations = 0;
             }
-            return true;
+            return changed;
         }
 
         return false;
     }
 
-    pub fn drawSegment(self: *StatusMonitor, seg: *const Segment, input: []const u8, offset: u8) !void {
-        if (input.len == 0 or offset >= seg.cells.len) return;
+    pub fn drawSegment(self: *StatusMonitor, seg: *const Segment, input: []const u8, offset: u8) !bool {
+        if (input.len == 0 or offset >= seg.cells.len or self.quad_buffer.len == 0) return false;
 
-        const cp_len = try std.unicode.utf8CountCodepoints(input);
-        if (cp_len == 0) return;
-
-        var char_stack: [128]u16 = undefined;
-        var slot_stack: [128]i16 = undefined;
-
-        var dynamic_chars: ?[]u16 = null;
-        var dynamic_slots: ?[]i16 = null;
-        defer {
-            if (dynamic_chars) |dc| self.allocator.free(dc);
-            if (dynamic_slots) |ds| self.allocator.free(ds);
-        }
-
-        var characters: []u16 = undefined;
-        var slots: []i16 = undefined;
-        if (cp_len * 2 > char_stack.len) {
-            dynamic_chars = try self.allocator.alloc(u16, cp_len * 2);
-            dynamic_slots = try self.allocator.alloc(i16, cp_len * 2);
-            characters = dynamic_chars.?;
-            slots = dynamic_slots.?;
-        } else {
-            characters = char_stack[0 .. cp_len * 2];
-            slots = slot_stack[0 .. cp_len * 2];
-        }
-
+        const base = self.segments.len + seg.cell_start;
         const view = try std.unicode.Utf8View.init(input);
         var iterator = view.iterator();
         var cell_idx: usize = 0;
-        var vert_idx: usize = 0;
+        var changed = false;
 
         while (iterator.nextCodepoint()) |cp| {
             const target_cell = cell_idx + offset;
@@ -435,80 +457,103 @@ pub const StatusMonitor = struct {
 
             if (cp == '\n') continue; // Preserve existing static glyph in this cell
 
-            if (self.font.getGlyphUV(cp)) |glyph| {
-                const out = vert_idx * 2;
-                characters[out..][0..2].* = glyph;
-                slots[out..][0..2].* = .{ seg.cells[target_cell], self.rect_y_pos };
-                vert_idx += 1;
+            const next_uv = if (cp == ' ')
+                RectDraw.uv_empty
+            else
+                (self.font.getGlyphUV(cp) orelse RectDraw.uv_empty);
+
+            const slot = &self.quad_buffer[base + target_cell];
+            if (slot.uv[0] != next_uv[0] or slot.uv[1] != next_uv[1]) {
+                slot.uv = next_uv;
+                changed = true;
             }
         }
-
-        if (vert_idx == 0) return;
-
-        try self.rect.setBackgroundColorU32(seg.color);
-        try self.rect.setTextureCoordinates(characters[0 .. vert_idx * 2]);
-        try self.rect.setRectPoints(slots[0 .. vert_idx * 2]);
-        try self.rect.draw(@intCast(vert_idx));
+        return changed;
     }
 
-    fn drawCodepoints(self: *StatusMonitor, seg: *const Segment, codepoints: []const u32, offset: u8) !void {
-        if (codepoints.len == 0 or offset >= seg.cells.len) return;
+    fn drawCodepoints(self: *StatusMonitor, seg: *const Segment, codepoints: []const u32, offset: u8) bool {
+        if (codepoints.len == 0 or offset >= seg.cells.len or self.quad_buffer.len == 0) return false;
 
+        const base = self.segments.len + seg.cell_start;
         const max_emit = @min(codepoints.len, seg.cells.len - offset);
-        var char_stack: [512]u16 = undefined;
-        var slot_stack: [512]i16 = undefined;
-        const limit = @min(max_emit, char_stack.len / 2);
+        var changed = false;
 
-        var vert_idx: usize = 0;
-        for (codepoints[0..limit], 0..) |cp, cell_idx| {
-            if (self.font.getGlyphUV(cp)) |glyph| {
-                const out = vert_idx * 2;
-                char_stack[out..][0..2].* = glyph;
-                slot_stack[out..][0..2].* = .{ seg.cells[offset + cell_idx], self.rect_y_pos };
-                vert_idx += 1;
+        for (codepoints[0..max_emit], 0..) |cp, cell_idx| {
+            const next_uv = if (cp == ' ')
+                RectDraw.uv_empty
+            else
+                (self.font.getGlyphUV(cp) orelse RectDraw.uv_empty);
+
+            const slot = &self.quad_buffer[base + offset + cell_idx];
+            if (slot.uv[0] != next_uv[0] or slot.uv[1] != next_uv[1]) {
+                slot.uv = next_uv;
+                changed = true;
             }
         }
-
-        if (vert_idx == 0) return;
-
-        try self.rect.setBackgroundColorU32(seg.color);
-        try self.rect.setTextureCoordinates(char_stack[0 .. vert_idx * 2]);
-        try self.rect.setRectPoints(slot_stack[0 .. vert_idx * 2]);
-        try self.rect.draw(@intCast(vert_idx));
+        return changed;
     }
 
-    /// Clears a single segment background in 1 quad draw with zero heap allocations.
-    pub fn clearSegment(self: *StatusMonitor, seg: *const Segment) !void {
-        if (seg.cells.len == 0) return;
-        const space_uv = self.font.getGlyphUV(' ') orelse .{ 0, 0 };
-        const start_ndc = @max(-1.0, @as(f32, @floatFromInt(seg.cells[0])) / 32767.0);
-        const end_x_i32 = @as(i32, seg.cells[seg.cells.len - 1]) + @as(i32, self.rect_width_i);
-        const end_ndc = if (seg == &self.time_segment)
-            1.0
-        else
-            @min(1.0, @as(f32, @floatFromInt(end_x_i32)) / 32767.0);
-        const seg_width_ndc = @max(0.0, end_ndc - start_ndc);
-
-        try self.rect.setRectSize(seg_width_ndc, 2.0);
-        try self.rect.setBackgroundColorU32(seg.color);
-        try self.rect.setTextureCoordinates(&space_uv);
-        try self.rect.setRectPoints(&.{ seg.cells[0], 32767 });
-        try self.rect.draw(1);
-        try self.rect.setRectSize(self.rect_width_f, self.rect_height);
+    /// Resets all character slots in a segment to empty (culled) UVs in CPU memory.
+    pub fn clearSegment(self: *StatusMonitor, seg: *const Segment) bool {
+        if (seg.cells.len == 0 or self.quad_buffer.len == 0) return false;
+        const base = self.segments.len + seg.cell_start;
+        var changed = false;
+        for (self.quad_buffer[base .. base + seg.cells.len]) |*q| {
+            if (q.uv[0] != RectDraw.uv_empty[0] or q.uv[1] != RectDraw.uv_empty[1]) {
+                q.uv = RectDraw.uv_empty;
+                changed = true;
+            }
+        }
+        return changed;
     }
 
     pub fn clearAllAndDrawStatic(self: *StatusMonitor) !void {
-        // Draw right-to-left (matching segment layout) and stamp static icons/separators
-        var i = self.segments.len;
-        while (i > 0) {
-            i -= 1;
-            const seg = self.segments[i];
-            try self.clearSegment(seg);
+        if (self.quad_buffer.len < self.segments.len) return;
+
+        const bg_quads = self.segments.len;
+        const glyph_size: [2]f32 = .{ self.rect_width_f, self.rect_height };
+
+        for (self.segments, 0..) |seg, seg_idx| {
+            const color_bytes = rgbaBytes(seg.color);
+
+            if (seg.cells.len > 0) {
+                const start_ndc = @max(-1.0, @as(f32, @floatFromInt(seg.cells[0])) / 32767.0);
+                const end_x_i32 = @as(i32, seg.cells[seg.cells.len - 1]) + @as(i32, self.rect_width_i);
+                const end_ndc = if (seg == &self.time_segment)
+                    1.0
+                else
+                    @min(1.0, @as(f32, @floatFromInt(end_x_i32)) / 32767.0);
+                const seg_width_ndc = @max(0.0, end_ndc - start_ndc);
+
+                self.quad_buffer[seg_idx] = .{
+                    .size = .{ seg_width_ndc, 2.0 },
+                    .pos = .{ seg.cells[0], 32767 },
+                    .uv = RectDraw.uv_solid,
+                    .color = color_bytes,
+                };
+            } else {
+                self.quad_buffer[seg_idx] = .{
+                    .size = .{ 0.0, 0.0 },
+                    .pos = .{ 0, 0 },
+                    .uv = RectDraw.uv_empty,
+                    .color = color_bytes,
+                };
+            }
+
+            const base = bg_quads + seg.cell_start;
+            for (seg.cells, 0..) |cell_x, local_i| {
+                self.quad_buffer[base + local_i] = .{
+                    .size = glyph_size,
+                    .pos = .{ cell_x, self.rect_y_pos },
+                    .uv = RectDraw.uv_empty,
+                    .color = color_bytes,
+                };
+            }
+
             if (seg.static_overlay.len > 0) {
-                try self.drawSegment(seg, seg.static_overlay, seg.static_offset);
+                _ = try self.drawSegment(seg, seg.static_overlay, seg.static_offset);
             }
         }
-        try self.rect.flush();
     }
 
     fn handleClick(self: *StatusMonitor, x_pos: i32, _: u32) void {
