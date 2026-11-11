@@ -1,19 +1,25 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Window = @import("Window.zig").Window;
 const Ticker = @import("Ticker.zig").Ticker;
 const StatusMonitor = @import("StatusMonitor.zig").StatusMonitor;
 
-pub fn main(init: std.process.Init) !void {
+const use_debug_gpa = switch (builtin.mode) {
+    .debug, .safe => true,
+    .fast, .small => false,
+};
+
+pub fn main(_: std.process.Init.Minimal) !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    const gpa = debug_allocator.allocator();
-    defer {
-        const check = debug_allocator.deinit();
-        if (check == .leak) {
+    defer if (use_debug_gpa) {
+        if (debug_allocator.deinit() == .leak) {
             std.debug.print("MEMORY LEAK DETECTED!\n", .{});
         }
-    }
+    };
+    const gpa = if (use_debug_gpa) debug_allocator.allocator() else std.heap.c_allocator;
 
-    const io = init.io;
+    var single_threaded_io: std.Io.Threaded = .init_single_threaded;
+    const io = single_threaded_io.io();
 
     var window = Window{
         .docked = true,

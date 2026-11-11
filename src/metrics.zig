@@ -72,6 +72,18 @@ pub const Metric = union(MetricTag) {
         };
     }
 
+    pub fn deinit(self: *Metric, io: Io) void {
+        switch (self.*) {
+            .cpu => |*p| p.deinit(io),
+            .memory => |*p| p.deinit(io),
+            .io => |*p| p.deinit(io),
+            .net => |*p| p.deinit(io),
+            .temp => |*p| p.deinit(io),
+            .free_storage => |*p| p.deinit(io),
+            .load, .window, .time => {},
+        }
+    }
+
     pub fn get(self: *Metric, idx: u8) u64 {
         return switch (self.*) {
             .cpu => |*p| p.current_pct,
@@ -135,18 +147,41 @@ pub const MetricString = struct {
 
 // --- Implementation Probes ---
 
+fn preadOnce(file: Io.File, io: Io, buf: []u8) !usize {
+    const bufs: [1][]u8 = .{buf};
+    return file.readPositional(io, &bufs, 0);
+}
+
+fn ensureOpen(slot: *?Io.File, io: Io, path: []const u8) !Io.File {
+    if (slot.*) |f| return f;
+    const f = try Io.Dir.openFileAbsolute(io, path, .{});
+    slot.* = f;
+    return f;
+}
+
+fn closeSlot(slot: *?Io.File, io: Io) void {
+    if (slot.*) |f| {
+        f.close(io);
+        slot.* = null;
+    }
+}
+
 pub const CpuProbe = struct {
+    file: ?Io.File = null,
     prev_idle: u64 = 0,
     prev_total: u64 = 0,
     current_pct: u64 = 0,
     primed: bool = false,
 
+    pub fn deinit(self: *CpuProbe, io: Io) void {
+        closeSlot(&self.file, io);
+    }
+
     pub fn sample(self: *CpuProbe, io: Io) !void {
-        const file = try Io.Dir.openFileAbsolute(io, "/proc/stat", .{});
-        defer file.close(io);
+        const file = try ensureOpen(&self.file, io, "/proc/stat");
 
         var buf: [128]u8 = undefined;
-        const amt = try file.readPositionalAll(io, &buf, 0);
+        const amt = try preadOnce(file, io, &buf);
 
         var it = mem.tokenizeAny(u8, buf[0..amt], " \n");
         _ = it.next(); // skip "cpu"
@@ -179,15 +214,19 @@ pub const CpuProbe = struct {
 };
 
 pub const MemProbe = struct {
+    file: ?Io.File = null,
     free: u64 = 0,
     dirty: u64 = 0,
 
+    pub fn deinit(self: *MemProbe, io: Io) void {
+        closeSlot(&self.file, io);
+    }
+
     pub fn sample(self: *MemProbe, io: Io) !void {
-        const file = try Io.Dir.openFileAbsolute(io, "/proc/meminfo", .{});
-        defer file.close(io);
+        const file = try ensureOpen(&self.file, io, "/proc/meminfo");
 
         var buf: [2048]u8 = undefined;
-        const amt = try file.readPositionalAll(io, &buf, 0);
+        const amt = try preadOnce(file, io, &buf);
 
         var found_free = false;
         var found_dirty = false;
@@ -214,16 +253,20 @@ pub const MemProbe = struct {
 };
 
 pub const IoProbe = struct {
+    file: ?Io.File = null,
     prev: IoStat = .{},
     current: IoStat = .{},
     primed: bool = false,
 
-    pub fn sample(self: *IoProbe, io: Io) !void {
-        const file = try Io.Dir.openFileAbsolute(io, "/proc/diskstats", .{});
-        defer file.close(io);
+    pub fn deinit(self: *IoProbe, io: Io) void {
+        closeSlot(&self.file, io);
+    }
 
-        var buf: [2048]u8 = undefined;
-        const amt = try file.readPositionalAll(io, &buf, 0);
+    pub fn sample(self: *IoProbe, io: Io) !void {
+        const file = try ensureOpen(&self.file, io, "/proc/diskstats");
+
+        var buf: [4096]u8 = undefined;
+        const amt = try preadOnce(file, io, &buf);
 
         var raw = IoStat{};
 
@@ -270,7 +313,7 @@ pub const IoProbe = struct {
             return;
         }
         self.current = raw.diff(self.prev);
-        // Apply 512 byte sector shift from source[cite: 1]
+        // Apply 512 byte sector shift
         self.current.read <<= 9;
         self.current.write <<= 9;
         self.prev = raw;
@@ -278,24 +321,38 @@ pub const IoProbe = struct {
 };
 
 pub const NetProbe = struct {
+    file: ?Io.File = null,
     prev: NetStat = .{},
     current: NetStat = .{},
     primed: bool = false,
 
-    const network_class = "/sys/class/net";
+    pub fn deinit(self: *NetProbe, io: Io) void {
+        closeSlot(&self.file, io);
+    }
 
     pub fn sample(self: *NetProbe, io: Io) !void {
+        const file = try ensureOpen(&self.file, io, "/proc/net/dev");
+
+        var buf: [2048]u8 = undefined;
+        const amt = try preadOnce(file, io, &buf);
+
         var raw = NetStat{};
+        var line_it = mem.tokenizeAny(u8, buf[0..amt], "\n");
+        while (line_it.next()) |line| {
+            const colon = mem.indexOfScalar(u8, line, ':') orelse continue;
+            const iface = mem.trim(u8, line[0..colon], " \t");
+            if (!(mem.startsWith(u8, iface, "en") or mem.startsWith(u8, iface, "eth") or mem.startsWith(u8, iface, "wl"))) {
+                continue;
+            }
 
-        const dir = try Io.Dir.openDirAbsolute(io, network_class, .{ .iterate = true });
-        defer dir.close(io);
-
-        var iter = dir.iterate();
-        while (try iter.next(io)) |entry| {
-            if (entry.kind == .directory or entry.kind == .sym_link) {
-                if (std.mem.startsWith(u8, entry.name, "en") or std.mem.startsWith(u8, entry.name, "eth") or std.mem.startsWith(u8, entry.name, "wl")) {
-                    raw.rx += try readSysfsUint(io, entry.name, "rx_bytes");
-                    raw.tx += try readSysfsUint(io, entry.name, "tx_bytes");
+            var fields = mem.tokenizeAny(u8, line[colon + 1 ..], " \t");
+            var col: usize = 0;
+            while (fields.next()) |tok| : (col += 1) {
+                if (col == 0) {
+                    raw.rx += std.fmt.parseInt(u64, tok, 10) catch 0;
+                } else if (col == 8) {
+                    raw.tx += std.fmt.parseInt(u64, tok, 10) catch 0;
+                    break;
                 }
             }
         }
@@ -309,51 +366,52 @@ pub const NetProbe = struct {
         self.current = raw.diff(self.prev);
         self.prev = raw;
     }
-
-    fn readSysfsUint(io: Io, network_name: []const u8, comptime stat_name: []const u8) !u64 {
-        var buf: [64]u8 = undefined;
-
-        // /sys/class/net/{name}/statistics/tx_bytes
-        const path = std.fmt.bufPrint(&buf, "{s}/{s}/statistics/{s}", .{ network_class, network_name, stat_name }) catch |err| {
-            std.log.warn("error: {any} Interface name '{s}' is too long for buffer", .{ err, network_name });
-            return 0;
-        };
-
-        const file = Io.Dir.openFileAbsolute(io, path, .{}) catch return 0;
-        defer file.close(io);
-        const amt = try file.readPositionalAll(io, &buf, 0);
-        return std.fmt.parseInt(u64, mem.trim(u8, buf[0..amt], " \n"), 10) catch 0;
-    }
 };
 
 pub const TempProbe = struct {
+    file: ?Io.File = null,
+    searched: bool = false,
     value: u64 = 0,
-    pub fn sample(self: *TempProbe, io: Io) !void {
-        var buf: [64]u8 = undefined;
+
+    pub fn deinit(self: *TempProbe, io: Io) void {
+        closeSlot(&self.file, io);
+    }
+
+    fn discoverSensor(self: *TempProbe, io: Io) !void {
+        self.searched = true;
+        var path_buf: [96]u8 = undefined;
+        var name_buf: [64]u8 = undefined;
+
         var dir = try Io.Dir.openDirAbsolute(io, "/sys/class/hwmon", .{ .iterate = true });
         defer dir.close(io);
 
         var iter = dir.iterate();
         while (try iter.next(io)) |entry| {
-            const path = try std.fmt.bufPrint(&buf, "/sys/class/hwmon/{s}/name", .{entry.name});
+            const name_path = std.fmt.bufPrint(&path_buf, "/sys/class/hwmon/{s}/name", .{entry.name}) catch continue;
+            const name_file = Io.Dir.openFileAbsolute(io, name_path, .{}) catch continue;
+            defer name_file.close(io);
 
-            const file = Io.Dir.openFileAbsolute(io, path, .{}) catch continue;
-            defer file.close(io);
-            const len = try file.readPositionalAll(io, &buf, 0);
-            const driver_name = std.mem.trim(u8, buf[0..len], " \n");
+            const len = preadOnce(name_file, io, &name_buf) catch continue;
+            const driver_name = mem.trim(u8, name_buf[0..len], " \n");
 
             // k10temp/zenpower is AMD, coretemp is Intel
-            if (std.mem.eql(u8, driver_name, "k10temp") or std.mem.eql(u8, driver_name, "zenpower") or std.mem.eql(u8, driver_name, "coretemp")) {
-                // Use this hwmonX directory!
-                const file_path = try std.fmt.bufPrint(&buf, "/sys/class/hwmon/{s}/temp1_input", .{entry.name});
-
-                const temp_file = Io.Dir.openFileAbsolute(io, file_path, .{}) catch return;
-                defer temp_file.close(io);
-                const amt = try temp_file.readPositionalAll(io, &buf, 0);
-                self.value = (std.fmt.parseInt(u64, mem.trim(u8, buf[0..amt], " \n"), 10) catch 0) / 1000;
-                break;
+            if (mem.eql(u8, driver_name, "k10temp") or mem.eql(u8, driver_name, "zenpower") or mem.eql(u8, driver_name, "coretemp")) {
+                const temp_path = std.fmt.bufPrint(&path_buf, "/sys/class/hwmon/{s}/temp1_input", .{entry.name}) catch continue;
+                self.file = Io.Dir.openFileAbsolute(io, temp_path, .{}) catch null;
+                return;
             }
         }
+    }
+
+    pub fn sample(self: *TempProbe, io: Io) !void {
+        if (!self.searched) {
+            try self.discoverSensor(io);
+        }
+        const temp_file = self.file orelse return;
+
+        var buf: [32]u8 = undefined;
+        const amt = try preadOnce(temp_file, io, &buf);
+        self.value = (std.fmt.parseInt(u64, mem.trim(u8, buf[0..amt], " \n"), 10) catch 0) / 1000;
     }
 };
 
@@ -368,11 +426,24 @@ pub const LoadProbe = struct {
 };
 
 pub const StorageProbe = struct {
+    file: ?Io.File = null,
+    last_sample_ns: i96 = 0,
     free_bytes: u64 = 0,
 
+    const refresh_interval_ns: i96 = 5 * std.time.ns_per_s;
+
+    pub fn deinit(self: *StorageProbe, io: Io) void {
+        closeSlot(&self.file, io);
+    }
+
     pub fn sample(self: *StorageProbe, io: Io) !void {
-        const file = try Io.Dir.openFileAbsolute(io, "/proc/mounts", .{});
-        defer file.close(io);
+        const now = nanoTimestamp(io);
+        if (self.last_sample_ns != 0 and now - self.last_sample_ns < refresh_interval_ns) {
+            return;
+        }
+        self.last_sample_ns = now;
+
+        const file = try ensureOpen(&self.file, io, "/proc/mounts");
 
         // Fixed-size buffer to track seen devices without heap allocation
         var seen_storage: [16][64]u8 = undefined;
@@ -380,7 +451,7 @@ pub const StorageProbe = struct {
 
         var total_free: u64 = 0;
         var buf: [4096]u8 = undefined;
-        const amt = try file.readPositionalAll(io, &buf, 0);
+        const amt = try preadOnce(file, io, &buf);
 
         var line_it = mem.tokenizeAny(u8, buf[0..amt], "\n");
         while (line_it.next()) |line| {
@@ -562,13 +633,34 @@ pub const WindowNameProbe = struct {
 
 test "System probes sample without errors" {
     var cpu: CpuProbe = .{};
+    defer cpu.deinit(std.testing.io);
     try cpu.sample(std.testing.io);
     try cpu.sample(std.testing.io);
     try std.testing.expect(cpu.current_pct <= 100);
 
     var mem_probe: MemProbe = .{};
+    defer mem_probe.deinit(std.testing.io);
     try mem_probe.sample(std.testing.io);
     try std.testing.expect(mem_probe.free > 0);
+
+    var io_probe: IoProbe = .{};
+    defer io_probe.deinit(std.testing.io);
+    try io_probe.sample(std.testing.io);
+    try io_probe.sample(std.testing.io);
+
+    var net_probe: NetProbe = .{};
+    defer net_probe.deinit(std.testing.io);
+    try net_probe.sample(std.testing.io);
+    try net_probe.sample(std.testing.io);
+
+    var temp_probe: TempProbe = .{};
+    defer temp_probe.deinit(std.testing.io);
+    try temp_probe.sample(std.testing.io);
+
+    var stor_probe: StorageProbe = .{};
+    defer stor_probe.deinit(std.testing.io);
+    try stor_probe.sample(std.testing.io);
+    try std.testing.expect(stor_probe.free_bytes > 0);
 
     var load_probe: LoadProbe = .{};
     try load_probe.sample();

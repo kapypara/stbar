@@ -99,6 +99,11 @@ pub const StatusMonitor = struct {
     title_rotations: usize = 0,
 
     pub fn deinit(self: *StatusMonitor) void {
+        for (&self.segments) |seg| {
+            for (seg.metrics) |*entry| {
+                entry.metric.deinit(self.io);
+            }
+        }
         self.rect.deinit();
         self.font.deinit();
         if (self.cells.len > 0) self.allocator.free(self.cells);
