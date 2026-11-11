@@ -1,10 +1,6 @@
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("GL/glew.h");
-    @cInclude("GL/gl.h");
-    @cInclude("GL/glx.h");
-});
+const c = @import("c");
 
 pub const RectDraw = struct {
     // OpenGL Handles
@@ -117,6 +113,10 @@ pub const RectDraw = struct {
 
 
     pub fn deinit(self: *RectDraw) void {
+        if (self.texture_id != 0) {
+            c.glDeleteTextures(1, &self.texture_id);
+            self.texture_id = 0;
+        }
         glew(c.glDeleteProgram, .{self.program}) catch {};
         glew(c.glDeleteBuffers, .{2, &self.vbos}) catch {};
         glew(c.glDeleteVertexArrays, .{1, &self.vao}) catch {};

@@ -34,10 +34,6 @@ pub const Texture = struct {
         const raw_pixels: []zigimg.color.Rgba32 = image.pixels.rgba32;
         const flat_bytes: []const u8 = std.mem.sliceAsBytes(raw_pixels);
 
-        std.debug.print("Successfully loaded image!\n", .{});
-        std.debug.print("Dimensions: {}x{}\n", .{image.width, image.height});
-        std.debug.print("Total pixel structs: {}\n", .{raw_pixels.len});
-
         const owned_rgba = try allocator.alloc(u8, flat_bytes.len);
         @memmove(owned_rgba, flat_bytes);
 

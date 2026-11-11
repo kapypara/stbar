@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("zigimg", zigimg.module("zigimg"));
 
     // --- ADDED SYSTEM DEPENDENCIES HERE ---
-    // Link libc (required for @cImport and system headers)
+    // Link libc (required for C headers and system libraries)
     exe.root_module.link_libc = true;
 
     // Link the required system libraries
@@ -70,6 +70,29 @@ pub fn build(b: *std.Build) void {
     for (c_lib) |lib| {
         exe.root_module.linkSystemLibrary(lib, .{});
     }
+
+    const wf = b.addWriteFiles();
+    const c_header = wf.add("c.h",
+        \\#include <GL/glew.h>
+        \\#include <GL/gl.h>
+        \\#include <GL/glx.h>
+        \\#include <GL/glxext.h>
+        \\#include <X11/Xatom.h>
+        \\#include <X11/extensions/Xrender.h>
+        \\#include <X11/Xutil.h>
+        \\#include <sys/statvfs.h>
+        \\
+    );
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = c_header,
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    for (c_lib) |lib| {
+        translate_c.linkSystemLibrary(lib, .{});
+    }
+    exe.root_module.addImport("c", translate_c.createModule());
     // --------------------------------------
 
     // This declares intent for the executable to be installed into the
@@ -100,9 +123,7 @@ pub fn build(b: *std.Build) void {
 
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,

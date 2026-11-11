@@ -4,85 +4,46 @@ const Ticker = @import("Ticker.zig").Ticker;
 const StatusMonitor = @import("StatusMonitor.zig").StatusMonitor;
 
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // 1. Initialize Renderer
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     const gpa = debug_allocator.allocator();
     defer {
         const check = debug_allocator.deinit();
         if (check == .leak) {
-            std.debug.print("⚠️ MEMORY LEAK DETECTED! ⚠️\n", .{});
+            std.debug.print("MEMORY LEAK DETECTED!\n", .{});
         }
     }
 
-    // var evented: std.Io.Evented = undefined;
-    // try evented.init(gpa, .{
-    //     .argv0 = .init(init.args),
-    //     .environ = init.environ,
-    //     .backing_allocator_needs_mutex = false,
-    // });
-    // defer evented.deinit();
-    const io = init.io; //evented.io();
+    const io = init.io;
 
-    // 1. Initialize the struct
     var window = Window{
         .docked = true,
     };
 
-    // 3. Call Init
-    try window.init(0, 14+3, 1920, 14 + 3);
-    defer window.deinit(); // Clean up X11/GL resources
+    // width = 0 auto-detects the active X11 screen width; height = 14 + 3 = 17px
+    try window.init(0, 0, 0, 14 + 3);
+    defer window.deinit();
 
     const tr = 8;
     const rr = 60;
 
     var ticker = Ticker.init(io, rr, tr);
 
-    var monitor: StatusMonitor = .{ .window = window };
-
+    var monitor: StatusMonitor = .{ .window = &window };
     try monitor.init(io, gpa, tr, rr);
     defer monitor.deinit();
 
-    // 4. Main Loop
     while (window.running) {
         window.updateTheMessageQueue();
-        
         window.updateViewport();
-        monitor.update();
+        try monitor.update();
         try monitor.render();
-
-        // optional swap code
-        // window.swapBuffers();
         ticker.tick();
     }
-    
-    // 2. Setup Static Rect
-    // var dp: c.static_rect = undefined;
-    // c.static_rect_build(&dp);
-    
-    // if (!c.static_rect_is_ready(&dp)) {
-    //     return error.StaticRectNotReady;
-    // }
+}
 
-    // background: vec4 is likely a struct {x, y, z, w}
-    // c.static_rect_setBackgroundColor(&dp, .{ .x = 0.0, .y = 0.0, .z = 0.0, .w = 0.4666 });
-
-    // 3. Texture and Font
-    // var font_texture: c.GL_texture = undefined;
-    // c.texture_create(&font_texture);
-    // c.texture_load(&font_texture, "assets/font/tamzen.png");
-
-    // c.static_rect_setTexture(&dp, &font_texture);
-    // c.static_rect_bindTexture(&dp);
-
-    // c.static_rect_setTextureSize(&dp, tex_char_size);
-
-    // 4. Output
-    // var bar: c.output_line = undefined;
-    // c.output_line_init(&bar, &ren, &dp, &font_glyphs, 8, 60);
-    // c.output_line_output(&bar);
-
-    std.debug.print("Bar initialized successfully.\n", .{});
+test {
+    _ = @import("formats.zig");
+    _ = @import("Segment.zig");
+    _ = @import("FontAtlas.zig");
+    _ = @import("metrics.zig");
 }

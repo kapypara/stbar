@@ -1,14 +1,6 @@
 const std = @import("std");
 
-pub const c = @cImport({
-    @cInclude("GL/glew.h");
-    @cInclude("GL/gl.h");
-    @cInclude("GL/glx.h");
-    @cInclude("GL/glxext.h");
-    @cInclude("X11/Xatom.h");
-    @cInclude("X11/extensions/Xrender.h");
-    @cInclude("X11/Xutil.h");
-});
+pub const c = @import("c");
 
 const USE_GLX_CREATE_WINDOW = 1;
 
@@ -33,6 +25,7 @@ pub const Window = struct {
     running: bool = true,
     docked: bool = false,
     clicked: bool = false,
+    resized: bool = false,
     last_click: Click = .{ .x = 0, .y = 0, .button = 0 },
 
     const Click = struct { x: i32, y: i32, button: u32 };
@@ -51,8 +44,12 @@ pub const Window = struct {
         if (self.display) |dpy| {
             _ = c.glXMakeCurrent(dpy, 0, null);
             if (self.render_context != null) c.glXDestroyContext(dpy, self.render_context);
+            if (USE_GLX_CREATE_WINDOW == 1 and self.glx_handle != 0) c.glXDestroyWindow(dpy, self.glx_handle);
             if (self.handle != 0) _ = c.XDestroyWindow(dpy, self.handle);
+            if (self.cmap != 0) _ = c.XFreeColormap(dpy, self.cmap);
+            if (self.visual) |vis| _ = c.XFree(vis);
             _ = c.XCloseDisplay(dpy);
+            self.display = null;
         }
     }
 
@@ -62,6 +59,9 @@ pub const Window = struct {
 
         self.x_screen = c.DefaultScreen(dpy);
         self.root = c.RootWindow(dpy, self.x_screen);
+        if (self.width <= 0) {
+            self.width = c.DisplayWidth(dpy, self.x_screen);
+        }
 
         const vis_attribs = [_]i32{
             c.GLX_RENDER_TYPE,   c.GLX_RGBA_BIT,
@@ -161,8 +161,8 @@ pub const Window = struct {
 
             var strut = std.mem.zeroes([12]c.u_long); 
 
-            // 1. Tell the WM to reserve 'height' pixels at the TOP (index 2)
-            strut[2] = @intCast(self.height * 2); 
+            // 1. Tell the WM to reserve 'y + height' pixels from the TOP edge (index 2)
+            strut[2] = @intCast(self.y + self.height); 
 
             // 2. Tell the WM the horizontal start/end of this top strut (indices 8 and 9)
             // This ensures it reserves space across the entire width of your screen.
@@ -233,8 +233,11 @@ pub const Window = struct {
                     }
                 },
                 c.ConfigureNotify => {
-                    self.width = event.xconfigure.width;
-                    self.height = event.xconfigure.height;
+                    if (event.xconfigure.width != self.width or event.xconfigure.height != self.height) {
+                        self.width = event.xconfigure.width;
+                        self.height = event.xconfigure.height;
+                        self.resized = true;
+                    }
                 },
                 c.ButtonPress => {
                     self.last_click = .{

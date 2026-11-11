@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Bitwise selection: (ifTrue & -condition) | (ifFalse & ~(-condition))
 /// In Zig, we cast the bool to a integer to create the mask.
@@ -8,20 +9,33 @@ fn bitSelect(condition: bool, ifTrue: u8, ifFalse: u8) u8 {
 }
 
 pub fn toBCD(binary_num: u64) u64 {
-    var bcd: [10]u8 align(16) = [_]u8{0} ** 10;
-    
-    // Using x86 inline assembly for the FBSTP (FPU BCD Store and Pop)
-    // This matches the logic of the original fildq/fbstp block.
-    asm volatile (
-        \\ fildq %[num]
-        \\ fbstp %[bcd]
-        :
-        : [bcd] "*m" (&bcd),
-          [num] "*m" (&binary_num),
-    );
+    if (comptime builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86) {
+        var bcd: [10]u8 align(16) = @splat(0);
+        var num: i64 = @intCast(@min(binary_num, std.math.maxInt(i64)));
 
-    // Return the first 8 bytes as a u64
-    return @as(*align(1) const u64, @ptrCast(&bcd)).*;
+        // Using x86 inline assembly for FBSTP (FPU BCD Store and Pop).
+        // `bcd` must be an output memory operand so LLVM sees the write.
+        asm volatile (
+            \\ fildq (%[num])
+            \\ fbstp (%[bcd])
+            :
+            : [bcd] "r" (&bcd),
+              [num] "r" (&num),
+            : .{ .memory = true, .st0 = true, .fpsr = true }
+        );
+
+        return std.mem.readInt(u64, bcd[0..8], .little);
+    } else {
+        var n = binary_num;
+        var bcd: u64 = 0;
+        var shift: u6 = 0;
+        while (n != 0 and shift <= 60) : (shift += 4) {
+            bcd |= (n % 10) << shift;
+            n /= 10;
+            if (shift == 60) break;
+        }
+        return bcd;
+    }
 }
 
 pub fn fromBCD(bcd_num_in: u64) u64 {
@@ -52,25 +66,44 @@ pub fn cpuUsage(input: u64) [3]u8 {
     return buffer;
 }
 
-pub fn memory(input: u64) [8]u8 {
-    var buffer: [8]u8 = undefined;
+pub const MemoryString = struct {
+    buf: [10]u8,
+    len: usize,
 
-    @memset(&buffer, '\n'); // Keep original behavior of '\n' padding
-    
+    pub fn slice(self: *const MemoryString) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+pub fn memory(input: u64) MemoryString {
+    var result: MemoryString = .{
+        .buf = @splat('\n'),
+        .len = 6,
+    };
+
     const digits = toBCD(input);
-
-    buffer[7] = @intCast((digits & 0xf) + '0');
-    buffer[6] = @intCast(((digits >> 4) & 0xf) + '0');
-    buffer[5] = @intCast(((digits >> 8) & 0xf) + '0');
+    const d0: u8 = @intCast((digits & 0xf) + '0');
+    const d1: u8 = @intCast(((digits >> 4) & 0xf) + '0');
+    const d2: u8 = @intCast(((digits >> 8) & 0xf) + '0');
 
     if (((digits >> 12) & 0xff) != 0) {
-        buffer[3] = @intCast(((digits >> 12) & 0xf) + '0');
-        buffer[2] = @intCast(((digits >> 16) & 0xf) + '0');
+        result.buf[0] = @intCast(((digits >> 16) & 0xf) + '0');
+        result.buf[1] = @intCast(((digits >> 12) & 0xf) + '0');
+        // result.buf[2] stays '\n' to preserve the static ',' glyph
+        result.buf[3] = d2;
+        result.buf[4] = d1;
+        result.buf[5] = d0;
+        result.len = 6;
     } else {
-        // Warning characters
-        buffer[0..4].* = .{0xe0, 0x18, 0xe0, 0x17};
+        // Low-memory warning icons (U+E017, U+E018) encoded as valid UTF-8 + '\n' comma skip
+        const prefix = "\u{e017}\u{e018}\n";
+        @memcpy(result.buf[0..prefix.len], prefix);
+        result.buf[7] = d2;
+        result.buf[8] = d1;
+        result.buf[9] = d0;
+        result.len = 10;
     }
-    return buffer;
+    return result;
 }
 
 pub fn systemLoad(input: u64) [5]u8 {
@@ -177,8 +210,27 @@ pub fn none(input: u64) NoneStruct {
     };
 
     // Converts to standard decimal string then to u8 slice
-    const str = std.fmt.bufPrint(&result.buf, "{}", .{input}) catch "--";
+    const str = std.fmt.bufPrint(&result.buf, "{d: >2}", .{input}) catch "--";
     result.len = str.len;
 
     return result;
+}
+
+test "BCD roundtrip and metric formatters" {
+    try std.testing.expectEqual(@as(u64, 19072), fromBCD(toBCD(19072)));
+
+    try std.testing.expectEqualStrings(" --", &cpuUsage(0));
+    try std.testing.expectEqualStrings(" 13", &cpuUsage(13));
+    try std.testing.expectEqualStrings("100", &cpuUsage(100));
+
+    const mem_hi = memory(19072);
+    try std.testing.expectEqualStrings("19\n072", mem_hi.slice());
+    try std.testing.expectEqual(@as(usize, 6), try std.unicode.utf8CountCodepoints(mem_hi.slice()));
+
+    const mem_lo = memory(512);
+    try std.testing.expectEqualStrings("\u{e017}\u{e018}\n512", mem_lo.slice());
+    try std.testing.expectEqual(@as(usize, 6), try std.unicode.utf8CountCodepoints(mem_lo.slice()));
+
+    try std.testing.expectEqualStrings(" 1\n34", &systemLoad(134));
+    try std.testing.expectEqualStrings("000\n0B", &generic(0));
 }

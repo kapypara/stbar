@@ -50,13 +50,8 @@ pub const FontAtlas = struct {
         };
     }
 
-    /// Finds the UV coordinates for a specific character code.
-    pub fn getGlyphUV(self: *const FontAtlas, code: u32) [2]u16 {
-
-        // if (code < 128) {
-        //     return self.computeUV(self.glyphs[code]);
-        // }
-
+    /// Finds the UV coordinates for a specific character code, or null if absent.
+    pub fn getGlyphUV(self: *const FontAtlas, code: u32) ?[2]u16 {
         var low: usize = 0;
         var high: usize = self.glyphs.len;
 
@@ -71,7 +66,7 @@ pub const FontAtlas = struct {
                 high = mid;
             }
         }
-        return .{0, 0};
+        return null;
     }
 
     pub fn loadFromJson(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !FontAtlas {
@@ -143,3 +138,15 @@ pub const FontAtlas = struct {
         };
     }
 };
+
+test "FontAtlas loads tamzen.json and resolves ASCII + PUA glyphs" {
+    var atlas = try FontAtlas.loadFromJson(std.testing.io, std.testing.allocator, "assets/font/tamzen.json");
+    defer atlas.deinit();
+
+    try std.testing.expectEqual(@as(u16, 7), atlas.char_width);
+    try std.testing.expectEqual(@as(u16, 14), atlas.char_height);
+    try std.testing.expect(atlas.getGlyphUV(' ') != null);
+    try std.testing.expect(atlas.getGlyphUV('A') != null);
+    try std.testing.expect(atlas.getGlyphUV(0xE000) != null);
+    try std.testing.expect(atlas.getGlyphUV(0x1F600) == null);
+}
