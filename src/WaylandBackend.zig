@@ -1,6 +1,12 @@
 const std = @import("std");
 const c = @import("c");
 const ProcLoader = @import("GlProcs.zig").ProcLoader;
+const QuadVertex = @import("RectDraw.zig").RectDraw.QuadVertex;
+const shm_draw_zig = @import("ShmDraw.zig");
+const ShmDraw = shm_draw_zig.ShmDraw;
+const ShmSlotState = shm_draw_zig.SlotState;
+const DamageRect = shm_draw_zig.DamageRect;
+const max_damage_rects = shm_draw_zig.max_damage_rects;
 const Click = @import("X11Backend.zig").Click;
 const KwinTitleWatcher = @import("KwinTitleWatcher.zig").KwinTitleWatcher;
 
@@ -9,8 +15,21 @@ const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
 
+pub const WaylandRenderMode = enum {
+    shm,
+    egl,
+};
+
 pub const WaylandBackend = struct {
     const max_toplevels = 64;
+    const shm_slot_count = 3;
+
+    const ShmBufferSlot = struct {
+        wl_buffer: ?*c.struct_wl_buffer = null,
+        pixel_offset: usize = 0,
+        busy: bool = false,
+        state: ShmSlotState = .{},
+    };
 
     const ToplevelSlot = struct {
         owner: ?*WaylandBackend = null,
@@ -21,13 +40,28 @@ pub const WaylandBackend = struct {
         activated: bool = false,
     };
 
+    render_mode: WaylandRenderMode = .shm,
+    compositor_version: u32 = 1,
+
     wl_display: ?*c.struct_wl_display = null,
     wl_registry: ?*c.struct_wl_registry = null,
     wl_compositor: ?*c.struct_wl_compositor = null,
+    wl_shm: ?*c.struct_wl_shm = null,
     wl_seat: ?*c.struct_wl_seat = null,
     wl_pointer: ?*c.struct_wl_pointer = null,
     wl_surface: ?*c.struct_wl_surface = null,
+    frame_cb: ?*c.struct_wl_callback = null,
     egl_window: ?*c.struct_wl_egl_window = null,
+
+    // Native `wl_shm` triple-buffered shared memory pool (`memfd_create`)
+    shm_pool: ?*c.struct_wl_shm_pool = null,
+    shm_map: ?*anyopaque = null,
+    shm_map_bytes: usize = 0,
+    shm_width: i32 = 0,
+    shm_height: i32 = 0,
+    shm_slots: [shm_slot_count]ShmBufferSlot = @splat(.{}),
+    shm_allocator: ?std.mem.Allocator = null,
+    needs_configure_commit: bool = false,
 
     layer_shell: ?*c.struct_zwlr_layer_shell_v1 = null,
     layer_surface: ?*c.struct_zwlr_layer_surface_v1 = null,
@@ -40,6 +74,7 @@ pub const WaylandBackend = struct {
 
     // Event-driven KWin Scripting + D-Bus title listener for KDE Plasma Wayland
     kwin_watcher: KwinTitleWatcher = .{},
+    kwin_needs_pump: bool = true,
 
     // Optional event-driven Xwayland root property watcher when neither wlr-foreign-toplevel nor KWin D-Bus is active
     aux_x11_dpy: ?*c.Display = null,
@@ -89,12 +124,19 @@ pub const WaylandBackend = struct {
         if (c.wl_display_roundtrip(dpy) < 0) return error.WaylandRoundtripFailed;
         if (self.wl_compositor == null) return error.NoWaylandCompositor;
         if (self.layer_shell == null) return error.NoLayerShell;
+        if (self.render_mode == .shm and self.wl_shm == null) return error.NoWlShm;
 
         // Flush seat capability & initial toplevel advertisements if bound
         _ = c.wl_display_roundtrip(dpy);
 
         try self.createLayerSurface();
-        try self.createEglContext();
+        switch (self.render_mode) {
+            .shm => {
+                try self.recreateShmBuffers();
+                self.clearTransparent();
+            },
+            .egl => try self.createEglContext(),
+        }
 
         if (!self.has_foreign_toplevel) {
             if (self.kwin_watcher.init()) {
@@ -111,6 +153,12 @@ pub const WaylandBackend = struct {
             _ = c.XCloseDisplay(x_dpy);
             self.aux_x11_dpy = null;
         }
+
+        if (self.frame_cb) |cb| {
+            c.wl_callback_destroy(cb);
+            self.frame_cb = null;
+        }
+        self.destroyShmBuffers(true);
 
         if (self.egl_display != c.EGL_NO_DISPLAY) {
             _ = c.eglMakeCurrent(self.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT);
@@ -161,6 +209,10 @@ pub const WaylandBackend = struct {
         if (self.wl_seat) |seat| {
             c.wl_seat_destroy(seat);
             self.wl_seat = null;
+        }
+        if (self.wl_shm) |shm| {
+            c.wl_shm_destroy(shm);
+            self.wl_shm = null;
         }
         if (self.wl_compositor) |comp| {
             c.wl_compositor_destroy(comp);
@@ -379,17 +431,231 @@ pub const WaylandBackend = struct {
         }
     }
 
+    fn destroyShmBuffers(self: *WaylandBackend, free_cell_cache: bool) void {
+        for (&self.shm_slots) |*slot| {
+            if (slot.wl_buffer) |buf| {
+                c.wl_buffer_destroy(buf);
+                slot.wl_buffer = null;
+            }
+            slot.busy = false;
+            slot.pixel_offset = 0;
+            if (free_cell_cache) {
+                if (self.shm_allocator) |alloc| {
+                    slot.state.deinit(alloc);
+                }
+            } else {
+                slot.state.invalidate();
+            }
+        }
+        if (self.shm_pool) |pool| {
+            c.wl_shm_pool_destroy(pool);
+            self.shm_pool = null;
+        }
+        if (self.shm_map) |ptr| {
+            _ = c.munmap(ptr, self.shm_map_bytes);
+            self.shm_map = null;
+            self.shm_map_bytes = 0;
+        }
+        self.shm_width = 0;
+        self.shm_height = 0;
+    }
+
+    fn recreateShmBuffers(self: *WaylandBackend) !void {
+        const shm = self.wl_shm orelse return error.NoWlShm;
+        self.destroyShmBuffers(false);
+
+        const w: i32 = @max(1, self.width);
+        const h: i32 = @max(1, self.height);
+        const stride: i32 = w * 4;
+        const pixels_per_slot: usize = @intCast(w * h);
+        const frame_bytes: usize = pixels_per_slot * @sizeOf(u32);
+        const pool_bytes: usize = frame_bytes * shm_slot_count;
+
+        const fd = c.memfd_create("zigbar-shm", c.MFD_CLOEXEC);
+        if (fd < 0) return error.MemfdCreateFailed;
+        errdefer _ = c.close(fd);
+
+        if (c.ftruncate(fd, @intCast(pool_bytes)) < 0) {
+            return error.ShmFtruncateFailed;
+        }
+
+        const mapped = c.mmap(null, pool_bytes, c.PROT_READ | c.PROT_WRITE, c.MAP_SHARED, fd, 0);
+        if (mapped == null or @intFromPtr(mapped) == std.math.maxInt(usize)) {
+            return error.ShmMmapFailed;
+        }
+        self.shm_map = mapped;
+        self.shm_map_bytes = pool_bytes;
+        errdefer {
+            _ = c.munmap(mapped.?, pool_bytes);
+            self.shm_map = null;
+            self.shm_map_bytes = 0;
+        }
+
+        self.shm_pool = c.wl_shm_create_pool(shm, fd, @intCast(pool_bytes)) orelse return error.WlShmPoolFailed;
+        // Both `mmap` and Wayland's `create_pool` hold kernel references; close extra fd immediately
+        _ = c.close(fd);
+
+        for (&self.shm_slots, 0..) |*slot, idx| {
+            const byte_offset: i32 = @intCast(idx * frame_bytes);
+            slot.pixel_offset = idx * pixels_per_slot;
+            slot.busy = false;
+            slot.state.invalidate();
+            slot.wl_buffer = c.wl_shm_pool_create_buffer(
+                self.shm_pool,
+                byte_offset,
+                w,
+                h,
+                stride,
+                c.WL_SHM_FORMAT_ARGB8888,
+            ) orelse return error.WlShmBufferFailed;
+            _ = c.wl_buffer_add_listener(slot.wl_buffer, &shm_buffer_listener, slot);
+        }
+
+        self.shm_width = w;
+        self.shm_height = h;
+    }
+
+    fn slotPixels(self: *const WaylandBackend, slot: *const ShmBufferSlot) []u32 {
+        const pixels_per_slot: usize = @intCast(self.shm_width * self.shm_height);
+        const base: [*]u32 = @ptrCast(@alignCast(self.shm_map.?));
+        return base[slot.pixel_offset .. slot.pixel_offset + pixels_per_slot];
+    }
+
+    fn acquireShmSlot(self: *WaylandBackend) *ShmBufferSlot {
+        for (&self.shm_slots) |*slot| {
+            if (!slot.busy) return slot;
+        }
+        self.updateTheMessageQueue();
+        for (&self.shm_slots) |*slot| {
+            if (!slot.busy) return slot;
+        }
+        return &self.shm_slots[0];
+    }
+
+    fn damageSurface(self: *WaylandBackend, x: i32, y: i32, w: i32, h: i32) void {
+        const surf = self.wl_surface orelse return;
+        if (self.compositor_version >= 4) {
+            c.wl_surface_damage_buffer(surf, x, y, w, h);
+        } else {
+            c.wl_surface_damage(surf, x, y, w, h);
+        }
+    }
+
+    pub fn presentShm(
+        self: *WaylandBackend,
+        allocator: std.mem.Allocator,
+        bg_count: usize,
+        quads: []const QuadVertex,
+        opacity: f32,
+        request_frame_sync: bool,
+    ) !void {
+        self.shm_allocator = allocator;
+        const surf = self.wl_surface orelse return;
+        const dpy = self.wl_display orelse return;
+
+        const target_w = @max(1, self.width);
+        const target_h = @max(1, self.height);
+        if (self.shm_pool == null or self.shm_width != target_w or self.shm_height != target_h) {
+            try self.recreateShmBuffers();
+        }
+
+        const slot = self.acquireShmSlot();
+        var dmg: [max_damage_rects]DamageRect = undefined;
+        const dmg_count = try ShmDraw.renderSlot(
+            allocator,
+            &slot.state,
+            self.slotPixels(slot),
+            self.shm_width,
+            self.shm_height,
+            bg_count,
+            quads,
+            opacity,
+            &dmg,
+        );
+
+        if (dmg_count == 0) {
+            if (self.needs_configure_commit) {
+                self.needs_configure_commit = false;
+                c.wl_surface_commit(surf);
+                _ = c.wl_display_flush(dpy);
+            }
+            return;
+        }
+
+        if (request_frame_sync and self.frame_cb == null) {
+            self.frame_cb = c.wl_surface_frame(surf);
+            if (self.frame_cb) |cb| {
+                _ = c.wl_callback_add_listener(cb, &frame_listener, self);
+            }
+        }
+
+        slot.busy = true;
+        self.needs_configure_commit = false;
+        c.wl_surface_attach(surf, slot.wl_buffer, 0, 0);
+        for (dmg[0..dmg_count]) |r| {
+            self.damageSurface(r.x, r.y, r.w, r.h);
+        }
+        c.wl_surface_commit(surf);
+        _ = c.wl_display_flush(dpy);
+    }
+
+    pub fn waitForFrameSync(self: *WaylandBackend) void {
+        if (self.render_mode != .shm) return;
+        var spins: u8 = 0;
+        while (self.running and self.frame_cb != null and spins < 4) : (spins += 1) {
+            self.waitForEventsOrTimeout(34);
+            if (self.wl_display) |wl_dpy| {
+                if (c.wl_display_dispatch_pending(wl_dpy) < 0) {
+                    self.running = false;
+                    break;
+                }
+            }
+            if (self.clicked or self.resized) break;
+        }
+    }
+
     pub fn clearTransparent(self: *WaylandBackend) void {
-        c.glClear(c.GL_COLOR_BUFFER_BIT);
-        self.swapBuffers();
+        switch (self.render_mode) {
+            .egl => {
+                c.glClear(c.GL_COLOR_BUFFER_BIT);
+                self.swapBuffers();
+            },
+            .shm => {
+                const surf = self.wl_surface orelse return;
+                const dpy = self.wl_display orelse return;
+                if (self.frame_cb) |cb| {
+                    c.wl_callback_destroy(cb);
+                    self.frame_cb = null;
+                }
+                const target_w = @max(1, self.width);
+                const target_h = @max(1, self.height);
+                if (self.shm_pool == null or self.shm_width != target_w or self.shm_height != target_h) {
+                    self.recreateShmBuffers() catch return;
+                }
+                for (&self.shm_slots) |*s| s.state.invalidate();
+                const slot = self.acquireShmSlot();
+                @memset(self.slotPixels(slot), 0);
+                slot.state.width = self.shm_width;
+                slot.state.height = self.shm_height;
+                slot.state.last_opacity_u8 = 0;
+                slot.busy = true;
+                self.needs_configure_commit = false;
+                c.wl_surface_attach(surf, slot.wl_buffer, 0, 0);
+                self.damageSurface(0, 0, self.shm_width, self.shm_height);
+                c.wl_surface_commit(surf);
+                _ = c.wl_display_flush(dpy);
+            },
+        }
     }
 
     pub fn updateViewport(self: *const WaylandBackend) void {
-        c.glViewport(0, 0, self.width, self.height);
+        if (self.render_mode == .egl) {
+            c.glViewport(0, 0, self.width, self.height);
+        }
     }
 
     pub fn swapBuffers(self: *const WaylandBackend) void {
-        if (self.egl_display != c.EGL_NO_DISPLAY and self.egl_surface != c.EGL_NO_SURFACE) {
+        if (self.render_mode == .egl and self.egl_display != c.EGL_NO_DISPLAY and self.egl_surface != c.EGL_NO_SURFACE) {
             _ = c.eglSwapBuffers(self.egl_display, self.egl_surface);
         }
     }
@@ -404,18 +670,34 @@ pub const WaylandBackend = struct {
             }
             _ = c.wl_display_flush(wl_dpy);
 
-            var pfd = c.struct_pollfd{
+            var pfds: [2]c.struct_pollfd = undefined;
+            pfds[0] = .{
                 .fd = c.wl_display_get_fd(wl_dpy),
                 .events = c.POLLIN,
                 .revents = 0,
             };
-            if (c.poll(&pfd, 1, 0) > 0 and (pfd.revents & (c.POLLIN | c.POLLERR | c.POLLHUP)) != 0) {
+            var nfds: c.nfds_t = 1;
+            const kwin_fd = self.kwin_watcher.fd();
+            if (kwin_fd >= 0) {
+                pfds[1] = .{
+                    .fd = kwin_fd,
+                    .events = c.POLLIN,
+                    .revents = 0,
+                };
+                nfds = 2;
+            }
+
+            const ready = c.poll(&pfds, nfds, 0);
+            if (ready > 0 and (pfds[0].revents & (c.POLLIN | c.POLLERR | c.POLLHUP)) != 0) {
                 if (c.wl_display_read_events(wl_dpy) < 0) {
                     self.running = false;
                     return;
                 }
             } else {
                 c.wl_display_cancel_read(wl_dpy);
+            }
+            if (ready > 0 and nfds == 2 and pfds[1].revents != 0) {
+                self.kwin_needs_pump = true;
             }
 
             if (c.wl_display_dispatch_pending(wl_dpy) < 0) {
@@ -424,7 +706,8 @@ pub const WaylandBackend = struct {
             }
         }
 
-        if (self.kwin_watcher.active) {
+        if (self.kwin_watcher.active and self.kwin_needs_pump) {
+            self.kwin_needs_pump = false;
             if (self.kwin_watcher.pump()) {
                 self.title_dirty = true;
             }
@@ -457,7 +740,8 @@ pub const WaylandBackend = struct {
             return;
         }
 
-        if (self.kwin_watcher.active) {
+        if (self.kwin_watcher.active and self.kwin_needs_pump) {
+            self.kwin_needs_pump = false;
             if (self.kwin_watcher.pump()) {
                 self.title_dirty = true;
                 return;
@@ -483,8 +767,10 @@ pub const WaylandBackend = struct {
             .revents = 0,
         };
         var nfds: c.nfds_t = 1;
+        var kwin_idx: ?usize = null;
         const kwin_fd = self.kwin_watcher.fd();
         if (kwin_fd >= 0) {
+            kwin_idx = nfds;
             pfds[nfds] = .{
                 .fd = kwin_fd,
                 .events = c.POLLIN,
@@ -510,6 +796,13 @@ pub const WaylandBackend = struct {
         } else {
             c.wl_display_cancel_read(wl_dpy);
         }
+        if (ready > 0) {
+            if (kwin_idx) |ki| {
+                if (pfds[ki].revents != 0) {
+                    self.kwin_needs_pump = true;
+                }
+            }
+        }
     }
 
     // --- Wayland Protocol Listeners ---
@@ -530,11 +823,20 @@ pub const WaylandBackend = struct {
         const iface = std.mem.span(interface_ptr);
 
         if (std.mem.eql(u8, iface, "wl_compositor")) {
+            const bound_ver = @min(version, 4);
+            self.compositor_version = bound_ver;
             self.wl_compositor = @ptrCast(c.wl_registry_bind(
                 registry,
                 name,
                 &c.wl_compositor_interface,
-                @min(version, 4),
+                bound_ver,
+            ));
+        } else if (std.mem.eql(u8, iface, "wl_shm")) {
+            self.wl_shm = @ptrCast(c.wl_registry_bind(
+                registry,
+                name,
+                &c.wl_shm_interface,
+                1,
             ));
         } else if (std.mem.eql(u8, iface, "zwlr_layer_shell_v1")) {
             self.layer_shell = @ptrCast(c.wl_registry_bind(
@@ -596,8 +898,10 @@ pub const WaylandBackend = struct {
         self.height = resolved_h;
 
         if (size_changed) {
-            if (self.egl_window) |win| {
-                c.wl_egl_window_resize(win, @max(1, self.width), @max(1, self.height), 0, 0);
+            if (self.render_mode == .egl) {
+                if (self.egl_window) |win| {
+                    c.wl_egl_window_resize(win, @max(1, self.width), @max(1, self.height), 0, 0);
+                }
             }
             if (width_changed and self.applied_input_height == 1) {
                 self.stageInputRegion(1);
@@ -606,8 +910,30 @@ pub const WaylandBackend = struct {
                 self.resized = true;
             }
         }
+        self.needs_configure_commit = true;
         self.configured = true;
         self.exposed = true;
+    }
+
+    const shm_buffer_listener = c.struct_wl_buffer_listener{
+        .release = shmBufferRelease,
+    };
+
+    fn shmBufferRelease(data: ?*anyopaque, _: ?*c.struct_wl_buffer) callconv(.c) void {
+        const slot: *ShmBufferSlot = @ptrCast(@alignCast(data.?));
+        slot.busy = false;
+    }
+
+    const frame_listener = c.struct_wl_callback_listener{
+        .done = frameDone,
+    };
+
+    fn frameDone(data: ?*anyopaque, cb: ?*c.struct_wl_callback, _: u32) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (cb != null) c.wl_callback_destroy(cb);
+        if (self.frame_cb == cb) {
+            self.frame_cb = null;
+        }
     }
 
     fn layerSurfaceClosed(data: ?*anyopaque, _: ?*c.struct_zwlr_layer_surface_v1) callconv(.c) void {

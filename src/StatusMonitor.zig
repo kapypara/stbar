@@ -49,7 +49,7 @@ pub const StatusMonitor = struct {
     allocator: std.mem.Allocator = undefined,
     io: std.Io = undefined,
 
-    rect: RectDraw = undefined,
+    rect: RectDraw = .{},
     font: FontAtlas = undefined,
     window: *Window,
 
@@ -168,15 +168,17 @@ pub const StatusMonitor = struct {
         self.font = FontAtlas.initEmbedded();
         errdefer self.font.deinit();
 
-        self.rect = try RectDraw.init(self.window.getProcLoader());
-        errdefer self.rect.deinit();
+        if (!self.window.usesShm()) {
+            self.rect = try RectDraw.init(self.window.getProcLoader());
+            errdefer self.rect.deinit();
 
-        var embedded_rgba: [@as(usize, font_zig.embedded.width) * @as(usize, font_zig.embedded.height) * 4]u8 = undefined;
-        font_zig.embedded.unpackRgba(&embedded_rgba);
+            var embedded_rgba: [@as(usize, font_zig.embedded.width) * @as(usize, font_zig.embedded.height) * 4]u8 = undefined;
+            font_zig.embedded.unpackRgba(&embedded_rgba);
 
-        self.rect.use();
-        try self.rect.loadTexture(font_zig.embedded.width, font_zig.embedded.height, &embedded_rgba);
-        self.rect.setTextureSize(self.font.x_increment, self.font.y_increment);
+            self.rect.use();
+            try self.rect.loadTexture(font_zig.embedded.width, font_zig.embedded.height, &embedded_rgba);
+            self.rect.setTextureSize(self.font.x_increment, self.font.y_increment);
+        }
 
         // Bind metric slices to segments
         self.time_segment.metrics = &self.time_metrics;
@@ -340,7 +342,9 @@ pub const StatusMonitor = struct {
         // Allocate single batched vertex buffer: 6 segment background rects + N glyph cells
         const bg_quads = self.segments.len;
         self.quad_buffer = try self.allocator.alloc(RectDraw.QuadVertex, bg_quads + cells_count);
-        self.rect.ensureCapacity(self.quad_buffer.len);
+        if (!self.window.usesShm()) {
+            self.rect.ensureCapacity(self.quad_buffer.len);
+        }
 
         self.clearAllAndDrawStatic();
         for (self.segments) |seg| {
@@ -612,8 +616,9 @@ pub const StatusMonitor = struct {
             now_ns = monotonicNs(self.io);
         }
 
-        // During active fades, let hardware VSync (`swapBuffers`) pace frames directly without polling delay
+        // During active fades, let hardware VSync (`wl_surface.frame` or `swapBuffers`) pace frames directly
         if (self.state == .fading_in or self.state == .fading_out) {
+            self.window.waitForFrameSync();
             return;
         }
 
@@ -628,7 +633,8 @@ pub const StatusMonitor = struct {
         }
         if (self.minNextInterpolationStepNs(now_ns)) |interp_ns| {
             if (drew and interp_ns <= now_ns) {
-                // `swapBuffers()` just paced to hardware VSync; render next interpolated frame immediately
+                // Pace next interpolated frame to hardware VSync (`wl_surface.frame` on SHM, `swapBuffers` on GL)
+                self.window.waitForFrameSync();
                 return;
             }
             const safe_interp_ns = if (!drew) @max(now_ns + 4 * std.time.ns_per_ms, interp_ns) else interp_ns;
@@ -761,6 +767,20 @@ pub const StatusMonitor = struct {
 
         if (drew_anything) {
             self.frame_dirty = false;
+            if (self.window.usesShm()) {
+                const want_vsync = self.state == .fading_in or
+                    self.state == .fading_out or
+                    (if (self.minNextInterpolationStepNs(now_ns)) |t_ns| t_ns <= now_ns + 16 * std.time.ns_per_ms else false);
+                try self.window.presentShm(
+                    self.allocator,
+                    self.segments.len,
+                    self.quad_buffer,
+                    self.opacity,
+                    want_vsync,
+                );
+                return true;
+            }
+
             const pre_swap_ns = now_ns;
             self.rect.drawBatch(self.quad_buffer, self.opacity);
             self.window.swapBuffers();

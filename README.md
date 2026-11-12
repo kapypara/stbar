@@ -1,9 +1,10 @@
 # zigbar
 
-Ultra-low-overhead Linux status bar written in **Zig 0.17.1**, supporting native **Wayland (`zwlr_layer_shell_v1` + `EGL`)** and **X11 (`EWMH` + `GLX`)** in a single standalone executable with zero external runtime files.
+Ultra-low-overhead Linux status bar written in **Zig 0.17.1**, supporting native **Wayland `wl_shm` (`zwlr_layer_shell_v1`)**, **Wayland `EGL`**, and **X11 (`EWMH` + `GLX`)** in a single standalone executable with zero external runtime files.
 
 ## Highlights
 
+- **Single-Threaded Native `wl_shm` Renderer (`~3 MB` RSS, `1` Thread):** Default Wayland backend renders glyphs directly from L1-cached 2-bit `.rodata` into a triple-buffered `memfd` shared-memory pool (`WL_SHM_FORMAT_ARGB8888`) without loading Mesa/GPU drivers, submitting cell-level `wl_surface_damage_buffer` rects and pacing smooth animations via `wl_surface.frame` hardware VSync callbacks — while preserving `wayland-egl` and `x11` OpenGL 3.2 backends in the same binary.
 - **Standalone Single Binary:** `assets/font/tamzen.json` and `assets/font/tamzen.png` are baked into `.rodata` at build time (`tools/bake_font.zig`), requiring zero external assets or Zig package dependencies at runtime.
 - **Zero Polling While Hidden:** In `auto-hide` mode, `zigbar` shrinks its input region to a `1px` top-edge strip and suspends indefinitely inside kernel `poll(..., -1)` (`0 Hz` timers, `0` `/proc` reads, `0` GPU draws). Last-viewed metric state is preserved across sleep so revealing the bar glimpses its previous state and smoothly catches up at VSync.
 - **Framerate-Free Hardware VSync Interpolation:** Samples live Linux metrics (`/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`, `/proc/self/mountinfo`, `/sys/class/hwmon`, `sysinfo`, `localtime_r`) at `8 Hz` while visible and interpolates `prev -> target` smoothly locked to your monitor's native VSync refresh rate when values change — sleeping in `poll()` whenever steady.
@@ -22,14 +23,16 @@ sudo pacman -S wayland wayland-protocols libglvnd libx11 libxrender libxext syst
 ### Compile Standalone Binary
 
 ```bash
-zig build -Doptimize=ReleaseFast
+zig build
 install -Dm755 zig-out/bin/zigbar ~/.local/bin/zigbar
 ```
+
+> `zig build` defaults to native `ReleaseFast` (`-O3` + fast-math + native host SIMD + full LTO + frame-pointer omission + stripped symbols). Pass `-Doptimize=Debug` for debug builds.
 
 Run unit tests:
 
 ```bash
-zig build test --summary all
+zig build test -Doptimize=Debug --summary all
 ```
 
 ## CLI Usage & Controls
@@ -38,10 +41,10 @@ zig build test --summary all
 Usage: zigbar [options]
 
 Options:
-  -m, --mode=<auto-hide|pinned|dock>   Startup bar mode (default: auto-hide)
-  -b, --backend=<auto|wayland|x11>     Display backend (default: auto)
-      --hz=<1..60>                     Metric sample rate while visible (default: 8)
-  -h, --help                           Show help message and exit
+  -m, --mode=<auto-hide|pinned|dock>             Startup bar mode (default: auto-hide)
+  -b, --backend=<auto|wayland|wayland-egl|x11>   Display backend (default: auto)
+      --hz=<1..60>                               Metric sample rate while visible (default: 8)
+  -h, --help                                     Show help message and exit
 ```
 
 ### Mouse Controls

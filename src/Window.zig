@@ -1,17 +1,22 @@
 const std = @import("std");
 pub const c = @import("c");
 const ProcLoader = @import("GlProcs.zig").ProcLoader;
+const QuadVertex = @import("RectDraw.zig").RectDraw.QuadVertex;
 const X11Backend = @import("X11Backend.zig").X11Backend;
-const WaylandBackend = @import("WaylandBackend.zig").WaylandBackend;
+const wayland_zig = @import("WaylandBackend.zig");
+const WaylandBackend = wayland_zig.WaylandBackend;
+const WaylandRenderMode = wayland_zig.WaylandRenderMode;
 pub const Click = @import("X11Backend.zig").Click;
 
 pub const BackendPreference = enum {
-    /// Prefer native Wayland `zwlr_layer_shell_v1` + `EGL` when `WAYLAND_DISPLAY` is active,
-    /// falling back automatically to X11/GLX.
+    /// Prefer native Wayland `zwlr_layer_shell_v1` + `wl_shm` when `WAYLAND_DISPLAY` is active,
+    /// falling back to `wayland-egl` or `x11` automatically.
     auto,
-    /// Require native Wayland `zwlr_layer_shell_v1` + `EGL`.
+    /// Native Wayland `zwlr_layer_shell_v1` + `wl_shm` (single-threaded, ~3 MB RSS, zero Mesa load).
     wayland,
-    /// Force X11 / Xwayland + GLX.
+    /// Native Wayland `zwlr_layer_shell_v1` + `EGL` / OpenGL 3.2 Core.
+    wayland_egl,
+    /// Force X11 / Xwayland + `GLX` / OpenGL 3.2 Core.
     x11,
 };
 
@@ -63,13 +68,17 @@ pub const Window = struct {
         self.height = height;
 
         switch (self.backend_preference) {
-            .wayland => try self.initWayland(width, height),
+            .wayland => try self.initWayland(width, height, .shm),
+            .wayland_egl => try self.initWayland(width, height, .egl),
             .x11 => try self.initX11(x, y, width, height),
             .auto => {
                 if (std.c.getenv("WAYLAND_DISPLAY") != null) {
-                    self.initWayland(width, height) catch {
+                    self.initWayland(width, height, .shm) catch {
                         self.backend = .none;
-                        try self.initX11(x, y, width, height);
+                        self.initWayland(width, height, .egl) catch {
+                            self.backend = .none;
+                            try self.initX11(x, y, width, height);
+                        };
                     };
                 } else {
                     try self.initX11(x, y, width, height);
@@ -78,9 +87,10 @@ pub const Window = struct {
         }
     }
 
-    fn initWayland(self: *Window, width: i32, height: i32) !void {
+    fn initWayland(self: *Window, width: i32, height: i32, render_mode: WaylandRenderMode) !void {
         // Initialize in-place so `&self.backend.wayland` is stable for Wayland listener pointers
         self.backend = .{ .wayland = .{
+            .render_mode = render_mode,
             .docked = self.docked,
             .strut_enabled = self.strut_enabled,
             .input_height = self.input_height,
@@ -131,6 +141,34 @@ pub const Window = struct {
 
     pub fn activeBackend(self: *const Window) ActiveBackend {
         return std.meta.activeTag(self.backend);
+    }
+
+    pub fn usesShm(self: *const Window) bool {
+        return switch (self.backend) {
+            .wayland => |*wl| wl.render_mode == .shm,
+            else => false,
+        };
+    }
+
+    pub fn presentShm(
+        self: *Window,
+        allocator: std.mem.Allocator,
+        bg_count: usize,
+        quads: []const QuadVertex,
+        opacity: f32,
+        request_frame_sync: bool,
+    ) !void {
+        switch (self.backend) {
+            .wayland => |*wl| try wl.presentShm(allocator, bg_count, quads, opacity, request_frame_sync),
+            else => {},
+        }
+    }
+
+    pub fn waitForFrameSync(self: *Window) void {
+        switch (self.backend) {
+            .wayland => |*wl| wl.waitForFrameSync(),
+            else => {},
+        }
     }
 
     pub fn getProcLoader(self: *const Window) ProcLoader {

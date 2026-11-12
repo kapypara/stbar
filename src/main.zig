@@ -8,8 +8,8 @@ const status_zig = @import("StatusMonitor.zig");
 const StatusMonitor = status_zig.StatusMonitor;
 const BarMode = status_zig.BarMode;
 
-/// Default display server backend (`--backend=auto|wayland|x11`):
-/// - `.auto`: native Wayland `zwlr_layer_shell_v1` + `EGL` when `WAYLAND_DISPLAY` is set, else X11/GLX
+/// Default display server backend (`--backend=auto|wayland|wayland-egl|x11`):
+/// - `.auto`: native Wayland `zwlr_layer_shell_v1` + `wl_shm` when `WAYLAND_DISPLAY` is set, else X11/GLX
 const default_backend_mode: BackendPreference = .auto;
 
 /// Default startup bar mode (`--mode=auto-hide|pinned|dock`):
@@ -43,15 +43,15 @@ const usage_text =
     \\Usage: zigbar [options]
     \\
     \\Options:
-    \\  -m, --mode=<auto-hide|pinned|dock>   Startup bar mode (default: auto-hide)
-    \\  -b, --backend=<auto|wayland|x11>     Display backend (default: auto)
-    \\      --hz=<1..60>                     Metric sample rate while visible (default: 8)
-    \\  -h, --help                           Show this help message and exit
+    \\  -m, --mode=<auto-hide|pinned|dock>             Startup bar mode (default: auto-hide)
+    \\  -b, --backend=<auto|wayland|wayland-egl|x11>   Display backend (default: auto)
+    \\      --hz=<1..60>                               Metric sample rate while visible (default: 8)
+    \\  -h, --help                                     Show this help message and exit
     \\
     \\Mouse Controls:
-    \\  Hover top 1px (>1s)                  Reveal bar in auto-hide mode
-    \\  Right-click                          Toggle pinned overlay (strut OFF) <-> auto-hide
-    \\  Middle-click                         Toggle 17px docked strut (strut ON) <-> auto-hide
+    \\  Hover top 1px (>1s)                            Reveal bar in auto-hide mode
+    \\  Right-click                                    Toggle pinned overlay (strut OFF) <-> auto-hide
+    \\  Middle-click                                   Toggle 17px docked strut (strut ON) <-> auto-hide
     \\
 ;
 
@@ -70,8 +70,9 @@ fn parseModeValue(val: []const u8) ?BarMode {
 
 fn parseBackendValue(val: []const u8) ?BackendPreference {
     if (std.mem.eql(u8, val, "auto")) return .auto;
-    if (std.mem.eql(u8, val, "wayland") or std.mem.eql(u8, val, "wl")) return .wayland;
-    if (std.mem.eql(u8, val, "x11") or std.mem.eql(u8, val, "xorg")) return .x11;
+    if (std.mem.eql(u8, val, "wayland") or std.mem.eql(u8, val, "wl") or std.mem.eql(u8, val, "shm") or std.mem.eql(u8, val, "wayland-shm")) return .wayland;
+    if (std.mem.eql(u8, val, "wayland-egl") or std.mem.eql(u8, val, "wl-egl") or std.mem.eql(u8, val, "egl")) return .wayland_egl;
+    if (std.mem.eql(u8, val, "x11") or std.mem.eql(u8, val, "xorg") or std.mem.eql(u8, val, "glx")) return .x11;
     return null;
 }
 
@@ -105,7 +106,7 @@ fn parseCli(args: std.process.Args) !CliConfig {
             };
         } else if (std.mem.startsWith(u8, arg, "--backend=")) {
             cfg.backend = parseBackendValue(arg["--backend=".len..]) orelse {
-                writeFd(2, "zigbar: invalid --backend (expected auto, wayland, or x11)\n");
+                writeFd(2, "zigbar: invalid --backend (expected auto, wayland, wayland-egl, or x11)\n");
                 return error.InvalidArgument;
             };
         } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--backend")) {
@@ -114,7 +115,7 @@ fn parseCli(args: std.process.Args) !CliConfig {
                 return error.InvalidArgument;
             };
             cfg.backend = parseBackendValue(val) orelse {
-                writeFd(2, "zigbar: invalid --backend (expected auto, wayland, or x11)\n");
+                writeFd(2, "zigbar: invalid --backend (expected auto, wayland, wayland-egl, or x11)\n");
                 return error.InvalidArgument;
             };
         } else if (std.mem.startsWith(u8, arg, "--hz=")) {
@@ -176,5 +177,6 @@ test {
     _ = @import("formats.zig");
     _ = @import("Segment.zig");
     _ = @import("FontAtlas.zig");
+    _ = @import("ShmDraw.zig");
     _ = @import("metrics.zig");
 }

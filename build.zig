@@ -15,7 +15,11 @@ pub fn build(b: *std.Build) void {
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.option(
+        std.builtin.Optimize,
+        "optimize",
+        "Prioritize performance, safety, or binary size (default: ReleaseFast)",
+    ) orelse .fast;
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -50,10 +54,12 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
+            .omit_frame_pointer = optimize != .debug,
             .strip = optimize != .debug,
         }),
         .use_llvm = true,
     });
+    exe.lto = if (optimize != .debug) .full else .none;
 
     // Bake `assets/font/tamzen.json` + `assets/font/tamzen.png` into `.rodata` at build time (zero runtime asset files)
     const bake_font_exe = b.addExecutable(.{
@@ -121,6 +127,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addIncludePath(wf.getDirectory());
 
     const c_header = wf.add("c.h",
+        \\#define _GNU_SOURCE
         \\#include <wayland-client.h>
         \\#include <wayland-egl.h>
         \\#include <EGL/egl.h>
@@ -135,6 +142,7 @@ pub fn build(b: *std.Build) void {
         \\#include <X11/extensions/Xrender.h>
         \\#include <X11/extensions/shape.h>
         \\#include <X11/Xutil.h>
+        \\#include <sys/mman.h>
         \\#include <sys/statvfs.h>
         \\#include <poll.h>
         \\#include <unistd.h>
