@@ -43,17 +43,19 @@ Usage: zigbar [options]
 Options:
   -m, --mode=<auto-hide|pinned|dock>             Startup bar mode (default: auto-hide)
   -b, --backend=<auto|wayland|wayland-egl|x11>   Display backend (default: auto)
+  -o, --output=<connector>                       Target Wayland output (e.g. eDP-1, DP-1; default: primary)
       --hz=<1..60>                               Metric sample rate while visible (default: 8)
   -h, --help                                     Show help message and exit
 ```
 
-### Mouse Controls
+### Mouse & Signal Controls
 
-| Action | Behavior |
+| Action / Signal | Behavior |
 | :--- | :--- |
 | **Hover top `1px` (`> 1.0s`)** | Smoothly fades in the bar (`auto-hide` mode); fades out `120ms` after pointer leaves |
-| **Right-click** | Toggles **`pinned`** overlay (`strut = OFF`, always visible) <-> **`auto-hide`** |
-| **Middle-click** | Toggles **`dock`** mode (`17px` top `exclusive_zone` / `_NET_WM_STRUT_PARTIAL` `strut = ON`) <-> **`auto-hide`** |
+| **Left-click segment** | Runs declarative segment action (copy Unix time / power summary / window title, launch `btop` / `dolphin`) |
+| **Right-click** / `pkill -USR1 -x zigbar` | Toggles **`pinned`** overlay (`strut = OFF`, always visible) <-> **`auto-hide`** |
+| **Middle-click** / `pkill -USR2 -x zigbar` | Toggles **`dock`** mode (`17px` top `exclusive_zone` / `_NET_WM_STRUT_PARTIAL` `strut = ON`) <-> **`auto-hide`** |
 
 ## Autostart with `systemd --user`
 

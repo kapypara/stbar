@@ -44,6 +44,7 @@ pub const X11Backend = struct {
     x: i32 = 0,
     y: i32 = 0,
     input_height: i32 = 0,
+    wakeup_fd: c_int = -1,
 
     running: bool = true,
     docked: bool = true,
@@ -401,12 +402,26 @@ pub const X11Backend = struct {
         }
         if (c.XPending(dpy) > 0) return;
 
-        var pfd = c.struct_pollfd{
+        var pfds: [2]c.struct_pollfd = undefined;
+        pfds[0] = .{
             .fd = c.ConnectionNumber(dpy),
             .events = c.POLLIN,
             .revents = 0,
         };
-        _ = c.poll(&pfd, 1, timeout_ms);
+        var nfds: c.nfds_t = 1;
+        if (self.wakeup_fd >= 0) {
+            pfds[1] = .{
+                .fd = self.wakeup_fd,
+                .events = c.POLLIN,
+                .revents = 0,
+            };
+            nfds = 2;
+        }
+        const ready = c.poll(&pfds, nfds, timeout_ms);
+        if (ready > 0 and nfds == 2 and pfds[1].revents != 0) {
+            var drain: [32]u8 = undefined;
+            _ = c.read(self.wakeup_fd, &drain, drain.len);
+        }
     }
 
     fn waitForMapNotify(_: ?*c.Display, ev: [*c]c.XEvent, arg: [*c]u8) callconv(.c) i32 {

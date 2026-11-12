@@ -550,6 +550,16 @@ pub const StatusMonitor = struct {
         }
     }
 
+    pub fn togglePinnedOverlay(self: *StatusMonitor) void {
+        const next: BarMode = if (self.mode == .pinned_overlay) .auto_hide else .pinned_overlay;
+        self.setMode(next, monotonicNs(self.io));
+    }
+
+    pub fn toggleDockedStrut(self: *StatusMonitor) void {
+        const next: BarMode = if (self.mode == .docked_strut) .auto_hide else .docked_strut;
+        self.setMode(next, monotonicNs(self.io));
+    }
+
     fn advanceVisibility(self: *StatusMonitor, now_ns: i96) void {
         if (self.mode != .auto_hide) {
             if (self.state == .fading_in) {
@@ -645,6 +655,16 @@ pub const StatusMonitor = struct {
     pub fn step(self: *StatusMonitor) !void {
         self.window.updateTheMessageQueue();
         if (!self.window.running) return;
+        if (self.window.surface_suspended) {
+            if (self.mode == .auto_hide and self.state != .hidden) {
+                self.opacity = 0.0;
+                self.state = .hidden;
+                self.frame_dirty = false;
+                self.window.setInputHeight(1);
+            }
+            self.window.waitForEventsOrTimeout(-1);
+            return;
+        }
 
         var now_ns = monotonicNs(self.io);
 

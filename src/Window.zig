@@ -49,8 +49,12 @@ pub const Window = struct {
     x: i32 = 0,
     y: i32 = 0,
     input_height: i32 = 0,
+    wakeup_fd: c_int = -1,
+    target_output: [64]u8 = @splat(0),
+    target_output_len: u8 = 0,
 
     running: bool = true,
+    surface_suspended: bool = false,
     docked: bool = true,
     strut_enabled: bool = false,
     pointer_inside: bool = false,
@@ -59,6 +63,12 @@ pub const Window = struct {
     exposed: bool = false,
     title_dirty: bool = true,
     last_click: Click = .{},
+
+    pub fn setTargetOutput(self: *Window, name: []const u8) void {
+        const n: u8 = @intCast(@min(name.len, self.target_output.len));
+        @memcpy(self.target_output[0..n], name[0..n]);
+        self.target_output_len = n;
+    }
 
     /// Note: `self` must remain at a stable memory address after `init` (Wayland listeners reference `&self.backend.wayland`).
     pub fn init(self: *Window, x: i32, y: i32, width: i32, height: i32) !void {
@@ -94,9 +104,11 @@ pub const Window = struct {
             .docked = self.docked,
             .strut_enabled = self.strut_enabled,
             .input_height = self.input_height,
+            .wakeup_fd = self.wakeup_fd,
         } };
         errdefer self.backend = .none;
 
+        self.backend.wayland.setTargetOutput(self.target_output[0..self.target_output_len]);
         try self.backend.wayland.init(width, height);
 
         const wl = &self.backend.wayland;
@@ -114,6 +126,7 @@ pub const Window = struct {
             .docked = self.docked,
             .strut_enabled = self.strut_enabled,
             .input_height = self.input_height,
+            .wakeup_fd = self.wakeup_fd,
         } };
         errdefer self.backend = .none;
 
@@ -267,6 +280,7 @@ pub const Window = struct {
                 self.input_height = wl.input_height;
                 self.strut_enabled = wl.strut_enabled;
                 self.pointer_inside = wl.pointer_inside;
+                self.surface_suspended = wl.surface_lost;
                 if (!wl.running) self.running = false;
                 if (wl.resized) {
                     self.resized = true;
@@ -292,6 +306,7 @@ pub const Window = struct {
                 self.input_height = x11.input_height;
                 self.strut_enabled = x11.strut_enabled;
                 self.pointer_inside = x11.pointer_inside;
+                self.surface_suspended = false;
                 if (!x11.running) self.running = false;
                 if (x11.resized) {
                     self.resized = true;

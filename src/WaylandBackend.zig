@@ -22,7 +22,23 @@ pub const WaylandRenderMode = enum {
 
 pub const WaylandBackend = struct {
     const max_toplevels = 64;
+    const max_outputs = 16;
     const shm_slot_count = 3;
+
+    pub const OutputSlot = struct {
+        owner: ?*WaylandBackend = null,
+        global_name: u32 = 0,
+        bound_version: u32 = 0,
+        handle: ?*c.struct_wl_output = null,
+        name: [64]u8 = @splat(0),
+        name_len: u8 = 0,
+        scale: i32 = 1,
+        ready: bool = false,
+
+        pub fn nameSlice(self: *const OutputSlot) []const u8 {
+            return self.name[0..self.name_len];
+        }
+    };
 
     const ShmBufferSlot = struct {
         wl_buffer: ?*c.struct_wl_buffer = null,
@@ -64,6 +80,13 @@ pub const WaylandBackend = struct {
 
     layer_shell: ?*c.struct_zwlr_layer_shell_v1 = null,
     layer_surface: ?*c.struct_zwlr_layer_surface_v1 = null,
+    outputs: [max_outputs]OutputSlot = @splat(.{}),
+    bound_output: ?*c.struct_wl_output = null,
+    target_output: [64]u8 = @splat(0),
+    target_output_len: u8 = 0,
+    surface_lost: bool = false,
+    pending_surface_rebind: bool = false,
+    logged_waiting_output: bool = false,
 
     // Native in-process Wayland clipboard (`ext-data-control-v1` -> `wlr-data-control-v1` -> `wl_data_device`)
     ext_data_manager: ?*c.struct_ext_data_control_manager_v1 = null,
@@ -115,6 +138,7 @@ pub const WaylandBackend = struct {
     height: i32 = 17,
     input_height: i32 = 0,
     applied_input_height: i32 = -1,
+    wakeup_fd: c_int = -1,
     pointer_x: i32 = 0,
     pointer_y: i32 = 0,
 
@@ -148,16 +172,34 @@ pub const WaylandBackend = struct {
         if (self.layer_shell == null) return error.NoLayerShell;
         if (self.render_mode == .shm and self.wl_shm == null) return error.NoWlShm;
 
-        // Flush seat capability & initial toplevel advertisements if bound
+        // Flush seat capability, wl_output connector names, & initial toplevel advertisements
         _ = c.wl_display_roundtrip(dpy);
 
-        try self.createLayerSurface();
-        switch (self.render_mode) {
-            .shm => {
-                try self.recreateShmBuffers();
-                self.clearTransparent();
-            },
-            .egl => try self.createEglContext(),
+        if (self.hasMatchingOutput()) {
+            try self.createLayerSurface();
+            switch (self.render_mode) {
+                .shm => {
+                    try self.recreateShmBuffers();
+                    self.clearTransparent();
+                },
+                .egl => try self.createEglContext(),
+            }
+        } else {
+            self.surface_lost = true;
+            if (self.target_output_len > 0 and !self.logged_waiting_output) {
+                self.logged_waiting_output = true;
+                var msg_buf: [140]u8 = undefined;
+                if (std.fmt.bufPrint(
+                    &msg_buf,
+                    "zigbar: output '{s}' not currently connected; waiting for hotplug...\n",
+                    .{self.target_output[0..self.target_output_len]},
+                )) |msg| {
+                    _ = c.write(2, msg.ptr, msg.len);
+                } else |_| {}
+            }
+            if (self.render_mode == .egl) {
+                try self.createEglContext();
+            }
         }
 
         if (!self.has_foreign_toplevel) {
@@ -167,6 +209,53 @@ pub const WaylandBackend = struct {
                 self.initAuxX11Watcher();
             }
         }
+    }
+
+    pub fn setTargetOutput(self: *WaylandBackend, name: []const u8) void {
+        const n: u8 = @intCast(@min(name.len, self.target_output.len));
+        @memcpy(self.target_output[0..n], name[0..n]);
+        self.target_output_len = n;
+    }
+
+    pub fn findOutputSlot(outputs: []const OutputSlot, target: []const u8) ?usize {
+        if (target.len == 0) {
+            for (outputs, 0..) |*slot, idx| {
+                if (slot.handle != null and slot.ready) return idx;
+            }
+            return null;
+        }
+        for (outputs, 0..) |*slot, idx| {
+            if (slot.handle != null and slot.ready and std.mem.eql(u8, slot.nameSlice(), target)) {
+                return idx;
+            }
+        }
+        for (outputs, 0..) |*slot, idx| {
+            if (slot.handle != null and slot.ready and std.ascii.eqlIgnoreCase(slot.nameSlice(), target)) {
+                return idx;
+            }
+        }
+        return null;
+    }
+
+    fn hasMatchingOutput(self: *const WaylandBackend) bool {
+        return findOutputSlot(&self.outputs, self.target_output[0..self.target_output_len]) != null;
+    }
+
+    fn selectTargetOutput(self: *const WaylandBackend) ?*c.struct_wl_output {
+        if (self.target_output_len == 0) return null;
+        const idx = findOutputSlot(&self.outputs, self.target_output[0..self.target_output_len]) orelse return null;
+        return self.outputs[idx].handle;
+    }
+
+    fn releaseOutputSlot(slot: *OutputSlot) void {
+        if (slot.handle) |out| {
+            if (slot.bound_version >= 3) {
+                c.wl_output_release(out);
+            } else {
+                c.wl_output_destroy(out);
+            }
+        }
+        slot.* = .{};
     }
 
     pub fn deinit(self: *WaylandBackend) void {
@@ -220,6 +309,10 @@ pub const WaylandBackend = struct {
             c.wl_surface_destroy(surf);
             self.wl_surface = null;
         }
+        self.bound_output = null;
+        for (&self.outputs) |*out_slot| {
+            releaseOutputSlot(out_slot);
+        }
         if (self.layer_shell) |shell| {
             c.zwlr_layer_shell_v1_destroy(shell);
             self.layer_shell = null;
@@ -269,16 +362,94 @@ pub const WaylandBackend = struct {
         return null;
     }
 
+    fn teardownLayerSurface(self: *WaylandBackend) void {
+        if (self.frame_cb) |cb| {
+            c.wl_callback_destroy(cb);
+            self.frame_cb = null;
+        }
+        if (self.render_mode == .egl and self.egl_display != c.EGL_NO_DISPLAY) {
+            _ = c.eglMakeCurrent(self.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, self.egl_context);
+            if (self.egl_surface != c.EGL_NO_SURFACE) {
+                _ = c.eglDestroySurface(self.egl_display, self.egl_surface);
+                self.egl_surface = c.EGL_NO_SURFACE;
+            }
+            if (self.egl_window) |win| {
+                c.wl_egl_window_destroy(win);
+                self.egl_window = null;
+            }
+        }
+        for (&self.shm_slots) |*slot| {
+            slot.busy = false;
+            slot.state.invalidate();
+        }
+        if (self.layer_surface) |ls| {
+            c.zwlr_layer_surface_v1_destroy(ls);
+            self.layer_surface = null;
+        }
+        if (self.wl_surface) |surf| {
+            c.wl_surface_destroy(surf);
+            self.wl_surface = null;
+        }
+        self.bound_output = null;
+        self.configured = false;
+        self.pointer_inside = false;
+        self.applied_input_height = -1;
+        self.needs_configure_commit = false;
+        self.surface_lost = true;
+        self.pending_surface_rebind = true;
+    }
+
+    fn tryRecoverLayerSurface(self: *WaylandBackend) void {
+        if (!self.surface_lost) return;
+        self.pending_surface_rebind = false;
+        if (!self.hasMatchingOutput()) return;
+
+        self.createLayerSurface() catch {
+            self.teardownLayerSurface();
+            self.pending_surface_rebind = false;
+            return;
+        };
+
+        switch (self.render_mode) {
+            .shm => {
+                self.recreateShmBuffers() catch {
+                    self.teardownLayerSurface();
+                    self.pending_surface_rebind = false;
+                    return;
+                };
+                if (self.input_height <= 1) {
+                    self.clearTransparent();
+                }
+            },
+            .egl => {
+                self.createEglSurface() catch {
+                    self.teardownLayerSurface();
+                    self.pending_surface_rebind = false;
+                    return;
+                };
+            },
+        }
+
+        self.surface_lost = false;
+        self.resized = true;
+        self.exposed = true;
+    }
+
     fn createLayerSurface(self: *WaylandBackend) !void {
         const dpy = self.wl_display.?;
         const comp = self.wl_compositor.?;
         const shell = self.layer_shell.?;
 
+        const chosen_output = self.selectTargetOutput();
+        self.bound_output = chosen_output;
+        self.configured = false;
+        self.applied_input_height = -1;
+
         self.wl_surface = c.wl_compositor_create_surface(comp) orelse return error.CreateSurfaceFailed;
         self.layer_surface = c.zwlr_layer_shell_v1_get_layer_surface(
             shell,
             self.wl_surface,
-            null,
+            chosen_output,
             c.ZWLR_LAYER_SHELL_V1_LAYER_TOP,
             "zigbar",
         ) orelse return error.CreateLayerSurfaceFailed;
@@ -364,6 +535,18 @@ pub const WaylandBackend = struct {
         }
         if (self.egl_context == c.EGL_NO_CONTEXT) return error.EglCreateContextFailed;
 
+        if (self.wl_surface != null) {
+            try self.createEglSurface();
+        } else {
+            // Surfaceless context allows shader/VBO initialization while waiting for target output hotplug
+            if (c.eglMakeCurrent(self.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, self.egl_context) != c.EGL_TRUE) {
+                return error.EglMakeCurrentFailed;
+            }
+            c.glClearColor(0.0, 0.0, 0.0, 0.0);
+        }
+    }
+
+    fn createEglSurface(self: *WaylandBackend) !void {
         self.egl_window = c.wl_egl_window_create(
             self.wl_surface,
             @max(1, self.width),
@@ -631,8 +814,10 @@ pub const WaylandBackend = struct {
     pub fn clearTransparent(self: *WaylandBackend) void {
         switch (self.render_mode) {
             .egl => {
-                c.glClear(c.GL_COLOR_BUFFER_BIT);
-                self.swapBuffers();
+                if (self.egl_surface != c.EGL_NO_SURFACE) {
+                    c.glClear(c.GL_COLOR_BUFFER_BIT);
+                    self.swapBuffers();
+                }
             },
             .shm => {
                 const surf = self.wl_surface orelse return;
@@ -718,6 +903,9 @@ pub const WaylandBackend = struct {
                 self.running = false;
                 return;
             }
+            if (self.surface_lost and self.pending_surface_rebind) {
+                self.tryRecoverLayerSurface();
+            }
         }
 
         if (self.kwin_watcher.active and self.kwin_needs_pump) {
@@ -745,12 +933,15 @@ pub const WaylandBackend = struct {
         }
     }
 
-    /// `timeout_ms < 0` sleeps indefinitely in kernel `poll()` until an input/compositor/title event arrives.
+    /// `timeout_ms < 0` sleeps indefinitely in kernel `poll()` until an input/compositor/title/signal event arrives.
     pub fn waitForEventsOrTimeout(self: *WaylandBackend, timeout_ms: i32) void {
         const wl_dpy = self.wl_display orelse return;
         if (timeout_ms == 0) {
             _ = c.wl_display_flush(wl_dpy);
             if (self.aux_x11_dpy) |x_dpy| _ = c.XFlush(x_dpy);
+            return;
+        }
+        if (self.surface_lost and self.pending_surface_rebind and self.hasMatchingOutput()) {
             return;
         }
 
@@ -774,7 +965,7 @@ pub const WaylandBackend = struct {
         }
         _ = c.wl_display_flush(wl_dpy);
 
-        var pfds: [3]c.struct_pollfd = undefined;
+        var pfds: [4]c.struct_pollfd = undefined;
         pfds[0] = .{
             .fd = c.wl_display_get_fd(wl_dpy),
             .events = c.POLLIN,
@@ -800,6 +991,16 @@ pub const WaylandBackend = struct {
             };
             nfds += 1;
         }
+        var wake_idx: ?usize = null;
+        if (self.wakeup_fd >= 0) {
+            wake_idx = nfds;
+            pfds[nfds] = .{
+                .fd = self.wakeup_fd,
+                .events = c.POLLIN,
+                .revents = 0,
+            };
+            nfds += 1;
+        }
 
         const ready = c.poll(&pfds, nfds, timeout_ms);
         if (ready > 0 and (pfds[0].revents & (c.POLLIN | c.POLLERR | c.POLLHUP)) != 0) {
@@ -814,6 +1015,12 @@ pub const WaylandBackend = struct {
             if (kwin_idx) |ki| {
                 if (pfds[ki].revents != 0) {
                     self.kwin_needs_pump = true;
+                }
+            }
+            if (wake_idx) |wi| {
+                if (pfds[wi].revents != 0) {
+                    var drain: [32]u8 = undefined;
+                    _ = c.read(self.wakeup_fd, &drain, drain.len);
                 }
             }
         }
@@ -910,10 +1117,105 @@ pub const WaylandBackend = struct {
                     1,
                 ));
             }
+        } else if (std.mem.eql(u8, iface, "wl_output")) {
+            for (&self.outputs) |*slot| {
+                if (slot.handle == null) {
+                    const bound_ver = @min(version, 4);
+                    const out_handle: ?*c.struct_wl_output = @ptrCast(c.wl_registry_bind(
+                        registry,
+                        name,
+                        &c.wl_output_interface,
+                        bound_ver,
+                    ));
+                    if (out_handle) |out| {
+                        slot.* = .{
+                            .owner = self,
+                            .global_name = name,
+                            .bound_version = bound_ver,
+                            .handle = out,
+                            .scale = 1,
+                            .ready = (bound_ver < 2),
+                        };
+                        _ = c.wl_output_add_listener(out, &output_listener, slot);
+                        if (slot.ready and self.surface_lost) {
+                            self.pending_surface_rebind = true;
+                        }
+                    }
+                    break;
+                }
+            }
         }
     }
 
-    fn registryGlobalRemove(_: ?*anyopaque, _: ?*c.struct_wl_registry, _: u32) callconv(.c) void {}
+    fn registryGlobalRemove(data: ?*anyopaque, _: ?*c.struct_wl_registry, name: u32) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        for (&self.outputs) |*slot| {
+            if (slot.handle != null and slot.global_name == name) {
+                if (self.bound_output != null and slot.handle == self.bound_output) {
+                    self.teardownLayerSurface();
+                }
+                releaseOutputSlot(slot);
+                break;
+            }
+        }
+    }
+
+    const output_listener = c.struct_wl_output_listener{
+        .geometry = outputGeometry,
+        .mode = outputMode,
+        .done = outputDone,
+        .scale = outputScale,
+        .name = outputName,
+        .description = outputDescription,
+    };
+
+    fn outputGeometry(
+        _: ?*anyopaque,
+        _: ?*c.struct_wl_output,
+        _: i32,
+        _: i32,
+        _: i32,
+        _: i32,
+        _: i32,
+        _: [*c]const u8,
+        _: [*c]const u8,
+        _: i32,
+    ) callconv(.c) void {}
+
+    fn outputMode(
+        _: ?*anyopaque,
+        _: ?*c.struct_wl_output,
+        _: u32,
+        _: i32,
+        _: i32,
+        _: i32,
+    ) callconv(.c) void {}
+
+    fn outputDone(data: ?*anyopaque, _: ?*c.struct_wl_output) callconv(.c) void {
+        const slot: *OutputSlot = @ptrCast(@alignCast(data.?));
+        slot.ready = true;
+        if (slot.owner) |owner| {
+            if (owner.surface_lost) {
+                owner.pending_surface_rebind = true;
+            }
+        }
+    }
+
+    fn outputScale(data: ?*anyopaque, _: ?*c.struct_wl_output, factor: i32) callconv(.c) void {
+        const slot: *OutputSlot = @ptrCast(@alignCast(data.?));
+        slot.scale = @max(1, factor);
+    }
+
+    fn outputName(data: ?*anyopaque, _: ?*c.struct_wl_output, name_ptr: [*c]const u8) callconv(.c) void {
+        const slot: *OutputSlot = @ptrCast(@alignCast(data.?));
+        if (name_ptr == null) return;
+        const raw = std.mem.span(name_ptr);
+        const n: u8 = @intCast(@min(raw.len, slot.name.len));
+        @memcpy(slot.name[0..n], raw[0..n]);
+        slot.name_len = n;
+    }
+
+    fn outputDescription(_: ?*anyopaque, _: ?*c.struct_wl_output, _: [*c]const u8) callconv(.c) void {}
 
     const layer_surface_listener = c.struct_zwlr_layer_surface_v1_listener{
         .configure = layerSurfaceConfigure,
@@ -977,9 +1279,10 @@ pub const WaylandBackend = struct {
         }
     }
 
-    fn layerSurfaceClosed(data: ?*anyopaque, _: ?*c.struct_zwlr_layer_surface_v1) callconv(.c) void {
+    fn layerSurfaceClosed(data: ?*anyopaque, ls: ?*c.struct_zwlr_layer_surface_v1) callconv(.c) void {
         const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
-        self.running = false;
+        if (self.layer_surface == null or ls != self.layer_surface) return;
+        self.teardownLayerSurface();
     }
 
     const seat_listener = c.struct_wl_seat_listener{
@@ -1639,3 +1942,39 @@ pub const WaylandBackend = struct {
         }
     }
 };
+
+test "WaylandBackend.findOutputSlot matches default, exact, and case-insensitive connectors" {
+    const dummy_a: *c.struct_wl_output = @ptrFromInt(0x1000);
+    const dummy_b: *c.struct_wl_output = @ptrFromInt(0x2000);
+    const dummy_c: *c.struct_wl_output = @ptrFromInt(0x3000);
+
+    var slots: [4]WaylandBackend.OutputSlot = @splat(.{});
+    // Slot 0: bound but not yet `done` (`ready == false`)
+    slots[0].handle = dummy_a;
+    slots[0].ready = false;
+    @memcpy(slots[0].name[0..4], "DP-1");
+    slots[0].name_len = 4;
+
+    // Slot 1: ready `eDP-1`
+    slots[1].handle = dummy_b;
+    slots[1].ready = true;
+    @memcpy(slots[1].name[0..5], "eDP-1");
+    slots[1].name_len = 5;
+
+    // Slot 2: ready `HDMI-A-1`
+    slots[2].handle = dummy_c;
+    slots[2].ready = true;
+    @memcpy(slots[2].name[0..8], "HDMI-A-1");
+    slots[2].name_len = 8;
+
+    // Empty target picks first ready output (skips unready slot 0 -> picks slot 1)
+    try std.testing.expectEqual(@as(?usize, 1), WaylandBackend.findOutputSlot(&slots, ""));
+    // Exact match
+    try std.testing.expectEqual(@as(?usize, 2), WaylandBackend.findOutputSlot(&slots, "HDMI-A-1"));
+    // Case-insensitive match
+    try std.testing.expectEqual(@as(?usize, 1), WaylandBackend.findOutputSlot(&slots, "edp-1"));
+    // Unready output is ignored until `wl_output.done`
+    try std.testing.expectEqual(@as(?usize, null), WaylandBackend.findOutputSlot(&slots, "DP-1"));
+    // Disconnected connector returns null
+    try std.testing.expectEqual(@as(?usize, null), WaylandBackend.findOutputSlot(&slots, "DP-9"));
+}
