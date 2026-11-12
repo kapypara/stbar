@@ -145,6 +145,41 @@ pub const ShmDraw = struct {
         }
     }
 
+    /// SWAR 2-lane ARGB linear blend for `w` in `0..256` (`0` -> `c0`, `256` -> `c1`).
+    pub inline fn lerpArgb256(c0: u32, c1: u32, w: u32) u32 {
+        if (w == 0 or c0 == c1) return c0;
+        if (w >= 256) return c1;
+        const inv_w: u32 = 256 - w;
+        const rb = (((c0 & 0x00FF00FF) * inv_w + (c1 & 0x00FF00FF) * w + 0x00800080) >> 8) & 0x00FF00FF;
+        const ag = ((((c0 >> 8) & 0x00FF00FF) * inv_w + ((c1 >> 8) & 0x00FF00FF) * w + 0x00800080) >> 8) & 0x00FF00FF;
+        return (ag << 8) | rb;
+    }
+
+    const AxisTap = struct {
+        t0: u8,
+        t1: u8,
+        w: u16,
+    };
+
+    inline fn computeAxisTap(d: usize, dst_n: usize, comptime src_n: usize) AxisTap {
+        const num0 = d * src_n;
+        const num1 = (d + 1) * src_n;
+        const t0 = @min(num0 / dst_n, src_n - 1);
+        const t1_raw = @min((num1 - 1) / dst_n, src_n - 1);
+        if (t0 == t1_raw) {
+            return .{ .t0 = @intCast(t0), .t1 = @intCast(t0), .w = 0 };
+        }
+        const t1 = @min(t0 + 1, src_n - 1);
+        const boundary = t1 * dst_n;
+        const above = num1 -| boundary;
+        const w = @min(256, (above * 256 + (src_n / 2)) / src_n);
+        return .{ .t0 = @intCast(t0), .t1 = @intCast(t1), .w = @intCast(w) };
+    }
+
+    inline fn samplePacked2Bit(idx: usize) u2 {
+        return @truncate(embedded.packed_2bit[idx >> 2] >> @intCast((idx & 3) * 2));
+    }
+
     fn blitCell(
         pixels: []u32,
         width: i32,
@@ -185,25 +220,55 @@ pub const ShmDraw = struct {
                 const src_base = (atlas_y0 + dy) * embedded.width + atlas_x0;
                 const dst_row = pixels[(sy.p0 + dy) * stride + sx.p0 ..][0..embedded.char_width];
                 for (0..embedded.char_width) |dx| {
-                    const idx = src_base + dx;
-                    const code: u2 = @truncate(embedded.packed_2bit[idx >> 2] >> @intCast((idx & 3) * 2));
-                    dst_row[dx] = lut[code];
+                    dst_row[dx] = lut[samplePacked2Bit(src_base + dx)];
                 }
             }
         } else {
-            const cw_f: f32 = @floatFromInt(embedded.char_width);
-            const ch_f: f32 = @floatFromInt(embedded.char_height);
-            for (sy.p0..sy.p1) |py| {
-                const vf = ((@as(f32, @floatFromInt(py)) + 0.5 - sy.start_f) / sy.span_f) * ch_f;
-                const ty: usize = @intCast(std.math.clamp(@as(i32, @intFromFloat(@floor(vf))), 0, embedded.char_height - 1));
-                const src_base = (atlas_y0 + ty) * embedded.width + atlas_x0;
-                const dst_row = pixels[py * stride ..];
-                for (sx.p0..sx.p1) |px| {
-                    const uf = ((@as(f32, @floatFromInt(px)) + 0.5 - sx.start_f) / sx.span_f) * cw_f;
-                    const tx: usize = @intCast(std.math.clamp(@as(i32, @intFromFloat(@floor(uf))), 0, embedded.char_width - 1));
-                    const idx = src_base + tx;
-                    const code: u2 = @truncate(embedded.packed_2bit[idx >> 2] >> @intCast((idx & 3) * 2));
-                    dst_row[px] = lut[code];
+            // Precompute rational box-coverage X taps once per cell (`<= 64` px fast path)
+            var x_taps_buf: [64]AxisTap = undefined;
+            const use_x_cache = cell_w <= x_taps_buf.len;
+            if (use_x_cache) {
+                for (0..cell_w) |dx| {
+                    x_taps_buf[dx] = computeAxisTap(dx, cell_w, embedded.char_width);
+                }
+            }
+
+            for (0..cell_h) |dy| {
+                const y_tap = computeAxisTap(dy, cell_h, embedded.char_height);
+                const src_row0 = (atlas_y0 + y_tap.t0) * embedded.width + atlas_x0;
+                const src_row1 = (atlas_y0 + y_tap.t1) * embedded.width + atlas_x0;
+                const dst_row = pixels[(sy.p0 + dy) * stride + sx.p0 ..][0..cell_w];
+
+                if (y_tap.w == 0) {
+                    for (0..cell_w) |dx| {
+                        const x_tap = if (use_x_cache) x_taps_buf[dx] else computeAxisTap(dx, cell_w, embedded.char_width);
+                        const c00 = samplePacked2Bit(src_row0 + x_tap.t0);
+                        if (x_tap.w == 0) {
+                            dst_row[dx] = lut[c00];
+                        } else {
+                            const c10 = samplePacked2Bit(src_row0 + x_tap.t1);
+                            dst_row[dx] = if (c00 == c10) lut[c00] else lerpArgb256(lut[c00], lut[c10], x_tap.w);
+                        }
+                    }
+                } else {
+                    for (0..cell_w) |dx| {
+                        const x_tap = if (use_x_cache) x_taps_buf[dx] else computeAxisTap(dx, cell_w, embedded.char_width);
+                        const c00 = samplePacked2Bit(src_row0 + x_tap.t0);
+                        const c01 = samplePacked2Bit(src_row1 + x_tap.t0);
+                        if (x_tap.w == 0) {
+                            dst_row[dx] = if (c00 == c01) lut[c00] else lerpArgb256(lut[c00], lut[c01], y_tap.w);
+                        } else {
+                            const c10 = samplePacked2Bit(src_row0 + x_tap.t1);
+                            const c11 = samplePacked2Bit(src_row1 + x_tap.t1);
+                            if (c00 == c10 and c00 == c01 and c00 == c11) {
+                                dst_row[dx] = lut[c00];
+                            } else {
+                                const top = lerpArgb256(lut[c00], lut[c10], x_tap.w);
+                                const bot = lerpArgb256(lut[c01], lut[c11], x_tap.w);
+                                dst_row[dx] = lerpArgb256(top, bot, y_tap.w);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -223,8 +288,9 @@ pub const ShmDraw = struct {
             var prev = &out[n - 1];
             const prev_x1 = prev.x + prev.w;
             const rect_x1 = rect.x + rect.w;
+            const gap = @max(14, rect.w * 2);
             // Coalesce adjacent or nearby horizontal glyph updates on the same row band
-            if (prev.y == rect.y and prev.h == rect.h and rect.x <= prev_x1 + 14 and rect_x1 >= prev.x - 14) {
+            if (prev.y == rect.y and prev.h == rect.h and rect.x <= prev_x1 + gap and rect_x1 >= prev.x - gap) {
                 const nx0 = @min(prev.x, rect.x);
                 const nx1 = @max(prev_x1, rect_x1);
                 prev.x = nx0;
@@ -398,4 +464,59 @@ test "ShmDraw recovers exact Tamzen atlas coordinates and performs incremental c
     try std.testing.expectEqual(@as(usize, 1), n4);
     try std.testing.expectEqual(@as(i32, w), dmg[0].w);
     try std.testing.expectEqual(@as(i32, h), dmg[0].h);
+}
+
+test "ShmDraw HiDPI scaling preserves crisp 2x integer blocks and smooth 1.5x coverage AA" {
+    const bg_col: [4]u8 = .{ 0x3C, 0x6E, 0x84, 0xCC };
+    const bg_argb = ShmDraw.packArgb(bg_col, 255);
+    const fg_argb = ShmDraw.packArgb(.{ 255, 255, 255, 255 }, 255);
+    const glyph_a_uv = embedded.latin1_uvs['A'];
+
+    const quads = [_]QuadVertex{
+        .{
+            .size = .{ 2.0, 2.0 },
+            .pos = .{ -32768, 32767 },
+            .uv = RectDraw.uv_solid,
+            .color = bg_col,
+        },
+        // Full-width single glyph cell (`14x28` at 2x, `11x21` at ~1.5x)
+        .{
+            .size = .{ 2.0, 2.0 },
+            .pos = .{ -32768, 32767 },
+            .uv = glyph_a_uv,
+            .color = bg_col,
+        },
+    };
+
+    // 1. Exact 2.0x integer scale (`14x28` buffer for a `7x14` cell): zero intermediate blur
+    var px_2x: [14 * 28]u32 = @splat(0);
+    var slot_2x: SlotState = .{};
+    var dmg: [max_damage_rects]DamageRect = undefined;
+    _ = ShmDraw.renderSlot(&slot_2x, &px_2x, 14, 28, 1, &quads, 1.0, &dmg);
+    var fg_2x_count: usize = 0;
+    for (px_2x) |p| {
+        // Every pixel at 2x must be strictly pure background or pure foreground (zero blur)
+        try std.testing.expect(p == bg_argb or p == fg_argb);
+        if (p == fg_argb) fg_2x_count += 1;
+    }
+    try std.testing.expect(fg_2x_count > 0);
+    // Each 2x2 block must be uniform
+    for (0..14) |ty| {
+        for (0..7) |tx| {
+            const p00 = px_2x[(ty * 2) * 14 + (tx * 2)];
+            try std.testing.expectEqual(p00, px_2x[(ty * 2) * 14 + (tx * 2 + 1)]);
+            try std.testing.expectEqual(p00, px_2x[(ty * 2 + 1) * 14 + (tx * 2)]);
+            try std.testing.expectEqual(p00, px_2x[(ty * 2 + 1) * 14 + (tx * 2 + 1)]);
+        }
+    }
+
+    // 2. Fractional ~1.5x scale (`11x21` buffer for a `7x14` cell): produces coverage-blended edge pixels
+    var px_15x: [11 * 21]u32 = @splat(0);
+    var slot_15x: SlotState = .{};
+    _ = ShmDraw.renderSlot(&slot_15x, &px_15x, 11, 21, 1, &quads, 1.0, &dmg);
+    var blended_count: usize = 0;
+    for (px_15x) |p| {
+        if (p != bg_argb and p != fg_argb) blended_count += 1;
+    }
+    try std.testing.expect(blended_count > 0);
 }

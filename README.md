@@ -8,8 +8,9 @@ Ultra-low-overhead Linux status bar written in **Zig 0.17.1**, supporting native
 - **Standalone Single Binary:** `assets/font/tamzen.json` and `assets/font/tamzen.png` are baked into `.rodata` at build time (`tools/bake_font.zig`), requiring zero external assets or Zig package dependencies at runtime.
 - **Zero Polling While Hidden:** In `auto-hide` mode, `zigbar` shrinks its input region to a `1px` top-edge strip and suspends indefinitely inside kernel `poll(..., -1)` (`0 Hz` timers, `0` `/proc` reads, `0` GPU draws). Last-viewed metric state is preserved across sleep so revealing the bar glimpses its previous state and smoothly catches up at VSync.
 - **Framerate-Free Hardware VSync Interpolation:** Samples live Linux metrics (`/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`, `/proc/self/mountinfo`, `/sys/class/hwmon`, `sysinfo`, `localtime_r`) at `8 Hz` while visible and interpolates `prev -> target` smoothly locked to your monitor's native VSync refresh rate when values change — sleeping in `poll()` whenever steady.
-- **Native Wayland & X11 Window Titles + Struts:**
-  - **Wayland Layer-Shell:** Real `17px` exclusive-zone top struts on KDE Plasma 6 Wayland, Sway, Hyprland, River, Niri, and Labwc.
+- **Native Wayland & X11 Window Titles, HiDPI, + Struts:**
+  - **Fractional & Integer Wayland HiDPI:** Native `wp_fractional_scale_v1` + `wp_viewporter` + `wl_compositor` v6 (`preferred_buffer_scale` / `wl_output.scale`) buffer scaling with bit-exact `2x`/`3x` integer blocks and sub-texel box-coverage antialiasing at fractional scales (`125%`, `150%`, `175%`).
+  - **Wayland Layer-Shell:** Real `17px` exclusive-zone top struts on KDE Plasma 6 Wayland, Sway, Hyprland, River, Niri, and Labwc, with seamless DPMS sleep & monitor hotplug recovery.
   - **Event-Driven Window Titles:** Uses `zwlr_foreign_toplevel_management_v1` on wlroots compositors, event-driven `org.kde.kwin.Scripting` (`sd-bus`) on KDE Plasma Wayland (covering both native Wayland and Xwayland apps), and `PropertyChangeMask` (`_NET_ACTIVE_WINDOW`) on X11.
 
 ## Build & Install

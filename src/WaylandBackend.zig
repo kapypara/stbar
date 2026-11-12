@@ -80,6 +80,17 @@ pub const WaylandBackend = struct {
 
     layer_shell: ?*c.struct_zwlr_layer_shell_v1 = null,
     layer_surface: ?*c.struct_zwlr_layer_surface_v1 = null,
+    wp_viewporter: ?*c.struct_wp_viewporter = null,
+    wp_viewport: ?*c.struct_wp_viewport = null,
+    fractional_scale_mgr: ?*c.struct_wp_fractional_scale_manager_v1 = null,
+    fractional_scale_obj: ?*c.struct_wp_fractional_scale_v1 = null,
+    entered_output: ?*c.struct_wl_output = null,
+    scale_120: u32 = 120,
+    has_preferred_fractional_scale: bool = false,
+    has_preferred_buffer_scale: bool = false,
+    applied_buffer_scale: i32 = 1,
+    applied_vp_w: i32 = -1,
+    applied_vp_h: i32 = -1,
     outputs: [max_outputs]OutputSlot = @splat(.{}),
     bound_output: ?*c.struct_wl_output = null,
     target_output: [64]u8 = @splat(0),
@@ -247,6 +258,89 @@ pub const WaylandBackend = struct {
         return self.outputs[idx].handle;
     }
 
+    /// Computes physical buffer dimension for `logical_px` at `scale_120` (`120` = `1.0x`),
+    /// rounding halfway away from zero per `fractional-scale-v1` specification.
+    pub fn scaledDim(logical_px: i32, scale_120: u32) i32 {
+        const l: u64 = @intCast(@max(1, logical_px));
+        const s: u64 = @max(60, scale_120);
+        return @intCast(@max(1, (l * s + 60) / 120));
+    }
+
+    pub fn effectiveScale120(self: *const WaylandBackend) u32 {
+        if (self.wp_viewport != null) {
+            return @max(60, self.scale_120);
+        }
+        if (self.compositor_version >= 3) {
+            const int_s: u32 = @max(1, (self.scale_120 + 60) / 120);
+            return int_s * 120;
+        }
+        return 120;
+    }
+
+    pub fn bufferSize(self: *const WaylandBackend) struct { w: i32, h: i32 } {
+        const s = self.effectiveScale120();
+        return .{
+            .w = scaledDim(self.width, s),
+            .h = scaledDim(self.height, s),
+        };
+    }
+
+    fn seedInitialScaleFromOutputs(self: *WaylandBackend, chosen_output: ?*c.struct_wl_output) u32 {
+        if (chosen_output) |target| {
+            for (&self.outputs) |*slot| {
+                if (slot.handle == target and slot.ready) {
+                    return @as(u32, @intCast(@max(1, slot.scale))) * 120;
+                }
+            }
+        }
+        for (&self.outputs) |*slot| {
+            if (slot.handle != null and slot.ready) {
+                return @as(u32, @intCast(@max(1, slot.scale))) * 120;
+            }
+        }
+        return 120;
+    }
+
+    fn stageSurfaceScale(self: *WaylandBackend) void {
+        const surf = self.wl_surface orelse return;
+        const log_w = @max(1, self.width);
+        const log_h = @max(1, self.height);
+
+        if (self.wp_viewport) |vp| {
+            if (self.compositor_version >= 3 and self.applied_buffer_scale != 1) {
+                c.wl_surface_set_buffer_scale(surf, 1);
+                self.applied_buffer_scale = 1;
+            }
+            if (self.applied_vp_w != log_w or self.applied_vp_h != log_h) {
+                c.wp_viewport_set_destination(vp, log_w, log_h);
+                self.applied_vp_w = log_w;
+                self.applied_vp_h = log_h;
+            }
+        } else if (self.compositor_version >= 3) {
+            const int_scale: i32 = @intCast(@max(1, self.effectiveScale120() / 120));
+            if (self.applied_buffer_scale != int_scale) {
+                c.wl_surface_set_buffer_scale(surf, int_scale);
+                self.applied_buffer_scale = int_scale;
+            }
+        }
+    }
+
+    fn syncEglWindow(self: *WaylandBackend) void {
+        if (self.render_mode != .egl) return;
+        self.stageSurfaceScale();
+        if (self.egl_window) |win| {
+            const buf = self.bufferSize();
+            c.wl_egl_window_resize(win, buf.w, buf.h, 0, 0);
+        }
+    }
+
+    fn onScaleChanged(self: *WaylandBackend) void {
+        if (!self.configured or self.wl_surface == null) return;
+        self.syncEglWindow();
+        self.resized = true;
+        self.exposed = true;
+    }
+
     fn releaseOutputSlot(slot: *OutputSlot) void {
         if (slot.handle) |out| {
             if (slot.bound_version >= 3) {
@@ -301,6 +395,14 @@ pub const WaylandBackend = struct {
             self.toplevel_manager = null;
         }
 
+        if (self.fractional_scale_obj) |fs| {
+            c.wp_fractional_scale_v1_destroy(fs);
+            self.fractional_scale_obj = null;
+        }
+        if (self.wp_viewport) |vp| {
+            c.wp_viewport_destroy(vp);
+            self.wp_viewport = null;
+        }
         if (self.layer_surface) |ls| {
             c.zwlr_layer_surface_v1_destroy(ls);
             self.layer_surface = null;
@@ -310,8 +412,17 @@ pub const WaylandBackend = struct {
             self.wl_surface = null;
         }
         self.bound_output = null;
+        self.entered_output = null;
         for (&self.outputs) |*out_slot| {
             releaseOutputSlot(out_slot);
+        }
+        if (self.fractional_scale_mgr) |mgr| {
+            c.wp_fractional_scale_manager_v1_destroy(mgr);
+            self.fractional_scale_mgr = null;
+        }
+        if (self.wp_viewporter) |vpr| {
+            c.wp_viewporter_destroy(vpr);
+            self.wp_viewporter = null;
         }
         if (self.layer_shell) |shell| {
             c.zwlr_layer_shell_v1_destroy(shell);
@@ -382,6 +493,14 @@ pub const WaylandBackend = struct {
             slot.busy = false;
             slot.state.invalidate();
         }
+        if (self.fractional_scale_obj) |fs| {
+            c.wp_fractional_scale_v1_destroy(fs);
+            self.fractional_scale_obj = null;
+        }
+        if (self.wp_viewport) |vp| {
+            c.wp_viewport_destroy(vp);
+            self.wp_viewport = null;
+        }
         if (self.layer_surface) |ls| {
             c.zwlr_layer_surface_v1_destroy(ls);
             self.layer_surface = null;
@@ -391,6 +510,12 @@ pub const WaylandBackend = struct {
             self.wl_surface = null;
         }
         self.bound_output = null;
+        self.entered_output = null;
+        self.has_preferred_fractional_scale = false;
+        self.has_preferred_buffer_scale = false;
+        self.applied_buffer_scale = 1;
+        self.applied_vp_w = -1;
+        self.applied_vp_h = -1;
         self.configured = false;
         self.pointer_inside = false;
         self.applied_input_height = -1;
@@ -442,10 +567,31 @@ pub const WaylandBackend = struct {
 
         const chosen_output = self.selectTargetOutput();
         self.bound_output = chosen_output;
+        self.entered_output = chosen_output;
+        self.scale_120 = self.seedInitialScaleFromOutputs(chosen_output);
+        self.has_preferred_fractional_scale = false;
+        self.has_preferred_buffer_scale = false;
+        self.applied_buffer_scale = 1;
+        self.applied_vp_w = -1;
+        self.applied_vp_h = -1;
         self.configured = false;
         self.applied_input_height = -1;
 
         self.wl_surface = c.wl_compositor_create_surface(comp) orelse return error.CreateSurfaceFailed;
+        _ = c.wl_surface_add_listener(self.wl_surface, &surface_listener, self);
+
+        if (self.wp_viewporter) |vpr| {
+            self.wp_viewport = c.wp_viewporter_get_viewport(vpr, self.wl_surface);
+        }
+        if (self.wp_viewport != null) {
+            if (self.fractional_scale_mgr) |fsm| {
+                self.fractional_scale_obj = c.wp_fractional_scale_manager_v1_get_fractional_scale(fsm, self.wl_surface);
+                if (self.fractional_scale_obj) |fs| {
+                    _ = c.wp_fractional_scale_v1_add_listener(fs, &fractional_scale_listener, self);
+                }
+            }
+        }
+
         self.layer_surface = c.zwlr_layer_shell_v1_get_layer_surface(
             shell,
             self.wl_surface,
@@ -547,10 +693,12 @@ pub const WaylandBackend = struct {
     }
 
     fn createEglSurface(self: *WaylandBackend) !void {
+        self.stageSurfaceScale();
+        const buf = self.bufferSize();
         self.egl_window = c.wl_egl_window_create(
             self.wl_surface,
-            @max(1, self.width),
-            @max(1, self.height),
+            buf.w,
+            buf.h,
         ) orelse return error.WlEglWindowCreateFailed;
 
         self.egl_surface = c.eglCreatePlatformWindowSurface(
@@ -664,8 +812,9 @@ pub const WaylandBackend = struct {
         const shm = self.wl_shm orelse return error.NoWlShm;
         self.destroyShmBuffers();
 
-        const w: i32 = @max(1, self.width);
-        const h: i32 = @max(1, self.height);
+        const buf = self.bufferSize();
+        const w: i32 = buf.w;
+        const h: i32 = buf.h;
         const stride: i32 = w * 4;
         const pixels_per_slot: usize = @intCast(w * h);
         const frame_bytes: usize = pixels_per_slot * @sizeOf(u32);
@@ -737,7 +886,16 @@ pub const WaylandBackend = struct {
         if (self.compositor_version >= 4) {
             c.wl_surface_damage_buffer(surf, x, y, w, h);
         } else {
-            c.wl_surface_damage(surf, x, y, w, h);
+            const s: i64 = @intCast(self.effectiveScale120());
+            if (s == 120) {
+                c.wl_surface_damage(surf, x, y, w, h);
+            } else {
+                const lx0: i32 = @intCast(@divFloor(@as(i64, x) * 120, s));
+                const ly0: i32 = @intCast(@divFloor(@as(i64, y) * 120, s));
+                const lx1: i32 = @intCast(@divFloor(@as(i64, x + w) * 120 + s - 1, s));
+                const ly1: i32 = @intCast(@divFloor(@as(i64, y + h) * 120 + s - 1, s));
+                c.wl_surface_damage(surf, lx0, ly0, @max(1, lx1 - lx0), @max(1, ly1 - ly0));
+            }
         }
     }
 
@@ -751,8 +909,9 @@ pub const WaylandBackend = struct {
         const surf = self.wl_surface orelse return;
         const dpy = self.wl_display orelse return;
 
-        const target_w = @max(1, self.width);
-        const target_h = @max(1, self.height);
+        const buf = self.bufferSize();
+        const target_w = buf.w;
+        const target_h = buf.h;
         if (self.shm_pool == null or self.shm_width != target_w or self.shm_height != target_h) {
             try self.recreateShmBuffers();
         }
@@ -773,6 +932,7 @@ pub const WaylandBackend = struct {
         if (dmg_count == 0) {
             if (self.needs_configure_commit) {
                 self.needs_configure_commit = false;
+                self.stageSurfaceScale();
                 c.wl_surface_commit(surf);
                 _ = c.wl_display_flush(dpy);
             }
@@ -788,6 +948,7 @@ pub const WaylandBackend = struct {
 
         slot.busy = true;
         self.needs_configure_commit = false;
+        self.stageSurfaceScale();
         c.wl_surface_attach(surf, slot.wl_buffer, 0, 0);
         for (dmg[0..dmg_count]) |r| {
             self.damageSurface(r.x, r.y, r.w, r.h);
@@ -826,8 +987,9 @@ pub const WaylandBackend = struct {
                     c.wl_callback_destroy(cb);
                     self.frame_cb = null;
                 }
-                const target_w = @max(1, self.width);
-                const target_h = @max(1, self.height);
+                const buf = self.bufferSize();
+                const target_w = buf.w;
+                const target_h = buf.h;
                 if (self.shm_pool == null or self.shm_width != target_w or self.shm_height != target_h) {
                     self.recreateShmBuffers() catch return;
                 }
@@ -839,6 +1001,7 @@ pub const WaylandBackend = struct {
                 slot.state.last_opacity_u8 = 0;
                 slot.busy = true;
                 self.needs_configure_commit = false;
+                self.stageSurfaceScale();
                 c.wl_surface_attach(surf, slot.wl_buffer, 0, 0);
                 self.damageSurface(0, 0, self.shm_width, self.shm_height);
                 c.wl_surface_commit(surf);
@@ -849,7 +1012,8 @@ pub const WaylandBackend = struct {
 
     pub fn updateViewport(self: *const WaylandBackend) void {
         if (self.render_mode == .egl) {
-            c.glViewport(0, 0, self.width, self.height);
+            const buf = self.bufferSize();
+            c.glViewport(0, 0, buf.w, buf.h);
         }
     }
 
@@ -1044,7 +1208,7 @@ pub const WaylandBackend = struct {
         const iface = std.mem.span(interface_ptr);
 
         if (std.mem.eql(u8, iface, "wl_compositor")) {
-            const bound_ver = @min(version, 4);
+            const bound_ver = @min(version, 6);
             self.compositor_version = bound_ver;
             self.wl_compositor = @ptrCast(c.wl_registry_bind(
                 registry,
@@ -1117,6 +1281,24 @@ pub const WaylandBackend = struct {
                     1,
                 ));
             }
+        } else if (std.mem.eql(u8, iface, "wp_viewporter")) {
+            if (self.wp_viewporter == null) {
+                self.wp_viewporter = @ptrCast(c.wl_registry_bind(
+                    registry,
+                    name,
+                    &c.wp_viewporter_interface,
+                    1,
+                ));
+            }
+        } else if (std.mem.eql(u8, iface, "wp_fractional_scale_manager_v1")) {
+            if (self.fractional_scale_mgr == null) {
+                self.fractional_scale_mgr = @ptrCast(c.wl_registry_bind(
+                    registry,
+                    name,
+                    &c.wp_fractional_scale_manager_v1_interface,
+                    1,
+                ));
+            }
         } else if (std.mem.eql(u8, iface, "wl_output")) {
             for (&self.outputs) |*slot| {
                 if (slot.handle == null) {
@@ -1151,6 +1333,9 @@ pub const WaylandBackend = struct {
         const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
         for (&self.outputs) |*slot| {
             if (slot.handle != null and slot.global_name == name) {
+                if (self.entered_output == slot.handle) {
+                    self.entered_output = null;
+                }
                 if (self.bound_output != null and slot.handle == self.bound_output) {
                     self.teardownLayerSurface();
                 }
@@ -1197,7 +1382,96 @@ pub const WaylandBackend = struct {
         if (slot.owner) |owner| {
             if (owner.surface_lost) {
                 owner.pending_surface_rebind = true;
+            } else if (!owner.has_preferred_fractional_scale and !owner.has_preferred_buffer_scale) {
+                const active_out = owner.entered_output orelse owner.bound_output;
+                if (active_out == null or active_out == slot.handle) {
+                    const next_s: u32 = @as(u32, @intCast(@max(1, slot.scale))) * 120;
+                    if (next_s != owner.scale_120) {
+                        owner.scale_120 = next_s;
+                        owner.onScaleChanged();
+                    }
+                }
             }
+        }
+    }
+
+    const surface_listener = c.struct_wl_surface_listener{
+        .enter = surfaceEnter,
+        .leave = surfaceLeave,
+        .preferred_buffer_scale = surfacePreferredBufferScale,
+        .preferred_buffer_transform = surfacePreferredBufferTransform,
+    };
+
+    fn surfaceEnter(
+        data: ?*anyopaque,
+        _: ?*c.struct_wl_surface,
+        output: ?*c.struct_wl_output,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        self.entered_output = output;
+        if (self.has_preferred_fractional_scale or self.has_preferred_buffer_scale) return;
+        if (output) |out| {
+            for (&self.outputs) |*slot| {
+                if (slot.handle == out and slot.ready) {
+                    const next_s: u32 = @as(u32, @intCast(@max(1, slot.scale))) * 120;
+                    if (next_s != self.scale_120) {
+                        self.scale_120 = next_s;
+                        self.onScaleChanged();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    fn surfaceLeave(
+        data: ?*anyopaque,
+        _: ?*c.struct_wl_surface,
+        output: ?*c.struct_wl_output,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.entered_output == output) {
+            self.entered_output = null;
+        }
+    }
+
+    fn surfacePreferredBufferScale(
+        data: ?*anyopaque,
+        _: ?*c.struct_wl_surface,
+        factor: i32,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (factor <= 0) return;
+        self.has_preferred_buffer_scale = true;
+        if (self.has_preferred_fractional_scale) return;
+        const next_s: u32 = @as(u32, @intCast(factor)) * 120;
+        if (next_s != self.scale_120) {
+            self.scale_120 = next_s;
+            self.onScaleChanged();
+        }
+    }
+
+    fn surfacePreferredBufferTransform(
+        _: ?*anyopaque,
+        _: ?*c.struct_wl_surface,
+        _: u32,
+    ) callconv(.c) void {}
+
+    const fractional_scale_listener = c.struct_wp_fractional_scale_v1_listener{
+        .preferred_scale = fractionalScalePreferred,
+    };
+
+    fn fractionalScalePreferred(
+        data: ?*anyopaque,
+        _: ?*c.struct_wp_fractional_scale_v1,
+        scale: u32,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (scale == 0) return;
+        self.has_preferred_fractional_scale = true;
+        if (scale != self.scale_120) {
+            self.scale_120 = scale;
+            self.onScaleChanged();
         }
     }
 
@@ -1241,11 +1515,7 @@ pub const WaylandBackend = struct {
         self.height = resolved_h;
 
         if (size_changed) {
-            if (self.render_mode == .egl) {
-                if (self.egl_window) |win| {
-                    c.wl_egl_window_resize(win, @max(1, self.width), @max(1, self.height), 0, 0);
-                }
-            }
+            self.syncEglWindow();
             if (width_changed and self.applied_input_height == 1) {
                 self.stageInputRegion(1);
             }
@@ -1977,4 +2247,27 @@ test "WaylandBackend.findOutputSlot matches default, exact, and case-insensitive
     try std.testing.expectEqual(@as(?usize, null), WaylandBackend.findOutputSlot(&slots, "DP-1"));
     // Disconnected connector returns null
     try std.testing.expectEqual(@as(?usize, null), WaylandBackend.findOutputSlot(&slots, "DP-9"));
+}
+
+test "WaylandBackend.scaledDim computes exact integer and fractional HiDPI buffer dimensions" {
+    // 1.00x (`120 / 120`)
+    try std.testing.expectEqual(@as(i32, 1920), WaylandBackend.scaledDim(1920, 120));
+    try std.testing.expectEqual(@as(i32, 17), WaylandBackend.scaledDim(17, 120));
+
+    // 1.25x (`150 / 120`): 1920 * 1.25 = 2400; 17 * 1.25 = 21.25 -> 21
+    try std.testing.expectEqual(@as(i32, 2400), WaylandBackend.scaledDim(1920, 150));
+    try std.testing.expectEqual(@as(i32, 21), WaylandBackend.scaledDim(17, 150));
+
+    // 1.50x (`180 / 120`): 1280 * 1.5 = 1920; 17 * 1.5 = 25.5 -> 26 (halfway away from zero)
+    try std.testing.expectEqual(@as(i32, 1920), WaylandBackend.scaledDim(1280, 180));
+    try std.testing.expectEqual(@as(i32, 26), WaylandBackend.scaledDim(17, 180));
+
+    // 1.75x (`210 / 120`): 1920 * 1.75 = 3360; 17 * 1.75 = 29.75 -> 30
+    try std.testing.expectEqual(@as(i32, 3360), WaylandBackend.scaledDim(1920, 210));
+    try std.testing.expectEqual(@as(i32, 30), WaylandBackend.scaledDim(17, 210));
+
+    // 2.00x (`240 / 120`) and 3.00x (`360 / 120`)
+    try std.testing.expectEqual(@as(i32, 3840), WaylandBackend.scaledDim(1920, 240));
+    try std.testing.expectEqual(@as(i32, 34), WaylandBackend.scaledDim(17, 240));
+    try std.testing.expectEqual(@as(i32, 51), WaylandBackend.scaledDim(17, 360));
 }

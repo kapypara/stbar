@@ -64,7 +64,10 @@ pub const RectDraw = struct {
         \\    vec4 bg_color;
         \\} vs_in[];
         \\uniform vec2 tex_size;
-        \\out vec2 texcoord_frag;
+        \\uniform sampler2D tex;
+        \\out vec2 local_uv;
+        \\flat out ivec2 cell_origin;
+        \\flat out ivec2 cell_extent;
         \\flat out vec4 bg_frag;
         \\flat out int solid_frag;
         \\void main() {
@@ -74,23 +77,28 @@ pub const RectDraw = struct {
         \\    }
         \\    solid_frag = (uv.y > 0.99) ? 1 : 0;
         \\    bg_frag = vs_in[0].bg_color;
+        \\    vec2 atlas_f = vec2(textureSize(tex, 0));
+        \\    ivec2 c_sz = max(ivec2(round(tex_size * atlas_f)), ivec2(1));
+        \\    cell_extent = c_sz;
+        \\    cell_origin = ivec2(round(uv * atlas_f));
+        \\    vec2 ext_f = vec2(c_sz);
         \\    vec2 p = vs_in[0].point;
         \\    vec2 s = vs_in[0].rect_size;
         \\
         \\    gl_Position = vec4(p, 0.0, 1.0);
-        \\    texcoord_frag = uv;
+        \\    local_uv = vec2(0.0, 0.0);
         \\    EmitVertex();
         \\
         \\    gl_Position = vec4(p.x, p.y - s.y, 0.0, 1.0);
-        \\    texcoord_frag = vec2(uv.x, uv.y + tex_size.y);
+        \\    local_uv = vec2(0.0, ext_f.y);
         \\    EmitVertex();
         \\
         \\    gl_Position = vec4(p.x + s.x, p.y, 0.0, 1.0);
-        \\    texcoord_frag = vec2(uv.x + tex_size.x, uv.y);
+        \\    local_uv = vec2(ext_f.x, 0.0);
         \\    EmitVertex();
         \\
         \\    gl_Position = vec4(p.x + s.x, p.y - s.y, 0.0, 1.0);
-        \\    texcoord_frag = vec2(uv.x + tex_size.x, uv.y + tex_size.y);
+        \\    local_uv = ext_f;
         \\    EmitVertex();
         \\
         \\    EndPrimitive();
@@ -99,7 +107,9 @@ pub const RectDraw = struct {
 
     const fs_source =
         \\#version 150 core
-        \\in vec2 texcoord_frag;
+        \\in vec2 local_uv;
+        \\flat in ivec2 cell_origin;
+        \\flat in ivec2 cell_extent;
         \\flat in vec4 bg_frag;
         \\flat in int solid_frag;
         \\uniform sampler2D tex;
@@ -108,7 +118,18 @@ pub const RectDraw = struct {
         \\void main() {
         \\    vec4 base = bg_frag;
         \\    if (solid_frag == 0) {
-        \\        vec4 fg = texture(tex, texcoord_frag);
+        \\        vec2 fw = max(fwidth(local_uv), vec2(1e-4));
+        \\        vec2 u0 = local_uv - 0.5 * fw;
+        \\        vec2 u1 = local_uv + 0.5 * fw;
+        \\        ivec2 max_c = cell_extent - ivec2(1);
+        \\        ivec2 t0 = clamp(ivec2(floor(u0)), ivec2(0), max_c);
+        \\        ivec2 t1 = clamp(ivec2(floor(u1 - 1e-4)), ivec2(0), max_c);
+        \\        vec2 w = clamp((u1 - vec2(t1)) / fw, 0.0, 1.0) * vec2(notEqual(t0, t1));
+        \\        vec4 c00 = texelFetch(tex, cell_origin + t0, 0);
+        \\        vec4 c10 = texelFetch(tex, cell_origin + ivec2(t1.x, t0.y), 0);
+        \\        vec4 c01 = texelFetch(tex, cell_origin + ivec2(t0.x, t1.y), 0);
+        \\        vec4 c11 = texelFetch(tex, cell_origin + t1, 0);
+        \\        vec4 fg = mix(mix(c00, c10, w.x), mix(c01, c11, w.x), w.y);
         \\        base = mix(bg_frag, fg, fg.a);
         \\    }
         \\    frag_color = base * u_opacity;
