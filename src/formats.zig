@@ -145,6 +145,70 @@ pub fn temperature(input: u64) [2]u8 {
     };
 }
 
+pub fn batteryPct(input: u64) [3]u8 {
+    if (input >= 100) return "100".*;
+    const tens: u8 = @intCast(input / 10);
+    const ones: u8 = @intCast(input % 10);
+    return .{
+        ' ',
+        if (input >= 10) '0' + tens else ' ',
+        '0' + ones,
+    };
+}
+
+pub const PowerFlow = enum(u8) {
+    maintaining = 0,
+    discharging = 1,
+    charging = 2,
+};
+
+/// Auto-ranging 5-cell Watt formatter for desktops (`" 4.9W"` .. `"99.9W"`, `" 125W"` .. `" 999W"`, `"1.0kW"` .. `"9.9kW"`).
+pub fn watts(tenths_w: u64) [5]u8 {
+    if (tenths_w < 1000) {
+        const d = extractDigits(3, tenths_w);
+        return .{
+            if (d[2] != 0) '0' + d[2] else ' ',
+            '0' + d[1],
+            '.',
+            '0' + d[0],
+            'W',
+        };
+    }
+    if (tenths_w < 9995) {
+        const whole_w = (tenths_w + 5) / 10;
+        const d = extractDigits(3, whole_w);
+        return .{ ' ', '0' + d[2], '0' + d[1], '0' + d[0], 'W' };
+    }
+    const tenths_kw = @min((tenths_w + 500) / 1000, 99);
+    const d = extractDigits(2, tenths_kw);
+    return .{ '0' + d[1], '.', '0' + d[0], 'k', 'W' };
+}
+
+/// Auto-ranging 6-cell signed Watt formatter (`'+'` charging, `'-'` discharging, `' '` maintaining — never `'='`).
+pub fn signedWatts(tenths_w: u64, flow: PowerFlow) [6]u8 {
+    const sign: u8 = switch (flow) {
+        .maintaining => ' ',
+        .discharging => '-',
+        .charging => '+',
+    };
+    if (tenths_w < 100) {
+        const d = extractDigits(2, tenths_w);
+        return .{ ' ', sign, '0' + d[1], '.', '0' + d[0], 'W' };
+    }
+    if (tenths_w < 1000) {
+        const d = extractDigits(3, tenths_w);
+        return .{ sign, '0' + d[2], '0' + d[1], '.', '0' + d[0], 'W' };
+    }
+    if (tenths_w < 9995) {
+        const whole_w = (tenths_w + 5) / 10;
+        const d = extractDigits(3, whole_w);
+        return .{ ' ', sign, '0' + d[2], '0' + d[1], '0' + d[0], 'W' };
+    }
+    const tenths_kw = @min((tenths_w + 500) / 1000, 99);
+    const d = extractDigits(2, tenths_kw);
+    return .{ sign, '0' + d[1], '.', '0' + d[0], 'k', 'W' };
+}
+
 test "Pure integer metric formatters" {
     try std.testing.expectEqualStrings(" --", &cpuUsage(0));
     try std.testing.expectEqualStrings(" 05", &cpuUsage(5));
@@ -167,4 +231,23 @@ test "Pure integer metric formatters" {
     try std.testing.expectEqualStrings("000\n0B", &generic(0));
     try std.testing.expectEqualStrings(" 9", &temperature(9));
     try std.testing.expectEqualStrings("54", &temperature(54));
+
+    try std.testing.expectEqualStrings("  5", &batteryPct(5));
+    try std.testing.expectEqualStrings(" 98", &batteryPct(98));
+    try std.testing.expectEqualStrings("100", &batteryPct(100));
+
+    try std.testing.expectEqualStrings(" 0.0W", &watts(0));
+    try std.testing.expectEqualStrings(" 4.9W", &watts(49));
+    try std.testing.expectEqualStrings("14.2W", &watts(142));
+    try std.testing.expectEqualStrings(" 125W", &watts(1254));
+    try std.testing.expectEqualStrings("1.3kW", &watts(12600));
+
+    try std.testing.expectEqualStrings(" -4.9W", &signedWatts(49, .discharging));
+    try std.testing.expectEqualStrings("-14.2W", &signedWatts(142, .discharging));
+    try std.testing.expectEqualStrings("  4.9W", &signedWatts(49, .maintaining));
+    try std.testing.expectEqualStrings(" 10.0W", &signedWatts(100, .maintaining));
+    try std.testing.expectEqualStrings(" +5.4W", &signedWatts(54, .charging));
+    try std.testing.expectEqualStrings("+38.5W", &signedWatts(385, .charging));
+    try std.testing.expectEqualStrings(" +140W", &signedWatts(1400, .charging));
+    try std.testing.expectEqualStrings("-1.2kW", &signedWatts(12000, .discharging));
 }

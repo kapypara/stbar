@@ -46,6 +46,8 @@ pub const MetricTag = enum {
     net,
     temp,
     load,
+    power,
+    battery,
     window,
     free_storage,
     time,
@@ -58,6 +60,8 @@ pub const Metric = union(MetricTag) {
     net: NetProbe,
     temp: TempProbe,
     load: LoadProbe,
+    power: PowerProbe,
+    battery: BatteryView,
     window: WindowNameProbe,
     free_storage: StorageProbe,
     time: TimeProbe,
@@ -70,6 +74,8 @@ pub const Metric = union(MetricTag) {
             .net => |*p| p.sample(io),
             .temp => |*p| p.sample(io),
             .load => |*p| p.sample(),
+            .power => |*p| p.sample(io),
+            .battery => |*p| p.sample(),
             .window => |*p| p.sample(),
             .free_storage => |*p| p.sample(io),
             .time => |*p| p.sample(io),
@@ -83,8 +89,9 @@ pub const Metric = union(MetricTag) {
             .io => |*p| p.deinit(io),
             .net => |*p| p.deinit(io),
             .temp => |*p| p.deinit(io),
+            .power => |*p| p.deinit(io),
             .free_storage => |*p| p.deinit(io),
-            .load, .window, .time => {},
+            .load, .battery, .window, .time => {},
         }
     }
 
@@ -93,11 +100,13 @@ pub const Metric = union(MetricTag) {
             .cpu => |*p| p.current_pct,
             .temp => |*p| p.value,
             .load => |*p| p.value,
+            .battery => |*p| p.value,
             .free_storage => |*p| p.free_bytes,
 
             .memory => |*p| if (idx == 0) p.free else p.dirty,
             .io => |*p| if (idx == 0) p.current.read else p.current.write,
             .net => |*p| if (idx == 0) p.current.rx else p.current.tx,
+            .power => |*p| p.effective_tenths_w,
 
             .window => 0,
             .time => 0,
@@ -119,6 +128,7 @@ pub const Metric = union(MetricTag) {
             .cpu => write(&result, formats.cpuUsage(value)),
             .temp => write(&result, formats.temperature(value)),
             .load => write(&result, formats.systemLoad(value)),
+            .battery => write(&result, formats.batteryPct(value)),
             .free_storage => write(&result, formats.freeSpace(value)),
 
             .memory => if (idx == 0) {
@@ -127,6 +137,11 @@ pub const Metric = union(MetricTag) {
             } else write(&result, formats.generic(value)),
             .io => write(&result, formats.generic(value)),
             .net => write(&result, formats.generic(value)),
+            .power => |*p| if (p.has_battery) {
+                write(&result, formats.signedWatts(value, p.flow_state));
+            } else {
+                write(&result, formats.watts(value));
+            },
 
             else => unreachable,
         }
@@ -461,6 +476,288 @@ pub const LoadProbe = struct {
         var info: std.os.linux.Sysinfo = undefined;
         if (std.os.linux.sysinfo(&info) == 0) {
             self.value = info.loads[0] / ((@as(u64, 1) << 16) / 100);
+        }
+    }
+};
+
+/// Samples single effective machine wattage (`effective_tenths_w`), power flow state (`flow_state`:
+/// `.discharging` `-`, `.charging` `+`, `.maintaining` ` `), and battery `%` (`capacity_pct`):
+/// - Discharging (`BAT*` `Discharging`): whole-machine battery discharge rail (`-`).
+/// - Charging (`BAT*` `Charging`): total effective charger draw (`component_uw + charging_uw`, `+`).
+/// - Maintaining / Desktop: live non-overlapping `hwmon` component power (`CPU/APU + GPUs + NVMe + NIC + PSU`, ` `).
+pub const PowerProbe = struct {
+    const max_batteries = 4;
+    const max_hwmon_sensors = 16;
+
+    const BatterySlot = struct {
+        status_fd: ?Io.File = null,
+        capacity_fd: ?Io.File = null,
+        power_fd: ?Io.File = null,
+        current_fd: ?Io.File = null,
+        voltage_fd: ?Io.File = null,
+
+        fn closeAll(self: *BatterySlot, io: Io) void {
+            closeSlot(&self.status_fd, io);
+            closeSlot(&self.capacity_fd, io);
+            closeSlot(&self.power_fd, io);
+            closeSlot(&self.current_fd, io);
+            closeSlot(&self.voltage_fd, io);
+        }
+    };
+
+    const HwmonPowerSlot = struct {
+        file: ?Io.File = null,
+        is_cpu_only: bool = false,
+    };
+
+    searched: bool = false,
+    has_battery: bool = false,
+    has_power_sensor: bool = false,
+    flow_state: formats.PowerFlow = .maintaining,
+    batteries: [max_batteries]BatterySlot = @splat(.{}),
+    battery_count: usize = 0,
+    hwmon_slots: [max_hwmon_sensors]HwmonPowerSlot = @splat(.{}),
+    hwmon_count: usize = 0,
+
+    capacity_pct: u64 = 0,
+    effective_tenths_w: u64 = 0,
+
+    pub fn deinit(self: *PowerProbe, io: Io) void {
+        for (&self.batteries) |*b| b.closeAll(io);
+        for (&self.hwmon_slots) |*h| closeSlot(&h.file, io);
+        self.battery_count = 0;
+        self.hwmon_count = 0;
+    }
+
+    /// Excludes `/sys/class/hwmon` mirrors of `/sys/class/power_supply` (`BAT*`, `AC*`, `ucsi*`, `hid-*`)
+    /// so battery charge speed or USB-C PDO limits are never mixed into component consumption.
+    pub fn isPowerSupplyHwmonMirror(driver_name: []const u8) bool {
+        return mem.startsWith(u8, driver_name, "BAT") or
+            mem.startsWith(u8, driver_name, "AC") or
+            mem.startsWith(u8, driver_name, "ADP") or
+            mem.startsWith(u8, driver_name, "ucsi") or
+            mem.startsWith(u8, driver_name, "hid-") or
+            mem.startsWith(u8, driver_name, "sbs-");
+    }
+
+    pub fn isCpuOnlyPowerDriver(driver_name: []const u8) bool {
+        return mem.eql(u8, driver_name, "zenpower") or
+            mem.eql(u8, driver_name, "zenergy") or
+            mem.eql(u8, driver_name, "amd_energy") or
+            mem.eql(u8, driver_name, "fam15h_power");
+    }
+
+    fn readTrimmedFileOnce(io: Io, path: []const u8, buf: []u8) ?[]const u8 {
+        const f = Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+        defer f.close(io);
+        const n = preadOnce(f, io, buf) catch return null;
+        return mem.trim(u8, buf[0..n], " \t\r\n");
+    }
+
+    fn readU64Slot(slot: ?Io.File, io: Io) ?u64 {
+        const f = slot orelse return null;
+        var buf: [32]u8 = undefined;
+        const n = preadOnce(f, io, &buf) catch return null;
+        return std.fmt.parseInt(u64, mem.trim(u8, buf[0..n], " \t\r\n"), 10) catch null;
+    }
+
+    fn discoverBatteries(self: *PowerProbe, io: Io) void {
+        var dir = Io.Dir.openDirAbsolute(io, "/sys/class/power_supply", .{ .iterate = true }) catch return;
+        defer dir.close(io);
+
+        var path_buf: [160]u8 = undefined;
+        var text_buf: [64]u8 = undefined;
+
+        var iter = dir.iterate();
+        while (iter.next(io) catch null) |entry| {
+            if (self.battery_count >= max_batteries) break;
+
+            const type_path = std.fmt.bufPrint(&path_buf, "/sys/class/power_supply/{s}/type", .{entry.name}) catch continue;
+            const kind = readTrimmedFileOnce(io, type_path, &text_buf) orelse continue;
+            if (!mem.eql(u8, kind, "Battery")) continue;
+
+            // Ignore wireless peripherals (`scope == "Device"` such as Bluetooth mice/headsets)
+            const scope_path = std.fmt.bufPrint(&path_buf, "/sys/class/power_supply/{s}/scope", .{entry.name}) catch continue;
+            if (readTrimmedFileOnce(io, scope_path, &text_buf)) |scope| {
+                if (mem.eql(u8, scope, "Device")) continue;
+            }
+
+            var slot: BatterySlot = .{};
+            if (std.fmt.bufPrint(&path_buf, "/sys/class/power_supply/{s}/status", .{entry.name})) |p| {
+                slot.status_fd = Io.Dir.openFileAbsolute(io, p, .{}) catch null;
+            } else |_| {}
+            if (std.fmt.bufPrint(&path_buf, "/sys/class/power_supply/{s}/capacity", .{entry.name})) |p| {
+                slot.capacity_fd = Io.Dir.openFileAbsolute(io, p, .{}) catch null;
+            } else |_| {}
+            if (std.fmt.bufPrint(&path_buf, "/sys/class/power_supply/{s}/power_now", .{entry.name})) |p| {
+                slot.power_fd = Io.Dir.openFileAbsolute(io, p, .{}) catch null;
+            } else |_| {}
+            if (std.fmt.bufPrint(&path_buf, "/sys/class/power_supply/{s}/current_now", .{entry.name})) |p| {
+                slot.current_fd = Io.Dir.openFileAbsolute(io, p, .{}) catch null;
+            } else |_| {}
+            if (std.fmt.bufPrint(&path_buf, "/sys/class/power_supply/{s}/voltage_now", .{entry.name})) |p| {
+                slot.voltage_fd = Io.Dir.openFileAbsolute(io, p, .{}) catch null;
+            } else |_| {}
+
+            if (slot.capacity_fd == null and slot.power_fd == null and slot.current_fd == null) {
+                slot.closeAll(io);
+                continue;
+            }
+
+            self.batteries[self.battery_count] = slot;
+            self.battery_count += 1;
+        }
+        self.has_battery = (self.battery_count > 0);
+    }
+
+    fn discoverHwmonPower(self: *PowerProbe, io: Io) void {
+        var dir = Io.Dir.openDirAbsolute(io, "/sys/class/hwmon", .{ .iterate = true }) catch return;
+        defer dir.close(io);
+
+        var path_buf: [160]u8 = undefined;
+        var name_buf: [64]u8 = undefined;
+        var label_buf: [64]u8 = undefined;
+        var has_apu_ppt = false;
+
+        var iter = dir.iterate();
+        while (iter.next(io) catch null) |entry| {
+            if (self.hwmon_count >= max_hwmon_sensors) break;
+
+            const name_path = std.fmt.bufPrint(&path_buf, "/sys/class/hwmon/{s}/name", .{entry.name}) catch continue;
+            const driver_name = readTrimmedFileOnce(io, name_path, &name_buf) orelse continue;
+            if (isPowerSupplyHwmonMirror(driver_name)) continue;
+
+            // Detect AMD APU (`in1_label == "vddnb"`): its `PPT` already covers CPU + Radeon iGPU + SoC
+            if (mem.eql(u8, driver_name, "amdgpu")) {
+                if (std.fmt.bufPrint(&path_buf, "/sys/class/hwmon/{s}/in1_label", .{entry.name})) |in1_p| {
+                    if (readTrimmedFileOnce(io, in1_p, &label_buf)) |lbl| {
+                        if (mem.eql(u8, lbl, "vddnb")) has_apu_ppt = true;
+                    }
+                } else |_| {}
+            }
+
+            // Open primary device-total power channel (`power1_input`, falling back to `power1_average`)
+            var power_fd: ?Io.File = null;
+            if (std.fmt.bufPrint(&path_buf, "/sys/class/hwmon/{s}/power1_input", .{entry.name})) |p1| {
+                power_fd = Io.Dir.openFileAbsolute(io, p1, .{}) catch null;
+            } else |_| {}
+            if (power_fd == null) {
+                if (std.fmt.bufPrint(&path_buf, "/sys/class/hwmon/{s}/power1_average", .{entry.name})) |p1_avg| {
+                    power_fd = Io.Dir.openFileAbsolute(io, p1_avg, .{}) catch null;
+                } else |_| {}
+            }
+            if (power_fd == null) continue;
+
+            self.hwmon_slots[self.hwmon_count] = .{
+                .file = power_fd,
+                .is_cpu_only = isCpuOnlyPowerDriver(driver_name),
+            };
+            self.hwmon_count += 1;
+        }
+
+        // Deduplicate standalone CPU package sensor if an AMD APU `PPT` sensor already covers the socket
+        if (has_apu_ppt) {
+            var write_idx: usize = 0;
+            for (self.hwmon_slots[0..self.hwmon_count]) |*slot| {
+                if (slot.is_cpu_only) {
+                    closeSlot(&slot.file, io);
+                } else {
+                    self.hwmon_slots[write_idx] = slot.*;
+                    write_idx += 1;
+                }
+            }
+            @memset(self.hwmon_slots[write_idx..self.hwmon_count], .{});
+            self.hwmon_count = write_idx;
+        }
+    }
+
+    pub fn sample(self: *PowerProbe, io: Io) !void {
+        if (!self.searched) {
+            self.searched = true;
+            self.discoverBatteries(io);
+            self.discoverHwmonPower(io);
+            var bat_has_power = false;
+            for (self.batteries[0..self.battery_count]) |b| {
+                if (b.power_fd != null or (b.current_fd != null and b.voltage_fd != null)) {
+                    bat_has_power = true;
+                    break;
+                }
+            }
+            self.has_power_sensor = bat_has_power or (self.hwmon_count > 0);
+        }
+
+        var cap_sum: u64 = 0;
+        var cap_count: u64 = 0;
+        var discharging_uw: u64 = 0;
+        var charging_uw: u64 = 0;
+        var any_discharging = false;
+        var any_charging = false;
+        var status_buf: [32]u8 = undefined;
+
+        for (self.batteries[0..self.battery_count]) |*bat| {
+            if (readU64Slot(bat.capacity_fd, io)) |cap| {
+                cap_sum += @min(cap, 100);
+                cap_count += 1;
+            }
+
+            const bat_uw: u64 = if (readU64Slot(bat.power_fd, io)) |p_uw|
+                p_uw
+            else blk: {
+                const cur_ua = readU64Slot(bat.current_fd, io) orelse break :blk 0;
+                const vol_uv = readU64Slot(bat.voltage_fd, io) orelse break :blk 0;
+                break :blk @intCast((@as(u128, cur_ua) * @as(u128, vol_uv)) / 1_000_000);
+            };
+
+            if (bat.status_fd) |s_fd| {
+                const n = preadOnce(s_fd, io, &status_buf) catch 0;
+                const st = mem.trim(u8, status_buf[0..n], " \t\r\n");
+                if (mem.eql(u8, st, "Discharging")) {
+                    any_discharging = true;
+                    discharging_uw +|= bat_uw;
+                } else if (mem.eql(u8, st, "Charging")) {
+                    any_charging = true;
+                    charging_uw +|= bat_uw;
+                }
+            }
+        }
+
+        if (cap_count > 0) {
+            self.capacity_pct = (cap_sum + cap_count / 2) / cap_count;
+        }
+
+        var component_uw: u64 = 0;
+        for (self.hwmon_slots[0..self.hwmon_count]) |slot| {
+            if (readU64Slot(slot.file, io)) |uw| {
+                component_uw +|= uw;
+            }
+        }
+
+        const effective_uw: u64 = if (any_discharging)
+            (if (discharging_uw > 0) discharging_uw else component_uw)
+        else if (any_charging)
+            (component_uw +| charging_uw)
+        else
+            component_uw;
+
+        self.flow_state = if (any_discharging)
+            .discharging
+        else if (any_charging)
+            .charging
+        else
+            .maintaining;
+
+        self.effective_tenths_w = (effective_uw + 50_000) / 100_000;
+    }
+};
+
+/// Lightweight zero-syscall view exposing `PowerProbe.capacity_pct` as its own smooth `MetricEntry`.
+pub const BatteryView = struct {
+    source: ?*const PowerProbe = null,
+    value: u64 = 0,
+
+    pub fn sample(self: *BatteryView) !void {
+        if (self.source) |src| {
+            self.value = src.capacity_pct;
         }
     }
 };
@@ -807,6 +1104,15 @@ test "System probes sample without errors" {
     var load_probe: LoadProbe = .{};
     try load_probe.sample();
 
+    var power_probe: PowerProbe = .{};
+    defer power_probe.deinit(std.testing.io);
+    try power_probe.sample(std.testing.io);
+    try std.testing.expect(power_probe.capacity_pct <= 100);
+
+    var bat_view: BatteryView = .{ .source = &power_probe };
+    try bat_view.sample();
+    try std.testing.expectEqual(power_probe.capacity_pct, bat_view.value);
+
     var time_probe: TimeProbe = .{};
     try time_probe.sample(std.testing.io);
     try std.testing.expect(time_probe.changed);
@@ -865,4 +1171,13 @@ test "Device filters, mount path unescaping, and hot-unplug saturating diffs" {
     const after_unplug_net = (NetStat{ .rx = 200_000, .tx = 100_000 }).diff(prev_net);
     try std.testing.expectEqual(@as(u64, 0), after_unplug_net.rx);
     try std.testing.expectEqual(@as(u64, 0), after_unplug_net.tx);
+
+    // Power hwmon mirror & APU deduplication filters
+    try std.testing.expect(PowerProbe.isPowerSupplyHwmonMirror("BAT0"));
+    try std.testing.expect(PowerProbe.isPowerSupplyHwmonMirror("ucsi_source_psy_USBC000:002"));
+    try std.testing.expect(PowerProbe.isPowerSupplyHwmonMirror("AC"));
+    try std.testing.expect(!PowerProbe.isPowerSupplyHwmonMirror("amdgpu"));
+    try std.testing.expect(!PowerProbe.isPowerSupplyHwmonMirror("nvme"));
+    try std.testing.expect(PowerProbe.isCpuOnlyPowerDriver("zenpower"));
+    try std.testing.expect(!PowerProbe.isCpuOnlyPowerDriver("amdgpu"));
 }

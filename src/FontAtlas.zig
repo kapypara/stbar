@@ -68,7 +68,7 @@ test "Embedded FontAtlas resolves ASCII + PUA glyphs in O(1) with zero heap allo
     try std.testing.expect(atlas.getGlyphUV(' ') != null);
     try std.testing.expect(atlas.getGlyphUV('A') != null);
     try std.testing.expect(atlas.getGlyphUV(0xE000) != null);
-    try std.testing.expect(atlas.getGlyphUV(0xE021) != null);
-    try std.testing.expect(atlas.getGlyphUV(0xE022) == null);
+    try std.testing.expect(atlas.getGlyphUV(0xE025) != null);
+    try std.testing.expect(atlas.getGlyphUV(0xE026) == null);
     try std.testing.expect(atlas.getGlyphUV(0x1F600) == null);
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("c");
 const Window = @import("Window.zig").Window;
 const ticker_zig = @import("Ticker.zig");
+const PowerFlow = @import("formats.zig").PowerFlow;
 
 /// Declarative left-click action attached to each `Segment`.
 pub const ClickAction = union(enum) {
@@ -18,7 +19,39 @@ pub const ClickAction = union(enum) {
     copy_unix_timestamp,
     /// Copies the current sanitized active window title natively to Wayland/X11 clipboard.
     copy_window_title,
+    /// Copies live battery `%` + total system wattage (+ charging wattage if charging) to clipboard.
+    copy_power_summary,
 };
+
+pub const PowerSnapshot = struct {
+    has_battery: bool = false,
+    has_power_sensor: bool = false,
+    flow_state: PowerFlow = .maintaining,
+    capacity_pct: u64 = 0,
+    effective_tenths_w: u64 = 0,
+};
+
+pub fn formatPowerSummary(snap: PowerSnapshot, out: *[48]u8) []const u8 {
+    const whole_w = snap.effective_tenths_w / 10;
+    const frac_w = snap.effective_tenths_w % 10;
+    if (!snap.has_battery) {
+        if (!snap.has_power_sensor) return "";
+        return std.fmt.bufPrint(out, "{d}.{d}W", .{ whole_w, frac_w }) catch "";
+    }
+    if (!snap.has_power_sensor) {
+        return std.fmt.bufPrint(out, "{d}%", .{snap.capacity_pct}) catch "";
+    }
+    const sign: []const u8 = switch (snap.flow_state) {
+        .maintaining => "",
+        .discharging => "-",
+        .charging => "+",
+    };
+    return std.fmt.bufPrint(
+        out,
+        "{d}% {s}{d}.{d}W",
+        .{ snap.capacity_pct, sign, whole_w, frac_w },
+    ) catch "";
+}
 
 pub const max_spawn_args = 15;
 
@@ -106,6 +139,7 @@ pub fn execute(
     io: std.Io,
     window: *Window,
     active_window_title: []const u8,
+    power_snap: PowerSnapshot,
 ) void {
     switch (action) {
         .none => {},
@@ -123,11 +157,36 @@ pub fn execute(
                 window.setClipboard(active_window_title);
             }
         },
+        .copy_power_summary => {
+            var buf: [48]u8 = undefined;
+            const summary = formatPowerSummary(power_snap, &buf);
+            if (summary.len > 0) {
+                window.setClipboard(summary);
+            }
+        },
     }
 }
 
-test "isExecutableInPath resolves system binaries without allocations" {
+test "isExecutableInPath and formatPowerSummary operate without allocations" {
     try std.testing.expect(isExecutableInPath("sh", "/nonexistent:/usr/bin:/bin"));
     try std.testing.expect(!isExecutableInPath("zigbar_definitely_missing_bin_xyz", "/usr/bin:/bin"));
     try std.testing.expect(isExecutableInPath("/bin/sh", ""));
+
+    var buf: [48]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "18.4W",
+        formatPowerSummary(.{ .has_battery = false, .has_power_sensor = true, .effective_tenths_w = 184 }, &buf),
+    );
+    try std.testing.expectEqualStrings(
+        "98% 10.0W",
+        formatPowerSummary(.{ .has_battery = true, .has_power_sensor = true, .flow_state = .maintaining, .capacity_pct = 98, .effective_tenths_w = 100 }, &buf),
+    );
+    try std.testing.expectEqualStrings(
+        "98% -4.9W",
+        formatPowerSummary(.{ .has_battery = true, .has_power_sensor = true, .flow_state = .discharging, .capacity_pct = 98, .effective_tenths_w = 49 }, &buf),
+    );
+    try std.testing.expectEqualStrings(
+        "64% +38.5W",
+        formatPowerSummary(.{ .has_battery = true, .has_power_sensor = true, .flow_state = .charging, .capacity_pct = 64, .effective_tenths_w = 385 }, &buf),
+    );
 }

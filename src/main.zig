@@ -44,7 +44,7 @@ const usage_text =
     \\
     \\Mouse Controls:
     \\  Hover top 1px (>1s)                            Reveal bar in auto-hide mode
-    \\  Left-click segment                             Run segment action (copy time/title, open btop/dolphin)
+    \\  Left-click segment                             Run segment action (copy time/power/title, open btop/dolphin)
     \\  Right-click                                    Toggle pinned overlay (strut OFF) <-> auto-hide
     \\  Middle-click                                   Toggle 17px docked strut (strut ON) <-> auto-hide
     \\

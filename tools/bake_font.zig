@@ -5,6 +5,64 @@ const uv_absent: [2]u16 = .{ 0, 65535 };
 const pua_base: u32 = 0xE000;
 const pua_count: usize = 64;
 
+const battery_icon_14x14 = [14][]const u8{
+    "..............",
+    "..............",
+    "..............",
+    "..##########..",
+    "..#........#..",
+    "..#.######.###",
+    "..#.######...#",
+    "..#.######...#",
+    "..#.######.###",
+    "..#........#..",
+    "..##########..",
+    "..............",
+    "..............",
+    "..............",
+};
+
+const bolt_icon_14x14 = [14][]const u8{
+    "..............",
+    "........###...",
+    ".......###....",
+    "......###.....",
+    ".....###......",
+    "....#########.",
+    "....#########.",
+    ".......###....",
+    "......###.....",
+    ".....###......",
+    "....###.......",
+    "...###........",
+    "..##..........",
+    "..............",
+};
+
+fn stampIconPair(
+    rgba: []u8,
+    atlas_width: usize,
+    columns: u16,
+    char_width: u16,
+    char_height: u16,
+    first_cell_index: u16,
+    art: [14][]const u8,
+) void {
+    for (0..2) |half| {
+        const cell_idx = first_cell_index + @as(u16, @intCast(half));
+        const base_x = @as(usize, cell_idx % columns) * char_width;
+        const base_y = @as(usize, cell_idx / columns) * char_height;
+        for (0..14) |dy| {
+            for (0..7) |dx| {
+                if (art[dy][half * 7 + dx] == '#') {
+                    const px_idx = ((base_y + dy) * atlas_width + (base_x + dx)) * 4;
+                    rgba[px_idx..][0..4].* = .{ 255, 255, 255, 255 };
+                }
+            }
+        }
+    }
+}
+
 const GlyphCoord = struct {
     code: u32,
     uv: [2]u16,
@@ -189,7 +247,8 @@ pub fn main(init: std.process.Init) !void {
 
     const root = parsed.value.object;
     const columns: u16 = @intCast(root.get("columns").?.integer);
-    const rows: u16 = @intCast(root.get("rows").?.integer);
+    const base_rows: u16 = @intCast(root.get("rows").?.integer);
+    const rows: u16 = base_rows + 1; // Extra row holds synthesized Battery + Power PUA icons
     const char_width: u16 = @intCast(root.get("char_width").?.integer);
     const char_height: u16 = @intCast(root.get("char_height").?.integer);
 
@@ -221,18 +280,35 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+
+    // Register synthesized 14x14 Battery (`U+E022..E023`) and Bolt/Watt (`U+E024..E025`) icons
+    const synth_base_cell: u16 = columns * base_rows;
+    for (0..4) |k| {
+        const idx_offset: u16 = @intCast(k);
+        pua_uvs[0x22 + k] = computeUV(columns, rows, synth_base_cell + idx_offset);
+    }
     std.sort.pdq(GlyphCoord, extra_list.items, {}, GlyphCoord.lessThan);
 
     const img = try decodePngRgba(gpa, png_bytes);
     defer gpa.free(img.rgba);
 
+    const out_width: u16 = img.width;
+    const out_height: u16 = img.height + char_height;
+    const pixel_count = @as(usize, out_width) * @as(usize, out_height);
+    const atlas_rgba = try gpa.alloc(u8, pixel_count * 4);
+    defer gpa.free(atlas_rgba);
+    @memset(atlas_rgba, 0);
+    @memcpy(atlas_rgba[0..img.rgba.len], img.rgba);
+
+    stampIconPair(atlas_rgba, out_width, columns, char_width, char_height, synth_base_cell, battery_icon_14x14);
+    stampIconPair(atlas_rgba, out_width, columns, char_width, char_height, synth_base_cell + 2, bolt_icon_14x14);
+
     // Try 2-bit palette compression when <= 4 unique RGBA colors (Tamzen uses 3)
     var palette: [4][4]u8 = @splat(.{ 0, 0, 0, 0 });
     var palette_len: usize = 0;
     var fits_2bit = true;
-    const pixel_count = @as(usize, img.width) * @as(usize, img.height);
     for (0..pixel_count) |i| {
-        const px = img.rgba[i * 4 ..][0..4].*;
+        const px = atlas_rgba[i * 4 ..][0..4].*;
         var found: ?usize = null;
         for (0..palette_len) |p_idx| {
             if (std.mem.eql(u8, &palette[p_idx], &px)) {
@@ -265,7 +341,7 @@ pub fn main(init: std.process.Init) !void {
         \\pub const rows: u16 = {d};
         \\pub const GlyphCoord = struct {{ code: u32, uv: [2]u16 }};
         \\
-    , .{ img.width, img.height, char_width, char_height, columns, rows });
+    , .{ out_width, out_height, char_width, char_height, columns, rows });
 
     try w.writeAll("pub const latin1_uvs: [256][2]u16 = .{\n");
     for (latin1_uvs) |uv| {
@@ -298,7 +374,7 @@ pub fn main(init: std.process.Init) !void {
             for (0..4) |sub| {
                 const px_idx = byte_idx * 4 + sub;
                 if (px_idx < pixel_count) {
-                    const px = img.rgba[px_idx * 4 ..][0..4].*;
+                    const px = atlas_rgba[px_idx * 4 ..][0..4].*;
                     var code: u2 = 0;
                     for (0..palette_len) |p_idx| {
                         if (std.mem.eql(u8, &palette[p_idx], &px)) {
@@ -325,8 +401,8 @@ pub fn main(init: std.process.Init) !void {
             \\
         );
     } else {
-        try w.print("pub const raw_rgba: [{d}]u8 = .{{\n    ", .{img.rgba.len});
-        for (img.rgba, 0..) |b, idx| {
+        try w.print("pub const raw_rgba: [{d}]u8 = .{{\n    ", .{atlas_rgba.len});
+        for (atlas_rgba, 0..) |b, idx| {
             try w.print("0x{X:0>2},", .{b});
             if ((idx + 1) % 24 == 0) try w.writeAll("\n    ");
         }

@@ -18,6 +18,7 @@ pub const SlotState = struct {
     height: i32 = 0,
     last_opacity_u8: u16 = 0xFFFF, // 0xFFFF forces an initial full-buffer draw
     cell_count: usize = 0,
+    bg_sig: u64 = 0,
     cell_uvs: [max_cells]u32 = @splat(0),
 
     pub fn invalidate(self: *SlotState) void {
@@ -26,6 +27,20 @@ pub const SlotState = struct {
 };
 
 pub const ShmDraw = struct {
+    fn computeBgSig(bg_quads: []const QuadVertex) u64 {
+        var h: u64 = 0x9E3779B97F4A7C15 ^ @as(u64, bg_quads.len);
+        for (bg_quads) |q| {
+            const s0: u32 = @bitCast(q.size[0]);
+            const s1: u32 = @bitCast(q.size[1]);
+            const p0: u16 = @bitCast(q.pos[0]);
+            const p1: u16 = @bitCast(q.pos[1]);
+            const col: u32 = @bitCast(q.color);
+            h = (h ^ ((@as(u64, s0) << 32) | s1)) *% 0xBF58476D1CE4E5B9;
+            h = (h ^ ((@as(u64, col) << 32) | (@as(u64, p0) << 16) | p1)) *% 0x94D049BB133111EB;
+        }
+        return h;
+    }
+
     inline fn packUv(uv: [2]u16) u32 {
         return (@as(u32, uv[1]) << 16) | @as(u32, uv[0]);
     }
@@ -269,15 +284,17 @@ pub const ShmDraw = struct {
             return 1;
         }
 
+        const next_bg_sig = computeBgSig(quads[0..clamped_bg]);
         const full_redraw = (slot.width != width or
             slot.height != height or
-            slot.last_opacity_u8 != alpha_scale);
+            slot.last_opacity_u8 != alpha_scale or
+            slot.bg_sig != next_bg_sig);
 
         if (full_redraw) {
             const stride: usize = @intCast(width);
             @memset(pixels[0..@intCast(width * height)], 0);
 
-            for (quads[0..bg_count]) |bg_q| {
+            for (quads[0..clamped_bg]) |bg_q| {
                 const sx = spanX(bg_q, width);
                 const sy = spanY(bg_q, height);
                 const argb = packArgb(bg_q.color, alpha_scale);
@@ -292,6 +309,7 @@ pub const ShmDraw = struct {
             slot.width = width;
             slot.height = height;
             slot.last_opacity_u8 = alpha_scale;
+            slot.bg_sig = next_bg_sig;
             damage_out[0] = .{ .x = 0, .y = 0, .w = width, .h = height };
             return 1;
         }
@@ -373,4 +391,11 @@ test "ShmDraw recovers exact Tamzen atlas coordinates and performs incremental c
     try std.testing.expectEqual(@as(i32, 0), dmg[0].x);
     try std.testing.expectEqual(@as(i32, 7), dmg[0].w);
     try std.testing.expectEqual(@as(i32, 14), dmg[0].h);
+
+    // Changing segment background geometry triggers a full-bar redraw even with identical cells/opacity
+    quads[0].color = .{ 0x3C, 0x6E, 0x84, 0xCC };
+    const n4 = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, &dmg);
+    try std.testing.expectEqual(@as(usize, 1), n4);
+    try std.testing.expectEqual(@as(i32, w), dmg[0].w);
+    try std.testing.expectEqual(@as(i32, h), dmg[0].h);
 }

@@ -5,6 +5,7 @@ const FontAtlas = font_zig.FontAtlas;
 const RectDraw = @import("RectDraw.zig").RectDraw;
 const ShmDraw = @import("ShmDraw.zig");
 const actions_zig = @import("Actions.zig");
+const PowerFlow = @import("formats.zig").PowerFlow;
 const segment_zig = @import("Segment.zig");
 const Window = @import("Window.zig").Window;
 const ticker_zig = @import("Ticker.zig");
@@ -32,11 +33,21 @@ pub const StatusMonitor = struct {
     pub const max_numeric_metrics = 10;
 
     pub const time_width = 23;
+    pub const power_battery_only_width = 7;
+    pub const power_desktop_width = 9;
+    pub const power_battery_width = 16;
     pub const processor_width = 15;
     pub const thermal_width = 13;
     pub const storage_width = 40;
     pub const network_width = 19;
-    pub const right_fixed_cells = time_width + processor_width + thermal_width + storage_width + network_width; // 110
+    pub const base_fixed_cells = time_width + processor_width + thermal_width + storage_width + network_width; // 110
+
+    const PowerLayoutMode = enum {
+        hidden,
+        battery_only,
+        desktop_watts,
+        battery_and_watts,
+    };
 
     const hover_reveal_ns: i96 = 1 * std.time.ns_per_s; // >1.0s continuous top-1px hover
     const leave_grace_ns: i96 = 120 * std.time.ns_per_ms; // brief anti-twitch grace on exit
@@ -95,6 +106,10 @@ pub const StatusMonitor = struct {
     time_metrics: [1]MetricEntry = .{
         .{ .metric = .{ .time = .{} }, .mode = .message, .start_index = 1 },
     },
+    power_metrics: [2]MetricEntry = .{
+        .{ .metric = .{ .power = .{} }, .mode = .average, .start_index = 7 },
+        .{ .metric = .{ .battery = .{} }, .mode = .average, .start_index = 0 },
+    },
     processor_metrics: [2]MetricEntry = .{
         .{ .metric = .{ .cpu = .{} }, .mode = .average, .start_index = 0 },
         .{ .metric = .{ .memory = .{} }, .mode = .average, .start_index = 6, .secondary_index = 19 },
@@ -117,6 +132,10 @@ pub const StatusMonitor = struct {
     time_segment: Segment = .{
         .color = 0x595959CC,
         .on_click = .copy_unix_timestamp,
+    },
+    power_segment: Segment = .{
+        .color = 0x3C6E84CC,
+        .on_click = .copy_power_summary,
     },
     processor_segment: Segment = .{
         .color = 0x844242CC,
@@ -151,7 +170,9 @@ pub const StatusMonitor = struct {
         .on_click = .copy_window_title,
     },
 
-    segments: [6]*Segment = undefined,
+    segments: [7]*Segment = undefined,
+    power_layout_mode: PowerLayoutMode = .hidden,
+    last_power_flow: PowerFlow = .maintaining,
 
     // Active window marquee state (monotonic time-driven)
     title_codepoints: [260]u32 = @splat(0),
@@ -198,13 +219,16 @@ pub const StatusMonitor = struct {
             self.rect.setTextureSize(self.font.x_increment, self.font.y_increment);
         }
 
-        // Bind metric slices to segments
+        // Bind metric slices to segments (`power_segment` slice is configured dynamically by battery presence)
         self.time_segment.metrics = &self.time_metrics;
         self.processor_segment.metrics = &self.processor_metrics;
         self.thermal_load_segment.metrics = &self.thermal_metrics;
         self.storage_load_segment.metrics = &self.storage_metrics;
         self.network_load_segment.metrics = &self.network_metrics;
         self.window_title_segment.metrics = &self.window_metrics;
+
+        // BatteryView reads `capacity_pct` directly from `PowerProbe` with zero extra syscalls
+        self.power_metrics[1].metric.battery.source = &self.power_metrics[0].metric.power;
 
         // Dirty memory is sampled alongside free memory in MemProbe, rendered in storage_load_segment
         self.processor_metrics[1].secondary_segment = &self.storage_load_segment;
@@ -230,11 +254,12 @@ pub const StatusMonitor = struct {
             &self.thermal_load_segment,
             &self.storage_load_segment,
             &self.network_load_segment,
+            &self.power_segment,
             &self.window_title_segment,
         };
 
-        // Bind inline rolling sample ring buffer for the 7 numeric MetricEntries
-        const numeric_metric_count = 7;
+        // Bind inline rolling sample ring buffer for the 9 numeric MetricEntries
+        const numeric_metric_count = 9;
         assert(numeric_metric_count <= max_numeric_metrics);
         const ring_len: usize = sample_hz;
         self.sample_buffer = self.sample_storage[0 .. ring_len * numeric_metric_count];
@@ -247,11 +272,20 @@ pub const StatusMonitor = struct {
         setSlots(&self.storage_metrics[0], self.sample_buffer, ring_len, 4);
         setSlots(&self.storage_metrics[1], self.sample_buffer, ring_len, 5);
         setSlots(&self.network_metrics[0], self.sample_buffer, ring_len, 6);
+        setSlots(&self.power_metrics[0], self.sample_buffer, ring_len, 7);
+        setSlots(&self.power_metrics[1], self.sample_buffer, ring_len, 8);
+
+        // Discover battery/hwmon topology up front so initial layout chooses the exact compact width
+        self.power_metrics[0].metric.power.sample(io) catch {};
+        self.power_metrics[1].metric.battery.sample() catch {};
 
         self.recomputeLayout();
 
         const now_ns = monotonicNs(io);
         self.seedInitialMetrics(now_ns);
+        if (self.currentPowerLayoutMode() != self.power_layout_mode) {
+            self.recomputeLayout();
+        }
         self.window.setStrut(initial_mode == .docked_strut);
         if (initial_mode == .auto_hide) {
             self.window.setInputHeight(1);
@@ -288,8 +322,61 @@ pub const StatusMonitor = struct {
                 entry.target = packed_init;
             }
         }
+        self.last_power_flow = self.power_metrics[0].metric.power.flow_state;
         self.sample_start_ns = now_ns;
         self.next_sample_ns = now_ns + self.visible_sample_ns;
+    }
+
+    fn currentPowerLayoutMode(self: *const StatusMonitor) PowerLayoutMode {
+        const pwr = &self.power_metrics[0].metric.power;
+        if (!pwr.has_battery) {
+            return if (pwr.has_power_sensor) .desktop_watts else .hidden;
+        }
+        return if (pwr.has_power_sensor) .battery_and_watts else .battery_only;
+    }
+
+    fn configurePowerSegment(self: *StatusMonitor) usize {
+        const mode = self.currentPowerLayoutMode();
+        self.power_layout_mode = mode;
+
+        switch (mode) {
+            .hidden => {
+                // Sensorless desktop/VM (0 cells)
+                self.power_metrics[0].start_index = 0;
+                self.power_metrics[0].secondary_index = null;
+                self.power_segment.static_offset = 0;
+                self.power_segment.static_overlay = "";
+                self.power_segment.metrics = self.power_metrics[0..1];
+                return 0;
+            },
+            .battery_only => {
+                // Battery without power sensors: " 98%🔋 " (7 cells)
+                self.power_metrics[0].start_index = power_battery_only_width;
+                self.power_metrics[0].secondary_index = null;
+                self.power_segment.static_offset = 3;
+                self.power_segment.static_overlay = "%\u{e022}\u{e023}";
+                self.power_segment.metrics = self.power_metrics[0..2];
+                return power_battery_only_width;
+            },
+            .desktop_watts => {
+                // Desktop with power sensors: " 14.2W⚡ " (9 cells)
+                self.power_metrics[0].start_index = 1;
+                self.power_metrics[0].secondary_index = null;
+                self.power_segment.static_offset = 6;
+                self.power_segment.static_overlay = "\u{e024}\u{e025}";
+                self.power_segment.metrics = self.power_metrics[0..1];
+                return power_desktop_width;
+            },
+            .battery_and_watts => {
+                // Laptop fixed width: " 98%🔋 -14.2W⚡ " / " 64%🔋 +38.5W⚡ " / " 98%🔋  10.0W⚡ " (16 cells)
+                self.power_metrics[0].start_index = 7;
+                self.power_metrics[0].secondary_index = null;
+                self.power_segment.static_offset = 3;
+                self.power_segment.static_overlay = "%\u{e022}\u{e023}\n\n\n\n\n\n\n\u{e024}\u{e025}";
+                self.power_segment.metrics = self.power_metrics[0..2];
+                return power_battery_width;
+            },
+        }
     }
 
     fn setSlots(entry: *MetricEntry, buffer: []u128, ring_len: usize, position: usize) void {
@@ -308,6 +395,7 @@ pub const StatusMonitor = struct {
 
     pub fn recomputeLayout(self: *StatusMonitor) void {
         self.window.updateViewport();
+        const power_width = self.configurePowerSegment();
 
         const window_height = @as(f32, @floatFromInt(@max(1, self.window.height)));
         const char_height = @as(f32, @floatFromInt(self.font.char_height));
@@ -322,7 +410,7 @@ pub const StatusMonitor = struct {
         // 0.52 vertically centers Tamzen inside the 17px bar
         self.rect_y_pos = @intFromFloat(self.rect_height * 32767.0 * 0.52);
 
-        self.generateCells();
+        self.generateCells(base_fixed_cells + power_width);
 
         const cells_count = self.cells.len;
         const time_idx = cells_count -| time_width;
@@ -330,6 +418,7 @@ pub const StatusMonitor = struct {
         const therm_idx = proc_idx -| thermal_width;
         const stor_idx = therm_idx -| storage_width;
         const net_idx = stor_idx -| network_width;
+        const power_idx = net_idx -| power_width;
 
         self.time_segment.cell_start = time_idx;
         self.time_segment.cells = self.cells[time_idx..cells_count];
@@ -346,8 +435,11 @@ pub const StatusMonitor = struct {
         self.network_load_segment.cell_start = net_idx;
         self.network_load_segment.cells = self.cells[net_idx..stor_idx];
 
+        self.power_segment.cell_start = power_idx;
+        self.power_segment.cells = self.cells[power_idx..net_idx];
+
         self.window_title_segment.cell_start = 0;
-        self.window_title_segment.cells = self.cells[0..net_idx];
+        self.window_title_segment.cells = self.cells[0..power_idx];
 
         // Slice inline batched vertex buffer: segment background rects + N glyph cells
         const bg_quads = self.segments.len;
@@ -369,9 +461,9 @@ pub const StatusMonitor = struct {
         self.frame_dirty = true;
     }
 
-    fn generateCells(self: *StatusMonitor) void {
+    fn generateCells(self: *StatusMonitor, min_fixed_cells: usize) void {
         const cell_size: u16 = @intCast(self.rect_width_i);
-        const char_count: usize = @max(right_fixed_cells + 4, @divTrunc(65535, cell_size));
+        const char_count: usize = @max(min_fixed_cells + 4, @divTrunc(65535, cell_size));
         const total_cells = @min(max_cells, char_count + 1);
         self.cells = self.cells_storage[0..total_cells];
 
@@ -614,6 +706,14 @@ pub const StatusMonitor = struct {
             const prior_progress = self.interpolationProgress(now_ns);
             for (self.segments) |segment| {
                 segment.update(self.io, self.sample_count, prior_progress);
+            }
+            if (self.currentPowerLayoutMode() != self.power_layout_mode) {
+                self.recomputeLayout();
+            }
+            const next_flow = self.power_metrics[0].metric.power.flow_state;
+            if (next_flow != self.last_power_flow) {
+                self.last_power_flow = next_flow;
+                self.power_metrics[0].last_p1 = std.math.maxInt(u64);
             }
             self.sample_count +%= 1;
             self.sample_start_ns = now_ns;
@@ -1042,11 +1142,19 @@ pub const StatusMonitor = struct {
             const left_px = (nx0 + 1.0) * 0.5 * w_f;
             const right_px = left_px + bg_q.size[0] * 0.5 * w_f;
             if (px_f >= left_px and px_f <= right_px) {
+                const pwr = &self.power_metrics[0].metric.power;
                 actions_zig.execute(
                     seg.on_click,
                     self.io,
                     self.window,
                     self.window_metrics[0].metric.window.slice(),
+                    .{
+                        .has_battery = pwr.has_battery,
+                        .has_power_sensor = pwr.has_power_sensor,
+                        .flow_state = pwr.flow_state,
+                        .capacity_pct = pwr.capacity_pct,
+                        .effective_tenths_w = pwr.effective_tenths_w,
+                    },
                 );
                 return;
             }
