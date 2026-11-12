@@ -4,6 +4,7 @@ pub const c = @import("c");
 const types = @import("Types.zig");
 const QuadVertex = types.QuadVertex;
 pub const Click = types.Click;
+pub const BackendPreference = types.BackendPreference;
 pub const BarPosition = types.BarPosition;
 pub const TitleClip = types.TitleClip;
 const ProcLoader = if (build_options.enable_gpu) @import("GlProcs.zig").ProcLoader else void;
@@ -13,20 +14,6 @@ const WaylandRenderMode = wayland_zig.WaylandRenderMode;
 const x11_zig = if (build_options.enable_x11) @import("X11Backend.zig") else struct {};
 const X11Backend = if (build_options.enable_x11) x11_zig.X11Backend else void;
 const X11RenderMode = if (build_options.enable_x11) x11_zig.X11RenderMode else void;
-
-pub const BackendPreference = enum {
-    /// Prefer native Wayland `zwlr_layer_shell_v1` + `wl_shm` when `WAYLAND_DISPLAY` is active,
-    /// falling back to `wayland-egl`, `x11` (`MIT-SHM`), or `x11-glx` automatically.
-    auto,
-    /// Native Wayland `zwlr_layer_shell_v1` + `wl_shm` (single-threaded, <1 MB private RSS, zero Mesa load).
-    wayland,
-    /// Native Wayland `zwlr_layer_shell_v1` + `EGL` / OpenGL 3.2 Core.
-    wayland_egl,
-    /// Native X11 / Xwayland + `MIT-SHM` (`XShmPutImage`, single-threaded, <1 MB private RSS, zero Mesa load).
-    x11,
-    /// Force X11 / Xwayland + `GLX` / OpenGL 3.2 Core.
-    x11_glx,
-};
 
 pub const ActiveBackend = enum {
     none,

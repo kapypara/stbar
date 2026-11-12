@@ -63,6 +63,10 @@ Options:
 | **Right-click** / `pkill -USR1 -x zigbar` | Toggles **`pinned`** overlay (`strut = OFF`, always visible) <-> **`auto-hide`** |
 | **Middle-click** / `pkill -USR2 -x zigbar` | Toggles **`dock`** mode (`17px` `exclusive_zone` / `_NET_WM_STRUT_PARTIAL` `strut = ON`) <-> **`auto-hide`** |
 
+## Customization (`src/config.zig`)
+
+All personal bar settings — startup CLI defaults, bar height, hover/fade/marquee timings, named PUA icon pairs, RGBA32 segment colors, fixed cell widths, and left-click commands (`btop`/`htop`, `dolphin`, clipboard actions) — live in [`src/config.zig`](src/config.zig) as `comptime` `.rodata` constants (`dwm`/`slstatus` style). Edit `src/config.zig` and re-run `zig build`.
+
 ## Autostart with `systemd --user`
 
 Install and enable the bundled user service (`systemd/zigbar.service`) so `zigbar` starts automatically with your graphical Wayland/X11 session:

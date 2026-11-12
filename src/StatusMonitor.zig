@@ -2,9 +2,11 @@ const std = @import("std");
 const build_options = @import("build_options");
 
 const types = @import("Types.zig");
+const config = @import("config.zig");
 const QuadVertex = types.QuadVertex;
 const uv_solid = types.uv_solid;
 const uv_empty = types.uv_empty;
+pub const BarMode = types.BarMode;
 pub const MarqueeMode = types.MarqueeMode;
 const TitleClip = types.TitleClip;
 
@@ -26,15 +28,14 @@ const MetricEntry = segment_zig.MetricEntry;
 const monotonicNs = ticker_zig.monotonicNs;
 const sleepNs = ticker_zig.sleepNs;
 
-pub const BarMode = enum {
-    /// Overlay (`strut = OFF`): hides to top 1px strip (zero background polling; sleeps indefinitely in `poll(-1)`)
-    /// and fades in after >1s continuous hover.
-    auto_hide,
-    /// Overlay (`strut = OFF`): stays visible without auto-hiding (toggled via right-click).
-    pinned_overlay,
-    /// Dock (`strut = ON`): reserves 17px top exclusive zone / strut and stays visible (toggled via middle-click).
-    docked_strut,
-};
+fn specSegment(comptime spec: config.SegmentSpec) Segment {
+    return .{
+        .color = spec.color,
+        .static_overlay = spec.static_overlay,
+        .static_offset = spec.static_offset,
+        .on_click = spec.on_click,
+    };
+}
 
 pub const StatusMonitor = struct {
     pub const max_sample_hz = 60;
@@ -42,15 +43,15 @@ pub const StatusMonitor = struct {
     pub const max_segments = 8;
     pub const max_numeric_metrics = 10;
 
-    pub const time_width = 23;
-    pub const power_battery_only_width = 7;
-    pub const power_desktop_width = 9;
-    pub const power_battery_width = 16;
-    pub const processor_width = 15;
-    pub const thermal_width = 13;
-    pub const storage_width = 40;
-    pub const network_width = 19;
-    pub const base_fixed_cells = time_width + processor_width + thermal_width + storage_width + network_width; // 110
+    pub const time_width = config.widths.time;
+    pub const power_battery_only_width = config.widths.power_battery_only;
+    pub const power_desktop_width = config.widths.power_desktop;
+    pub const power_battery_width = config.widths.power_battery;
+    pub const processor_width = config.widths.processor;
+    pub const thermal_width = config.widths.thermal;
+    pub const storage_width = config.widths.storage;
+    pub const network_width = config.widths.network;
+    pub const base_fixed_cells = config.widths.base_fixed_cells;
 
     const PowerLayoutMode = enum {
         hidden,
@@ -59,13 +60,13 @@ pub const StatusMonitor = struct {
         battery_and_watts,
     };
 
-    const hover_reveal_ns: i96 = 1 * std.time.ns_per_s; // >1.0s continuous 1px edge hover
-    const leave_grace_ns: i96 = 120 * std.time.ns_per_ms; // brief anti-twitch grace on exit
-    const fade_in_ns: i96 = 250 * std.time.ns_per_ms; // smooth cubic ease-out reveal
-    const fade_out_ns: i96 = 180 * std.time.ns_per_ms; // smooth fade-out on hide
-    const marquee_step_ns: i96 = 125 * std.time.ns_per_ms; // snap-mode character advance (8 chars/s)
-    const smooth_px_ns: i96 = 16_666_667; // smooth-mode 1 logical px per 60Hz VSync (60 px/s)
-    const smooth_char_ns: i96 = 7 * smooth_px_ns; // 7 logical px per character cell (~116.67ms)
+    const hover_reveal_ns: i96 = config.hover_reveal_ns;
+    const leave_grace_ns: i96 = config.leave_grace_ns;
+    const fade_in_ns: i96 = config.fade_in_ns;
+    const fade_out_ns: i96 = config.fade_out_ns;
+    const marquee_step_ns: i96 = config.marquee_snap_step_ns;
+    const smooth_px_ns: i96 = config.marquee_smooth_px_ns;
+    const smooth_char_ns: i96 = 7 * smooth_px_ns; // 7 logical px per character cell
 
     const VisibilityState = enum {
         hidden,
@@ -83,9 +84,9 @@ pub const StatusMonitor = struct {
     window: *Window,
 
     // Mode, visibility & monotonic deadlines (framerate-free)
-    mode: BarMode = .auto_hide,
+    mode: BarMode = config.default_initial_mode,
     state: VisibilityState = .hidden,
-    visible_sample_ns: i96 = std.time.ns_per_s / 8,
+    visible_sample_ns: i96 = @divTrunc(std.time.ns_per_s, @as(i96, config.default_visible_sample_hz)),
     sample_start_ns: i96 = 0,
     next_sample_ns: i96 = 0,
     sample_count: usize = 0,
@@ -142,53 +143,20 @@ pub const StatusMonitor = struct {
         .{ .metric = .{ .window = .{} }, .mode = .message, .start_index = 1 },
     },
 
-    time_segment: Segment = .{
-        .color = 0x595959CC,
-        .on_click = .copy_unix_timestamp,
-    },
-    power_segment: Segment = .{
-        .color = 0x3C6E84CC,
-        .on_click = .copy_power_summary,
-    },
-    processor_segment: Segment = .{
-        .color = 0x844242CC,
-        .static_overlay = "\n\n\n\u{e000}\u{e001}\n\n\n,\n\n\n\u{e002}\u{e003}",
-        .static_offset = 0,
-        .on_click = .{ .spawn_if_installed = .{
-            .bin = "btop",
-            .argv = &.{ "konsole", "-e", "btop" },
-            .fallback = &.{ "konsole", "-e", "htop" },
-        } },
-    },
-    thermal_load_segment: Segment = .{
-        .color = 0x84783CCC,
-        .static_overlay = "\n\n.\n\n\u{e006}\u{e007}\n\n\n\u{e004}\u{e005}",
-        .static_offset = 0,
-        .on_click = .{ .spawn = &.{"screenfix"} },
-    },
-    storage_load_segment: Segment = .{
-        .color = 0x763C84CC,
-        .static_overlay = "\n\n\n.\n\n\u{e010}\u{e011}\n\n\n\n.\n\n\u{e00e}\u{e00f}\n\n\n\n.\n\n\u{e00c}\u{e00d}\n\n\n\n\n.\n\n\nG\u{e012}\u{e013}",
-        .static_offset = 1,
-        .on_click = .{ .spawn = &.{"dolphin"} },
-    },
-    network_load_segment: Segment = .{
-        .color = 0x43843CCC,
-        .static_overlay = "\n\n\n.\n\n\u{e008}\u{e009}\n\n\n\n.\n\n\u{e00a}\u{e00b}",
-        .static_offset = 1,
-        .on_click = .{ .spawn = &.{"usb-restart"} },
-    },
-    window_title_segment: Segment = .{
-        .color = 0x00000077,
-        .on_click = .copy_window_title,
-    },
+    time_segment: Segment = specSegment(config.segments.time),
+    power_segment: Segment = specSegment(config.segments.power),
+    processor_segment: Segment = specSegment(config.segments.processor),
+    thermal_load_segment: Segment = specSegment(config.segments.thermal),
+    storage_load_segment: Segment = specSegment(config.segments.storage),
+    network_load_segment: Segment = specSegment(config.segments.network),
+    window_title_segment: Segment = specSegment(config.segments.window_title),
 
     segments: [7]*Segment = undefined,
     power_layout_mode: PowerLayoutMode = .hidden,
     last_power_flow: PowerFlow = .maintaining,
 
     // Active window marquee state (monotonic time-driven)
-    marquee_mode: MarqueeMode = .smooth,
+    marquee_mode: MarqueeMode = config.default_marquee_mode,
     title_extra_slot: usize = 0,
     marquee_clip_scrolling: bool = false,
     marquee_active_clip_min: i16 = -32768,
@@ -374,8 +342,8 @@ pub const StatusMonitor = struct {
                 // Battery without power sensors: " 98%🔋 " (7 cells)
                 self.power_metrics[0].start_index = power_battery_only_width;
                 self.power_metrics[0].secondary_index = null;
-                self.power_segment.static_offset = 3;
-                self.power_segment.static_overlay = "%\u{e022}\u{e023}";
+                self.power_segment.static_offset = config.power_overlays.battery_only.offset;
+                self.power_segment.static_overlay = config.power_overlays.battery_only.overlay;
                 self.power_segment.metrics = self.power_metrics[0..2];
                 return power_battery_only_width;
             },
@@ -383,8 +351,8 @@ pub const StatusMonitor = struct {
                 // Desktop with power sensors: " 14.2W⚡ " (9 cells)
                 self.power_metrics[0].start_index = 1;
                 self.power_metrics[0].secondary_index = null;
-                self.power_segment.static_offset = 6;
-                self.power_segment.static_overlay = "\u{e024}\u{e025}";
+                self.power_segment.static_offset = config.power_overlays.desktop_watts.offset;
+                self.power_segment.static_overlay = config.power_overlays.desktop_watts.overlay;
                 self.power_segment.metrics = self.power_metrics[0..1];
                 return power_desktop_width;
             },
@@ -392,8 +360,8 @@ pub const StatusMonitor = struct {
                 // Laptop fixed width: " 98%🔋 -14.2W⚡ " / " 64%🔋 +38.5W⚡ " / " 98%🔋  10.0W⚡ " (16 cells)
                 self.power_metrics[0].start_index = 7;
                 self.power_metrics[0].secondary_index = null;
-                self.power_segment.static_offset = 3;
-                self.power_segment.static_overlay = "%\u{e022}\u{e023}\n\n\n\n\n\n\n\u{e024}\u{e025}";
+                self.power_segment.static_offset = config.power_overlays.battery_and_watts.offset;
+                self.power_segment.static_overlay = config.power_overlays.battery_and_watts.overlay;
                 self.power_segment.metrics = self.power_metrics[0..2];
                 return power_battery_width;
             },
@@ -429,8 +397,7 @@ pub const StatusMonitor = struct {
         self.rect_width_i = @max(1, @as(i16, @intFromFloat(@ceil(raw_width_f * 32767.0))));
         self.rect_width_f = @as(f32, @floatFromInt(self.rect_width_i)) / 32767.0;
 
-        // 0.52 vertically centers Tamzen inside the 17px bar
-        self.rect_y_pos = @intFromFloat(self.rect_height * 32767.0 * 0.52);
+        self.rect_y_pos = @intFromFloat(self.rect_height * 32767.0 * config.glyph_vertical_align);
 
         self.generateCells(base_fixed_cells + power_width);
 
@@ -1103,12 +1070,12 @@ pub const StatusMonitor = struct {
 
             if (self.title_len > max_chars and self.title_len + 3 <= self.title_codepoints.len) {
                 self.title_codepoints[self.title_len] = ' ';
-                self.title_codepoints[self.title_len + 1] = 0x02;
+                self.title_codepoints[self.title_len + 1] = config.marquee_separator_codepoint;
                 self.title_codepoints[self.title_len + 2] = ' ';
                 self.title_len += 3;
             }
 
-            self.marquee_start_ns = now_ns + std.time.ns_per_s;
+            self.marquee_start_ns = now_ns + config.marquee_initial_pause_ns;
             self.marquee_next_ns = self.marquee_start_ns;
             self.title_rotations = 0;
 
@@ -1123,7 +1090,7 @@ pub const StatusMonitor = struct {
                 const cell_px = self.cellPhysPixels();
                 const elapsed_ns = @max(0, now_ns - self.marquee_start_ns);
                 const total_px_steps = @divTrunc(2 * elapsed_ns * cell_px + smooth_char_ns, 2 * smooth_char_ns);
-                const total_limit_chars = self.title_len * 2;
+                const total_limit_chars = self.title_len * config.marquee_loops_before_rest;
                 const total_limit_px: i96 = @as(i96, @intCast(total_limit_chars)) * cell_px;
 
                 if (total_px_steps >= total_limit_px) {
@@ -1135,7 +1102,7 @@ pub const StatusMonitor = struct {
                     if (self.drawCodepoints(seg, self.title_codepoints[0..max_chars], 1)) {
                         changed = true;
                     }
-                    self.marquee_start_ns = now_ns + 60 * std.time.ns_per_s;
+                    self.marquee_start_ns = now_ns + config.marquee_rest_pause_ns;
                     self.marquee_next_ns = self.marquee_start_ns;
                     return changed;
                 }
@@ -1213,13 +1180,13 @@ pub const StatusMonitor = struct {
         // Character-snapping marquee (`--marquee=snap`): edge-to-edge while scrolling, 1-cell gaps when paused
         if (self.title_len > max_chars and now_ns >= self.marquee_next_ns) {
             self.title_rotations += 1;
-            if (self.title_rotations >= self.title_len * 2) {
+            if (self.title_rotations >= self.title_len * config.marquee_loops_before_rest) {
                 var changed = self.marquee_clip_scrolling;
                 self.marquee_clip_scrolling = false;
                 if (self.resetTitleCellPositions()) changed = true;
                 if (self.clearSegment(seg)) changed = true;
                 if (self.drawCodepoints(seg, self.title_codepoints[0..max_chars], 1)) changed = true;
-                self.marquee_next_ns = now_ns + 60 * std.time.ns_per_s;
+                self.marquee_next_ns = now_ns + config.marquee_rest_pause_ns;
                 self.title_rotations = 0;
                 return changed;
             }

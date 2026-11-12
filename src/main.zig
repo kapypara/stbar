@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const c = @import("c");
 const types = @import("Types.zig");
+const config = @import("config.zig");
 const BarPosition = types.BarPosition;
 const MarqueeMode = types.MarqueeMode;
 const window_zig = @import("Window.zig");
@@ -10,25 +11,6 @@ const BackendPreference = window_zig.BackendPreference;
 const status_zig = @import("StatusMonitor.zig");
 const StatusMonitor = status_zig.StatusMonitor;
 const BarMode = status_zig.BarMode;
-
-/// Default display server backend (`--backend=auto|wayland|wayland-egl|x11|x11-glx`):
-/// - `.auto`: native Wayland `zwlr_layer_shell_v1` + `wl_shm` when `WAYLAND_DISPLAY` is set, else X11 `MIT-SHM`
-const default_backend_mode: BackendPreference = .auto;
-
-/// Default startup bar mode (`--mode=auto-hide|pinned|dock`):
-/// - `.auto_hide`: overlay (`strut = OFF`), 1px edge hover sensor (>1s reveal, 0 Hz sleep while hidden)
-/// - `.pinned_overlay`: overlay (`strut = OFF`), always visible
-/// - `.docked_strut`: reserved 17px dock (`strut = ON`), always visible
-const default_initial_mode: BarMode = .auto_hide;
-
-/// Default screen edge anchor (`-p, --position=top|bottom`).
-const default_bar_position: BarPosition = .top;
-
-/// Default overflowing window-title scroll style (`--marquee=smooth|snap`).
-const default_marquee_mode: MarqueeMode = .smooth;
-
-/// Default metric sample frequency while visible (`--hz=1..60`; 0 Hz while hidden).
-const default_visible_sample_hz: u8 = 8;
 
 var stop_requested: std.atomic.Value(bool) = .init(false);
 var sig_usr1_pending: std.atomic.Value(bool) = .init(false);
@@ -49,11 +31,11 @@ fn onSignal(sig: c_int) callconv(.c) void {
 }
 
 const CliConfig = struct {
-    mode: BarMode = default_initial_mode,
-    position: BarPosition = default_bar_position,
-    marquee: MarqueeMode = default_marquee_mode,
-    backend: BackendPreference = default_backend_mode,
-    sample_hz: u8 = default_visible_sample_hz,
+    mode: BarMode = config.default_initial_mode,
+    position: BarPosition = config.default_bar_position,
+    marquee: MarqueeMode = config.default_marquee_mode,
+    backend: BackendPreference = config.default_backend_mode,
+    sample_hz: u8 = config.default_visible_sample_hz,
     output: [64]u8 = @splat(0),
     output_len: u8 = 0,
     exit_early: bool = false,
@@ -275,13 +257,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .position = cli.position,
         .docked = true,
         .strut_enabled = (cli.mode == .docked_strut),
-        .input_height = if (cli.mode == .auto_hide) 1 else 14 + 3,
+        .input_height = if (cli.mode == .auto_hide) 1 else config.bar_height_px,
         .wakeup_fd = sig_pipe[0],
     };
     window.setTargetOutput(cli.outputSlice());
 
-    // width = 0 auto-detects the active output width; height = 14 + 3 = 17px
-    try window.init(0, 0, 0, 14 + 3);
+    // width = 0 auto-detects the active output width
+    try window.init(0, 0, 0, config.bar_height_px);
     defer window.deinit();
 
     var monitor: StatusMonitor = .{
@@ -304,6 +286,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
 test {
     _ = @import("Types.zig");
+    _ = @import("config.zig");
     _ = @import("formats.zig");
     _ = @import("Actions.zig");
     _ = @import("Segment.zig");

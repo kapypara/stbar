@@ -14,6 +14,29 @@ pub const Click = struct {
     button: u32 = 0,
 };
 
+pub const BarMode = enum {
+    /// Overlay (`strut = OFF`): hides to 1px edge strip (`0 Hz` `poll(-1)` sleep) and fades in after hover delay.
+    auto_hide,
+    /// Overlay (`strut = OFF`): stays visible without auto-hiding (toggled via right-click / `SIGUSR1`).
+    pinned_overlay,
+    /// Dock (`strut = ON`): reserves exclusive zone / strut and stays visible (toggled via middle-click / `SIGUSR2`).
+    docked_strut,
+};
+
+pub const BackendPreference = enum {
+    /// Prefer native Wayland `zwlr_layer_shell_v1` + `wl_shm` when `WAYLAND_DISPLAY` is active,
+    /// falling back to `wayland-egl`, `x11` (`MIT-SHM`), or `x11-glx` automatically.
+    auto,
+    /// Native Wayland `zwlr_layer_shell_v1` + `wl_shm` (single-threaded, <1 MB private RSS, zero Mesa load).
+    wayland,
+    /// Native Wayland `zwlr_layer_shell_v1` + `EGL` / OpenGL 3.2 Core (`-Dgpu=true`).
+    wayland_egl,
+    /// Native X11 / Xwayland + `MIT-SHM` (`XShmPutImage`, single-threaded, <1 MB private RSS, zero Mesa load).
+    x11,
+    /// Force X11 / Xwayland + `GLX` / OpenGL 3.2 Core (`-Dgpu=true`).
+    x11_glx,
+};
+
 pub const BarPosition = enum {
     top,
     bottom,
