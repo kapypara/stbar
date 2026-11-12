@@ -185,6 +185,14 @@ pub const Window = struct {
         };
     }
 
+    pub fn setClipboard(self: *Window, text: []const u8) void {
+        switch (self.backend) {
+            .wayland => |*wl| wl.setClipboard(text),
+            .x11 => |*x11| x11.setClipboard(text),
+            .none => {},
+        }
+    }
+
     pub fn setStrut(self: *Window, enabled: bool) void {
         self.strut_enabled = enabled;
         switch (self.backend) {

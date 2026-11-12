@@ -28,6 +28,17 @@ pub const X11Backend = struct {
     net_wm_name_atom: c.Atom = 0,
     wm_name_atom: c.Atom = 0,
 
+    // Native in-process X11 ICCCM `CLIPBOARD` selection atoms & buffer
+    clipboard_atom: c.Atom = 0,
+    targets_atom: c.Atom = 0,
+    utf8_string_atom: c.Atom = 0,
+    text_atom: c.Atom = 0,
+    text_plain_atom: c.Atom = 0,
+    text_plain_utf8_atom: c.Atom = 0,
+    last_event_time: c.Time = c.CurrentTime,
+    clipboard_buf: [512]u8 = @splat(0),
+    clipboard_len: usize = 0,
+
     width: i32 = 800,
     height: i32 = 17,
     x: i32 = 0,
@@ -199,6 +210,12 @@ pub const X11Backend = struct {
         self.net_active_window_atom = c.XInternAtom(dpy, "_NET_ACTIVE_WINDOW", c.False);
         self.net_wm_name_atom = c.XInternAtom(dpy, "_NET_WM_NAME", c.False);
         self.wm_name_atom = c.XInternAtom(dpy, "WM_NAME", c.False);
+        self.clipboard_atom = c.XInternAtom(dpy, "CLIPBOARD", c.False);
+        self.targets_atom = c.XInternAtom(dpy, "TARGETS", c.False);
+        self.utf8_string_atom = c.XInternAtom(dpy, "UTF8_STRING", c.False);
+        self.text_atom = c.XInternAtom(dpy, "TEXT", c.False);
+        self.text_plain_atom = c.XInternAtom(dpy, "text/plain", c.False);
+        self.text_plain_utf8_atom = c.XInternAtom(dpy, "text/plain;charset=utf-8", c.False);
         _ = c.XSelectInput(dpy, self.root, c.PropertyChangeMask);
 
         var root_ret: c.Window = 0;
@@ -350,12 +367,16 @@ pub const X11Backend = struct {
                     }
                 },
                 c.ButtonPress => {
+                    self.last_event_time = event.xbutton.time;
                     self.last_click = .{
                         .x = event.xbutton.x,
                         .y = event.xbutton.y,
                         .button = event.xbutton.button,
                     };
                     self.clicked = true;
+                },
+                c.SelectionRequest => {
+                    self.handleSelectionRequest(&event.xselectionrequest);
                 },
                 c.PropertyNotify => {
                     const atom = event.xproperty.atom;
@@ -399,5 +420,76 @@ pub const X11Backend = struct {
 
     pub fn swapBuffers(self: *const X11Backend) void {
         c.glXSwapBuffers(self.display, self.glx_handle);
+    }
+
+    pub fn setClipboard(self: *X11Backend, text: []const u8) void {
+        if (text.len == 0) return;
+        const dpy = self.display orelse return;
+        if (self.handle == 0 or self.clipboard_atom == 0) return;
+
+        const copy_len = @min(text.len, self.clipboard_buf.len);
+        @memcpy(self.clipboard_buf[0..copy_len], text[0..copy_len]);
+        self.clipboard_len = copy_len;
+
+        _ = c.XSetSelectionOwner(dpy, self.clipboard_atom, self.handle, self.last_event_time);
+        _ = c.XFlush(dpy);
+    }
+
+    fn handleSelectionRequest(self: *X11Backend, req: *const c.XSelectionRequestEvent) void {
+        const dpy = self.display orelse return;
+        const prop: c.Atom = if (req.property != c.None) req.property else req.target;
+
+        var reply = std.mem.zeroes(c.XSelectionEvent);
+        reply.type = c.SelectionNotify;
+        reply.display = req.display;
+        reply.requestor = req.requestor;
+        reply.selection = req.selection;
+        reply.target = req.target;
+        reply.property = c.None;
+        reply.time = req.time;
+
+        if (req.selection == self.clipboard_atom and self.clipboard_len > 0) {
+            if (req.target == self.targets_atom) {
+                const targets = [_]c.Atom{
+                    self.targets_atom,
+                    self.utf8_string_atom,
+                    c.XA_STRING,
+                    self.text_atom,
+                    self.text_plain_atom,
+                    self.text_plain_utf8_atom,
+                };
+                _ = c.XChangeProperty(
+                    dpy,
+                    req.requestor,
+                    prop,
+                    c.XA_ATOM,
+                    32,
+                    c.PropModeReplace,
+                    @ptrCast(&targets),
+                    targets.len,
+                );
+                reply.property = prop;
+            } else if (req.target == self.utf8_string_atom or
+                req.target == c.XA_STRING or
+                req.target == self.text_atom or
+                req.target == self.text_plain_atom or
+                req.target == self.text_plain_utf8_atom)
+            {
+                _ = c.XChangeProperty(
+                    dpy,
+                    req.requestor,
+                    prop,
+                    req.target,
+                    8,
+                    c.PropModeReplace,
+                    &self.clipboard_buf,
+                    @intCast(self.clipboard_len),
+                );
+                reply.property = prop;
+            }
+        }
+
+        _ = c.XSendEvent(dpy, req.requestor, c.False, 0, @ptrCast(&reply));
+        _ = c.XFlush(dpy);
     }
 };

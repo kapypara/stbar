@@ -65,6 +65,29 @@ pub const WaylandBackend = struct {
     layer_shell: ?*c.struct_zwlr_layer_shell_v1 = null,
     layer_surface: ?*c.struct_zwlr_layer_surface_v1 = null,
 
+    // Native in-process Wayland clipboard (`ext-data-control-v1` -> `wlr-data-control-v1` -> `wl_data_device`)
+    ext_data_manager: ?*c.struct_ext_data_control_manager_v1 = null,
+    ext_data_device: ?*c.struct_ext_data_control_device_v1 = null,
+    ext_data_source: ?*c.struct_ext_data_control_source_v1 = null,
+    pending_ext_offer: ?*c.struct_ext_data_control_offer_v1 = null,
+    ext_data_denied: bool = false,
+
+    wlr_data_manager: ?*c.struct_zwlr_data_control_manager_v1 = null,
+    wlr_data_device: ?*c.struct_zwlr_data_control_device_v1 = null,
+    wlr_data_source: ?*c.struct_zwlr_data_control_source_v1 = null,
+    pending_wlr_offer: ?*c.struct_zwlr_data_control_offer_v1 = null,
+    wlr_data_denied: bool = false,
+
+    wl_data_manager: ?*c.struct_wl_data_device_manager = null,
+    wl_data_device: ?*c.struct_wl_data_device = null,
+    wl_data_source: ?*c.struct_wl_data_source = null,
+    pending_wl_offer: ?*c.struct_wl_data_offer = null,
+    dnd_wl_offer: ?*c.struct_wl_data_offer = null,
+
+    last_button_serial: u32 = 0,
+    clipboard_buf: [512]u8 = @splat(0),
+    clipboard_len: usize = 0,
+
     toplevel_manager: ?*c.struct_zwlr_foreign_toplevel_manager_v1 = null,
     toplevels: [max_toplevels]ToplevelSlot = @splat(.{}),
     has_foreign_toplevel: bool = false,
@@ -201,6 +224,7 @@ pub const WaylandBackend = struct {
             c.zwlr_layer_shell_v1_destroy(shell);
             self.layer_shell = null;
         }
+        self.deinitClipboard();
         if (self.wl_pointer) |ptr| {
             c.wl_pointer_destroy(ptr);
             self.wl_pointer = null;
@@ -859,6 +883,33 @@ pub const WaylandBackend = struct {
                 &toplevel_manager_listener,
                 self,
             );
+        } else if (std.mem.eql(u8, iface, "ext_data_control_manager_v1")) {
+            if (self.ext_data_manager == null) {
+                self.ext_data_manager = @ptrCast(c.wl_registry_bind(
+                    registry,
+                    name,
+                    &c.ext_data_control_manager_v1_interface,
+                    1,
+                ));
+            }
+        } else if (std.mem.eql(u8, iface, "zwlr_data_control_manager_v1")) {
+            if (self.wlr_data_manager == null) {
+                self.wlr_data_manager = @ptrCast(c.wl_registry_bind(
+                    registry,
+                    name,
+                    &c.zwlr_data_control_manager_v1_interface,
+                    1,
+                ));
+            }
+        } else if (std.mem.eql(u8, iface, "wl_data_device_manager")) {
+            if (self.wl_data_manager == null) {
+                self.wl_data_manager = @ptrCast(c.wl_registry_bind(
+                    registry,
+                    name,
+                    &c.wl_data_device_manager_interface,
+                    1,
+                ));
+            }
         }
     }
 
@@ -1000,13 +1051,14 @@ pub const WaylandBackend = struct {
     fn pointerButton(
         data: ?*anyopaque,
         _: ?*c.struct_wl_pointer,
-        _: u32,
+        serial: u32,
         _: u32,
         button: u32,
         state: u32,
     ) callconv(.c) void {
         if (state != c.WL_POINTER_BUTTON_STATE_PRESSED) return;
         const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        self.last_button_serial = serial;
 
         const mapped_btn: u32 = switch (button) {
             BTN_LEFT => 1,
@@ -1162,6 +1214,428 @@ pub const WaylandBackend = struct {
         if (!found and self.active_title_len != 0) {
             self.active_title_len = 0;
             self.title_dirty = true;
+        }
+    }
+
+    // --- Native In-Process Wayland Clipboard ---
+
+    const clipboard_mimes = [_][*:0]const u8{
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+        "STRING",
+        "TEXT",
+    };
+
+    pub fn setClipboard(self: *WaylandBackend, text: []const u8) void {
+        if (text.len == 0) return;
+        const copy_len = @min(text.len, self.clipboard_buf.len);
+        @memcpy(self.clipboard_buf[0..copy_len], text[0..copy_len]);
+        self.clipboard_len = copy_len;
+
+        self.applyWaylandSelection();
+    }
+
+    fn applyWaylandSelection(self: *WaylandBackend) void {
+        const dpy = self.wl_display orelse return;
+        const seat = self.wl_seat orelse return;
+
+        // Tier 1: `ext_data_control_manager_v1` (KWin 6+, Sway, Hyprland — works without stealing keyboard focus)
+        if (!self.ext_data_denied) {
+            if (self.ext_data_manager) |mgr| {
+                if (self.ext_data_source) |old| {
+                    c.ext_data_control_source_v1_destroy(old);
+                    self.ext_data_source = null;
+                }
+                if (self.ext_data_device == null) {
+                    self.ext_data_device = c.ext_data_control_manager_v1_get_data_device(mgr, seat);
+                    if (self.ext_data_device) |dev| {
+                        _ = c.ext_data_control_device_v1_add_listener(dev, &ext_device_listener, self);
+                    }
+                }
+                if (self.ext_data_device) |dev| {
+                    if (c.ext_data_control_manager_v1_create_data_source(mgr)) |src| {
+                        self.ext_data_source = src;
+                        _ = c.ext_data_control_source_v1_add_listener(src, &ext_source_listener, self);
+                        for (clipboard_mimes) |mime| {
+                            c.ext_data_control_source_v1_offer(src, mime);
+                        }
+                        c.ext_data_control_device_v1_set_selection(dev, src);
+                        _ = c.wl_display_flush(dpy);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Tier 2: `zwlr_data_control_manager_v1` (wlroots compositors without ext-data-control)
+        if (!self.wlr_data_denied) {
+            if (self.wlr_data_manager) |mgr| {
+                if (self.wlr_data_source) |old| {
+                    c.zwlr_data_control_source_v1_destroy(old);
+                    self.wlr_data_source = null;
+                }
+                if (self.wlr_data_device == null) {
+                    self.wlr_data_device = c.zwlr_data_control_manager_v1_get_data_device(mgr, seat);
+                    if (self.wlr_data_device) |dev| {
+                        _ = c.zwlr_data_control_device_v1_add_listener(dev, &wlr_device_listener, self);
+                    }
+                }
+                if (self.wlr_data_device) |dev| {
+                    if (c.zwlr_data_control_manager_v1_create_data_source(mgr)) |src| {
+                        self.wlr_data_source = src;
+                        _ = c.zwlr_data_control_source_v1_add_listener(src, &wlr_source_listener, self);
+                        for (clipboard_mimes) |mime| {
+                            c.zwlr_data_control_source_v1_offer(src, mime);
+                        }
+                        c.zwlr_data_control_device_v1_set_selection(dev, src);
+                        _ = c.wl_display_flush(dpy);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Tier 3: Core `wl_data_device_manager` fallback using the pointer click serial
+        if (self.wl_data_manager) |mgr| {
+            if (self.wl_data_source) |old| {
+                c.wl_data_source_destroy(old);
+                self.wl_data_source = null;
+            }
+            if (self.wl_data_device == null) {
+                self.wl_data_device = c.wl_data_device_manager_get_data_device(mgr, seat);
+                if (self.wl_data_device) |dev| {
+                    _ = c.wl_data_device_add_listener(dev, &wl_device_listener, self);
+                }
+            }
+            if (self.wl_data_device) |dev| {
+                if (c.wl_data_device_manager_create_data_source(mgr)) |src| {
+                    self.wl_data_source = src;
+                    _ = c.wl_data_source_add_listener(src, &wl_source_listener, self);
+                    for (clipboard_mimes) |mime| {
+                        c.wl_data_source_offer(src, mime);
+                    }
+                    c.wl_data_device_set_selection(dev, src, self.last_button_serial);
+                    _ = c.wl_display_flush(dpy);
+                }
+            }
+        }
+    }
+
+    fn destroyExtDataDevice(self: *WaylandBackend) void {
+        if (self.pending_ext_offer) |o| {
+            c.ext_data_control_offer_v1_destroy(o);
+            self.pending_ext_offer = null;
+        }
+        if (self.ext_data_source) |src| {
+            c.ext_data_control_source_v1_destroy(src);
+            self.ext_data_source = null;
+        }
+        if (self.ext_data_device) |dev| {
+            c.ext_data_control_device_v1_destroy(dev);
+            self.ext_data_device = null;
+        }
+    }
+
+    fn destroyWlrDataDevice(self: *WaylandBackend) void {
+        if (self.pending_wlr_offer) |o| {
+            c.zwlr_data_control_offer_v1_destroy(o);
+            self.pending_wlr_offer = null;
+        }
+        if (self.wlr_data_source) |src| {
+            c.zwlr_data_control_source_v1_destroy(src);
+            self.wlr_data_source = null;
+        }
+        if (self.wlr_data_device) |dev| {
+            c.zwlr_data_control_device_v1_destroy(dev);
+            self.wlr_data_device = null;
+        }
+    }
+
+    fn destroyWlDataDevice(self: *WaylandBackend) void {
+        if (self.pending_wl_offer) |o| {
+            c.wl_data_offer_destroy(o);
+            self.pending_wl_offer = null;
+        }
+        if (self.dnd_wl_offer) |o| {
+            c.wl_data_offer_destroy(o);
+            self.dnd_wl_offer = null;
+        }
+        if (self.wl_data_source) |src| {
+            c.wl_data_source_destroy(src);
+            self.wl_data_source = null;
+        }
+        if (self.wl_data_device) |dev| {
+            c.wl_data_device_destroy(dev);
+            self.wl_data_device = null;
+        }
+    }
+
+    fn deinitClipboard(self: *WaylandBackend) void {
+        self.destroyExtDataDevice();
+        self.destroyWlrDataDevice();
+        self.destroyWlDataDevice();
+        if (self.ext_data_manager) |mgr| {
+            c.ext_data_control_manager_v1_destroy(mgr);
+            self.ext_data_manager = null;
+        }
+        if (self.wlr_data_manager) |mgr| {
+            c.zwlr_data_control_manager_v1_destroy(mgr);
+            self.wlr_data_manager = null;
+        }
+        if (self.wl_data_manager) |mgr| {
+            c.wl_data_device_manager_destroy(mgr);
+            self.wl_data_manager = null;
+        }
+    }
+
+    fn writeClipboardFd(fd: i32, bytes: []const u8) void {
+        if (fd < 0) return;
+        defer _ = c.close(fd);
+        if (bytes.len == 0) return;
+
+        const flags = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+        if (flags >= 0) {
+            _ = c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK);
+        }
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const rc = c.write(fd, bytes[written..].ptr, bytes.len - written);
+            if (rc <= 0) break;
+            written += @intCast(rc);
+        }
+    }
+
+    const ext_offer_listener = c.struct_ext_data_control_offer_v1_listener{
+        .offer = extOfferMime,
+    };
+    fn extOfferMime(_: ?*anyopaque, _: ?*c.struct_ext_data_control_offer_v1, _: [*c]const u8) callconv(.c) void {}
+
+    const ext_device_listener = c.struct_ext_data_control_device_v1_listener{
+        .data_offer = extDeviceDataOffer,
+        .selection = extDeviceSelection,
+        .finished = extDeviceFinished,
+        .primary_selection = extDevicePrimarySelection,
+    };
+
+    fn extDeviceDataOffer(
+        data: ?*anyopaque,
+        _: ?*c.struct_ext_data_control_device_v1,
+        offer: ?*c.struct_ext_data_control_offer_v1,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.pending_ext_offer) |prev| c.ext_data_control_offer_v1_destroy(prev);
+        self.pending_ext_offer = offer;
+        if (offer) |o| {
+            _ = c.ext_data_control_offer_v1_add_listener(o, &ext_offer_listener, self);
+        }
+    }
+
+    fn extDeviceSelection(
+        data: ?*anyopaque,
+        _: ?*c.struct_ext_data_control_device_v1,
+        offer: ?*c.struct_ext_data_control_offer_v1,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.pending_ext_offer == offer) self.pending_ext_offer = null;
+        if (offer) |o| c.ext_data_control_offer_v1_destroy(o);
+    }
+
+    fn extDevicePrimarySelection(
+        data: ?*anyopaque,
+        _: ?*c.struct_ext_data_control_device_v1,
+        offer: ?*c.struct_ext_data_control_offer_v1,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.pending_ext_offer == offer) self.pending_ext_offer = null;
+        if (offer) |o| c.ext_data_control_offer_v1_destroy(o);
+    }
+
+    fn extDeviceFinished(data: ?*anyopaque, _: ?*c.struct_ext_data_control_device_v1) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        self.destroyExtDataDevice();
+        self.ext_data_denied = true;
+        if (self.clipboard_len > 0) self.applyWaylandSelection();
+    }
+
+    const ext_source_listener = c.struct_ext_data_control_source_v1_listener{
+        .send = extSourceSend,
+        .cancelled = extSourceCancelled,
+    };
+
+    fn extSourceSend(
+        data: ?*anyopaque,
+        _: ?*c.struct_ext_data_control_source_v1,
+        _: [*c]const u8,
+        fd: i32,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        writeClipboardFd(fd, self.clipboard_buf[0..self.clipboard_len]);
+    }
+
+    fn extSourceCancelled(data: ?*anyopaque, src: ?*c.struct_ext_data_control_source_v1) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.ext_data_source == src) {
+            self.destroyExtDataDevice(); // Unsubscribes from future desktop Ctrl+C events immediately
+        } else if (src != null) {
+            c.ext_data_control_source_v1_destroy(src);
+        }
+    }
+
+    const wlr_offer_listener = c.struct_zwlr_data_control_offer_v1_listener{
+        .offer = wlrOfferMime,
+    };
+    fn wlrOfferMime(_: ?*anyopaque, _: ?*c.struct_zwlr_data_control_offer_v1, _: [*c]const u8) callconv(.c) void {}
+
+    const wlr_device_listener = c.struct_zwlr_data_control_device_v1_listener{
+        .data_offer = wlrDeviceDataOffer,
+        .selection = wlrDeviceSelection,
+        .finished = wlrDeviceFinished,
+    };
+
+    fn wlrDeviceDataOffer(
+        data: ?*anyopaque,
+        _: ?*c.struct_zwlr_data_control_device_v1,
+        offer: ?*c.struct_zwlr_data_control_offer_v1,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.pending_wlr_offer) |prev| c.zwlr_data_control_offer_v1_destroy(prev);
+        self.pending_wlr_offer = offer;
+        if (offer) |o| {
+            _ = c.zwlr_data_control_offer_v1_add_listener(o, &wlr_offer_listener, self);
+        }
+    }
+
+    fn wlrDeviceSelection(
+        data: ?*anyopaque,
+        _: ?*c.struct_zwlr_data_control_device_v1,
+        offer: ?*c.struct_zwlr_data_control_offer_v1,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.pending_wlr_offer == offer) self.pending_wlr_offer = null;
+        if (offer) |o| c.zwlr_data_control_offer_v1_destroy(o);
+    }
+
+    fn wlrDeviceFinished(data: ?*anyopaque, _: ?*c.struct_zwlr_data_control_device_v1) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        self.destroyWlrDataDevice();
+        self.wlr_data_denied = true;
+        if (self.clipboard_len > 0) self.applyWaylandSelection();
+    }
+
+    const wlr_source_listener = c.struct_zwlr_data_control_source_v1_listener{
+        .send = wlrSourceSend,
+        .cancelled = wlrSourceCancelled,
+    };
+
+    fn wlrSourceSend(
+        data: ?*anyopaque,
+        _: ?*c.struct_zwlr_data_control_source_v1,
+        _: [*c]const u8,
+        fd: i32,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        writeClipboardFd(fd, self.clipboard_buf[0..self.clipboard_len]);
+    }
+
+    fn wlrSourceCancelled(data: ?*anyopaque, src: ?*c.struct_zwlr_data_control_source_v1) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.wlr_data_source == src) {
+            self.destroyWlrDataDevice();
+        } else if (src != null) {
+            c.zwlr_data_control_source_v1_destroy(src);
+        }
+    }
+
+    const wl_offer_listener = c.struct_wl_data_offer_listener{
+        .offer = wlOfferMime,
+    };
+    fn wlOfferMime(_: ?*anyopaque, _: ?*c.struct_wl_data_offer, _: [*c]const u8) callconv(.c) void {}
+
+    const wl_device_listener = c.struct_wl_data_device_listener{
+        .data_offer = wlDeviceDataOffer,
+        .enter = wlDeviceEnter,
+        .leave = wlDeviceLeave,
+        .motion = wlDeviceMotion,
+        .drop = wlDeviceDrop,
+        .selection = wlDeviceSelection,
+    };
+
+    fn wlDeviceDataOffer(
+        data: ?*anyopaque,
+        _: ?*c.struct_wl_data_device,
+        offer: ?*c.struct_wl_data_offer,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.pending_wl_offer) |prev| c.wl_data_offer_destroy(prev);
+        self.pending_wl_offer = offer;
+        if (offer) |o| {
+            _ = c.wl_data_offer_add_listener(o, &wl_offer_listener, self);
+        }
+    }
+
+    fn wlDeviceEnter(
+        data: ?*anyopaque,
+        _: ?*c.struct_wl_data_device,
+        _: u32,
+        _: ?*c.struct_wl_surface,
+        _: c.wl_fixed_t,
+        _: c.wl_fixed_t,
+        offer: ?*c.struct_wl_data_offer,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.pending_wl_offer == offer) self.pending_wl_offer = null;
+        if (self.dnd_wl_offer != null and self.dnd_wl_offer != offer) {
+            c.wl_data_offer_destroy(self.dnd_wl_offer);
+        }
+        self.dnd_wl_offer = offer;
+    }
+
+    fn wlDeviceLeave(data: ?*anyopaque, _: ?*c.struct_wl_data_device) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.dnd_wl_offer) |o| {
+            c.wl_data_offer_destroy(o);
+            self.dnd_wl_offer = null;
+        }
+    }
+
+    fn wlDeviceMotion(_: ?*anyopaque, _: ?*c.struct_wl_data_device, _: u32, _: c.wl_fixed_t, _: c.wl_fixed_t) callconv(.c) void {}
+    fn wlDeviceDrop(_: ?*anyopaque, _: ?*c.struct_wl_data_device) callconv(.c) void {}
+
+    fn wlDeviceSelection(
+        data: ?*anyopaque,
+        _: ?*c.struct_wl_data_device,
+        offer: ?*c.struct_wl_data_offer,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.pending_wl_offer == offer) self.pending_wl_offer = null;
+        if (offer) |o| c.wl_data_offer_destroy(o);
+    }
+
+    const wl_source_listener = c.struct_wl_data_source_listener{
+        .target = wlSourceTarget,
+        .send = wlSourceSend,
+        .cancelled = wlSourceCancelled,
+    };
+
+    fn wlSourceTarget(_: ?*anyopaque, _: ?*c.struct_wl_data_source, _: [*c]const u8) callconv(.c) void {}
+
+    fn wlSourceSend(
+        data: ?*anyopaque,
+        _: ?*c.struct_wl_data_source,
+        _: [*c]const u8,
+        fd: i32,
+    ) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        writeClipboardFd(fd, self.clipboard_buf[0..self.clipboard_len]);
+    }
+
+    fn wlSourceCancelled(data: ?*anyopaque, src: ?*c.struct_wl_data_source) callconv(.c) void {
+        const self: *WaylandBackend = @ptrCast(@alignCast(data.?));
+        if (self.wl_data_source == src) {
+            self.destroyWlDataDevice();
+        } else if (src != null) {
+            c.wl_data_source_destroy(src);
         }
     }
 };

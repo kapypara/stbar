@@ -44,6 +44,7 @@ const usage_text =
     \\
     \\Mouse Controls:
     \\  Hover top 1px (>1s)                            Reveal bar in auto-hide mode
+    \\  Left-click segment                             Run segment action (copy time/title, open btop/dolphin)
     \\  Right-click                                    Toggle pinned overlay (strut OFF) <-> auto-hide
     \\  Middle-click                                   Toggle 17px docked strut (strut ON) <-> auto-hide
     \\
@@ -136,6 +137,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = c.sigaction(c.SIGINT, &sa, null);
     _ = c.sigaction(c.SIGTERM, &sa, null);
 
+    // Automatically reap detached child apps spawned via left-click (`btop`, `dolphin`, etc.)
+    var sa_chld: c.struct_sigaction = std.mem.zeroes(c.struct_sigaction);
+    sa_chld.sa_flags = c.SA_NOCLDWAIT | c.SA_NOCLDSTOP;
+    _ = c.sigaction(c.SIGCHLD, &sa_chld, null);
+
     var single_threaded_io: std.Io.Threaded = .init_single_threaded;
     const io = single_threaded_io.io();
 
@@ -161,6 +167,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
 test {
     _ = @import("formats.zig");
+    _ = @import("Actions.zig");
     _ = @import("Segment.zig");
     _ = @import("FontAtlas.zig");
     _ = @import("ShmDraw.zig");

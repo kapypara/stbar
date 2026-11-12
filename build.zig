@@ -107,6 +107,8 @@ pub fn build(b: *std.Build) void {
         .{ .xml = "protocols/xdg-shell.xml", .stem = "xdg-shell" },
         .{ .xml = "protocols/wlr-layer-shell-unstable-v1.xml", .stem = "wlr-layer-shell-unstable-v1" },
         .{ .xml = "protocols/wlr-foreign-toplevel-management-unstable-v1.xml", .stem = "wlr-foreign-toplevel-management-unstable-v1" },
+        .{ .xml = "protocols/ext-data-control-v1.xml", .stem = "ext-data-control-v1" },
+        .{ .xml = "protocols/wlr-data-control-unstable-v1.xml", .stem = "wlr-data-control-unstable-v1" },
     };
 
     for (protocols) |proto| {
@@ -134,6 +136,8 @@ pub fn build(b: *std.Build) void {
         \\#include "xdg-shell-client-protocol.h"
         \\#include "wlr-layer-shell-unstable-v1-client-protocol.h"
         \\#include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
+        \\#include "ext-data-control-v1-client-protocol.h"
+        \\#include "wlr-data-control-unstable-v1-client-protocol.h"
         \\#include <GL/gl.h>
         \\#include <GL/glext.h>
         \\#include <GL/glx.h>

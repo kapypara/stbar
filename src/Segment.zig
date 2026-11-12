@@ -1,5 +1,6 @@
 const std = @import("std");
 const Metric = @import("metrics.zig").Metric;
+const ClickAction = @import("Actions.zig").ClickAction;
 
 pub const SegmentType = enum {
     average,
@@ -42,6 +43,7 @@ pub const Segment = struct {
     metrics: []MetricEntry = &.{},
     static_overlay: []const u8 = "",
     static_offset: u8 = 0,
+    on_click: ClickAction = .none,
 
     pub fn update(self: *Segment, io: std.Io, sample_idx: usize, prior_progress: f64) void {
         for (self.metrics) |*entry| {

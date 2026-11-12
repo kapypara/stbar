@@ -4,6 +4,7 @@ const font_zig = @import("FontAtlas.zig");
 const FontAtlas = font_zig.FontAtlas;
 const RectDraw = @import("RectDraw.zig").RectDraw;
 const ShmDraw = @import("ShmDraw.zig");
+const actions_zig = @import("Actions.zig");
 const segment_zig = @import("Segment.zig");
 const Window = @import("Window.zig").Window;
 const ticker_zig = @import("Ticker.zig");
@@ -115,29 +116,39 @@ pub const StatusMonitor = struct {
 
     time_segment: Segment = .{
         .color = 0x595959CC,
+        .on_click = .copy_unix_timestamp,
     },
     processor_segment: Segment = .{
         .color = 0x844242CC,
         .static_overlay = "\n\n\n\u{e000}\u{e001}\n\n\n,\n\n\n\u{e002}\u{e003}",
         .static_offset = 0,
+        .on_click = .{ .spawn_if_installed = .{
+            .bin = "btop",
+            .argv = &.{ "konsole", "-e", "btop" },
+            .fallback = &.{ "konsole", "-e", "htop" },
+        } },
     },
     thermal_load_segment: Segment = .{
         .color = 0x84783CCC,
         .static_overlay = "\n\n.\n\n\u{e006}\u{e007}\n\n\n\u{e004}\u{e005}",
         .static_offset = 0,
+        .on_click = .{ .spawn = &.{"screenfix"} },
     },
     storage_load_segment: Segment = .{
         .color = 0x763C84CC,
         .static_overlay = "\n\n\n.\n\n\u{e010}\u{e011}\n\n\n\n.\n\n\u{e00e}\u{e00f}\n\n\n\n.\n\n\u{e00c}\u{e00d}\n\n\n\n\n.\n\n\nG\u{e012}\u{e013}",
         .static_offset = 1,
+        .on_click = .{ .spawn = &.{"dolphin"} },
     },
     network_load_segment: Segment = .{
         .color = 0x43843CCC,
         .static_overlay = "\n\n\n.\n\n\u{e008}\u{e009}\n\n\n\n.\n\n\u{e00a}\u{e00b}",
         .static_offset = 1,
+        .on_click = .{ .spawn = &.{"usb-restart"} },
     },
     window_title_segment: Segment = .{
         .color = 0x00000077,
+        .on_click = .copy_window_title,
     },
 
     segments: [6]*Segment = undefined,
@@ -1016,27 +1027,29 @@ pub const StatusMonitor = struct {
             return;
         }
 
-        // Left-click (Button1): dispatch segment command only when visible
+        // Left-click (Button1): hit-test rendered segment background rect and execute declarative `on_click`
         if (button != 1) return;
         if (self.state == .hidden or self.state == .hover_armed or self.opacity <= 0.05) return;
+        if (self.window.width <= 0 or self.quad_buffer.len < self.segments.len) return;
 
-        if (self.font.char_width == 0 or self.window.width <= 0) return;
-        const clamped_x = std.math.clamp(x_pos, 0, self.window.width);
-        const from_right: usize = @intCast(@divTrunc(self.window.width - clamped_x, self.font.char_width));
+        const w_f: f32 = @floatFromInt(self.window.width);
+        const px_f: f32 = @as(f32, @floatFromInt(std.math.clamp(x_pos, 0, self.window.width - 1))) + 0.5;
 
-        const cmd: []const u8 = if (from_right < time_width)
-            "cclip -i $(date +%s)\n"
-        else if (from_right < time_width + processor_width)
-            "konsole -e htop &\n"
-        else if (from_right < time_width + processor_width + thermal_width)
-            "screenfix &\n"
-        else if (from_right < time_width + processor_width + thermal_width + storage_width)
-            "dolphin &\n"
-        else if (from_right < right_fixed_cells)
-            "usb-restart &\n"
-        else
-            "cclip -i \"$(xdotool getwindowname `xdotool getactivewindow` | tr -d '\\n')\" &\n";
-
-        std.Io.File.stdout().writeStreamingAll(self.io, cmd) catch {};
+        for (self.segments, 0..) |seg, seg_idx| {
+            const bg_q = self.quad_buffer[seg_idx];
+            if (bg_q.size[0] <= 0.0) continue;
+            const nx0 = @max(-1.0, @as(f32, @floatFromInt(bg_q.pos[0])) / 32767.0);
+            const left_px = (nx0 + 1.0) * 0.5 * w_f;
+            const right_px = left_px + bg_q.size[0] * 0.5 * w_f;
+            if (px_f >= left_px and px_f <= right_px) {
+                actions_zig.execute(
+                    seg.on_click,
+                    self.io,
+                    self.window,
+                    self.window_metrics[0].metric.window.slice(),
+                );
+                return;
+            }
+        }
     }
 };
