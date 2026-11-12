@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const c = @import("c");
 const window_zig = @import("Window.zig");
 const Window = window_zig.Window;
@@ -20,11 +19,6 @@ const default_initial_mode: BarMode = .auto_hide;
 
 /// Default metric sample frequency while visible (`--hz=1..60`; 0 Hz while hidden).
 const default_visible_sample_hz: u8 = 8;
-
-const use_debug_gpa = switch (builtin.mode) {
-    .debug, .safe => true,
-    .fast, .small => false,
-};
 
 var stop_requested: std.atomic.Value(bool) = .init(false);
 
@@ -120,7 +114,7 @@ fn parseCli(args: std.process.Args) !CliConfig {
             };
         } else if (std.mem.startsWith(u8, arg, "--hz=")) {
             const hz = std.fmt.parseInt(u8, arg["--hz=".len..], 10) catch 0;
-            if (hz < 1 or hz > 60) {
+            if (hz < 1 or hz > StatusMonitor.max_sample_hz) {
                 writeFd(2, "zigbar: invalid --hz (expected 1..60)\n");
                 return error.InvalidArgument;
             }
@@ -142,14 +136,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = c.sigaction(c.SIGINT, &sa, null);
     _ = c.sigaction(c.SIGTERM, &sa, null);
 
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer if (use_debug_gpa) {
-        if (debug_allocator.deinit() == .leak) {
-            std.debug.print("MEMORY LEAK DETECTED!\n", .{});
-        }
-    };
-    const gpa = if (use_debug_gpa) debug_allocator.allocator() else std.heap.c_allocator;
-
     var single_threaded_io: std.Io.Threaded = .init_single_threaded;
     const io = single_threaded_io.io();
 
@@ -165,7 +151,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer window.deinit();
 
     var monitor: StatusMonitor = .{ .window = &window };
-    try monitor.init(io, gpa, cli.sample_hz, cli.mode);
+    try monitor.init(io, cli.sample_hz, cli.mode);
     defer monitor.deinit();
 
     while (window.running and !stop_requested.load(.acquire)) {

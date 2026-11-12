@@ -152,14 +152,13 @@ pub const Window = struct {
 
     pub fn presentShm(
         self: *Window,
-        allocator: std.mem.Allocator,
         bg_count: usize,
         quads: []const QuadVertex,
         opacity: f32,
         request_frame_sync: bool,
     ) !void {
         switch (self.backend) {
-            .wayland => |*wl| try wl.presentShm(allocator, bg_count, quads, opacity, request_frame_sync),
+            .wayland => |*wl| try wl.presentShm(bg_count, quads, opacity, request_frame_sync),
             else => {},
         }
     }

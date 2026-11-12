@@ -3,6 +3,7 @@ const std = @import("std");
 const font_zig = @import("FontAtlas.zig");
 const FontAtlas = font_zig.FontAtlas;
 const RectDraw = @import("RectDraw.zig").RectDraw;
+const ShmDraw = @import("ShmDraw.zig");
 const segment_zig = @import("Segment.zig");
 const Window = @import("Window.zig").Window;
 const ticker_zig = @import("Ticker.zig");
@@ -24,6 +25,11 @@ pub const BarMode = enum {
 };
 
 pub const StatusMonitor = struct {
+    pub const max_sample_hz = 60;
+    pub const max_cells = ShmDraw.max_cells;
+    pub const max_segments = 8;
+    pub const max_numeric_metrics = 10;
+
     pub const time_width = 23;
     pub const processor_width = 15;
     pub const thermal_width = 13;
@@ -46,7 +52,6 @@ pub const StatusMonitor = struct {
         fading_out,
     };
 
-    allocator: std.mem.Allocator = undefined,
     io: std.Io = undefined,
 
     rect: RectDraw = .{},
@@ -75,6 +80,11 @@ pub const StatusMonitor = struct {
     rect_width_i: i16 = 0, // fixed point (-32768 -> 32767)
     rect_width_f: f32 = 0, // NDC (-1 -> 1)
     rect_y_pos: i16 = 0, // y pos for glyph rect in fixed-point NDC
+
+    // Inline zero-allocator buffers (`self` lives at a stable stack address in `main`)
+    cells_storage: [max_cells]i16 = @splat(0),
+    quad_storage: [max_segments + max_cells]RectDraw.QuadVertex = undefined,
+    sample_storage: [max_sample_hz * max_numeric_metrics]u128 = @splat(0),
 
     cells: []i16 = &.{},
     quad_buffer: []RectDraw.QuadVertex = &.{},
@@ -146,22 +156,19 @@ pub const StatusMonitor = struct {
         }
         self.rect.deinit();
         self.font.deinit();
-        if (self.cells.len > 0) self.allocator.free(self.cells);
-        if (self.quad_buffer.len > 0) self.allocator.free(self.quad_buffer);
-        if (self.sample_buffer.len > 0) self.allocator.free(self.sample_buffer);
     }
 
+    /// Note: `self` must reside at a stable memory address before calling `init` because segments,
+    /// metric ring slices, and cell/quad views point directly into `self`'s inline storage.
     pub fn init(
         self: *StatusMonitor,
         io: std.Io,
-        allocator: std.mem.Allocator,
         sample_hz: u8,
         initial_mode: BarMode,
     ) !void {
-        assert(sample_hz > 0);
+        assert(sample_hz >= 1 and sample_hz <= max_sample_hz);
 
         self.io = io;
-        self.allocator = allocator;
         self.mode = initial_mode;
         self.visible_sample_ns = @divTrunc(std.time.ns_per_s, @as(i96, sample_hz));
 
@@ -215,10 +222,11 @@ pub const StatusMonitor = struct {
             &self.window_title_segment,
         };
 
-        // Allocate contiguous rolling sample ring buffer for the 7 numeric MetricEntries
+        // Bind inline rolling sample ring buffer for the 7 numeric MetricEntries
         const numeric_metric_count = 7;
+        assert(numeric_metric_count <= max_numeric_metrics);
         const ring_len: usize = sample_hz;
-        self.sample_buffer = try allocator.alloc(u128, ring_len * numeric_metric_count);
+        self.sample_buffer = self.sample_storage[0 .. ring_len * numeric_metric_count];
         @memset(self.sample_buffer, 0);
 
         setSlots(&self.processor_metrics[0], self.sample_buffer, ring_len, 0);
@@ -229,7 +237,7 @@ pub const StatusMonitor = struct {
         setSlots(&self.storage_metrics[1], self.sample_buffer, ring_len, 5);
         setSlots(&self.network_metrics[0], self.sample_buffer, ring_len, 6);
 
-        try self.recomputeLayout();
+        self.recomputeLayout();
 
         const now_ns = monotonicNs(io);
         self.seedInitialMetrics(now_ns);
@@ -287,16 +295,7 @@ pub const StatusMonitor = struct {
         };
     }
 
-    pub fn recomputeLayout(self: *StatusMonitor) !void {
-        if (self.cells.len > 0) {
-            self.allocator.free(self.cells);
-            self.cells = &.{};
-        }
-        if (self.quad_buffer.len > 0) {
-            self.allocator.free(self.quad_buffer);
-            self.quad_buffer = &.{};
-        }
-
+    pub fn recomputeLayout(self: *StatusMonitor) void {
         self.window.updateViewport();
 
         const window_height = @as(f32, @floatFromInt(@max(1, self.window.height)));
@@ -312,7 +311,7 @@ pub const StatusMonitor = struct {
         // 0.52 vertically centers Tamzen inside the 17px bar
         self.rect_y_pos = @intFromFloat(self.rect_height * 32767.0 * 0.52);
 
-        try self.generateCells();
+        self.generateCells();
 
         const cells_count = self.cells.len;
         const time_idx = cells_count -| time_width;
@@ -339,9 +338,10 @@ pub const StatusMonitor = struct {
         self.window_title_segment.cell_start = 0;
         self.window_title_segment.cells = self.cells[0..net_idx];
 
-        // Allocate single batched vertex buffer: 6 segment background rects + N glyph cells
+        // Slice inline batched vertex buffer: segment background rects + N glyph cells
         const bg_quads = self.segments.len;
-        self.quad_buffer = try self.allocator.alloc(RectDraw.QuadVertex, bg_quads + cells_count);
+        assert(bg_quads <= max_segments);
+        self.quad_buffer = self.quad_storage[0 .. bg_quads + cells_count];
         if (!self.window.usesShm()) {
             self.rect.ensureCapacity(self.quad_buffer.len);
         }
@@ -358,10 +358,11 @@ pub const StatusMonitor = struct {
         self.frame_dirty = true;
     }
 
-    fn generateCells(self: *StatusMonitor) !void {
+    fn generateCells(self: *StatusMonitor) void {
         const cell_size: u16 = @intCast(self.rect_width_i);
         const char_count: usize = @max(right_fixed_cells + 4, @divTrunc(65535, cell_size));
-        self.cells = try self.allocator.alloc(i16, char_count + 1);
+        const total_cells = @min(max_cells, char_count + 1);
+        self.cells = self.cells_storage[0..total_cells];
 
         var current_x: i16 = -32768;
         for (self.cells) |*cell| {
@@ -546,7 +547,7 @@ pub const StatusMonitor = struct {
 
         if (self.window.resized) {
             self.window.resized = false;
-            try self.recomputeLayout();
+            self.recomputeLayout();
             if (self.state == .hidden or self.state == .hover_armed) {
                 self.window.clearTransparent();
                 self.frame_dirty = false;
@@ -609,6 +610,9 @@ pub const StatusMonitor = struct {
             if (self.next_sample_ns <= now_ns) {
                 self.next_sample_ns = now_ns + sample_interval_ns;
             }
+        } else {
+            // Keep wall-clock second flips aligned to exact second boundaries (`~4ns` vDSO check)
+            self.time_metrics[0].metric.time.sample(self.io) catch {};
         }
 
         const drew = try self.renderVisible(now_ns);
@@ -624,6 +628,9 @@ pub const StatusMonitor = struct {
 
         // Otherwise, sleep in kernel `poll()` until the exact next scheduled deadline or input/title event
         var deadline_ns = self.next_sample_ns;
+        const wall_ns = ticker_zig.nanoTimestamp(self.io);
+        const next_sec_rem_ns = std.time.ns_per_s - @mod(wall_ns, std.time.ns_per_s);
+        deadline_ns = @min(deadline_ns, now_ns + next_sec_rem_ns);
         if (self.state == .leave_grace) {
             deadline_ns = @min(deadline_ns, self.leave_start_ns + leave_grace_ns);
         }
@@ -772,7 +779,6 @@ pub const StatusMonitor = struct {
                     self.state == .fading_out or
                     (if (self.minNextInterpolationStepNs(now_ns)) |t_ns| t_ns <= now_ns + 16 * std.time.ns_per_ms else false);
                 try self.window.presentShm(
-                    self.allocator,
                     self.segments.len,
                     self.quad_buffer,
                     self.opacity,

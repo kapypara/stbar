@@ -60,7 +60,6 @@ pub const WaylandBackend = struct {
     shm_width: i32 = 0,
     shm_height: i32 = 0,
     shm_slots: [shm_slot_count]ShmBufferSlot = @splat(.{}),
-    shm_allocator: ?std.mem.Allocator = null,
     needs_configure_commit: bool = false,
 
     layer_shell: ?*c.struct_zwlr_layer_shell_v1 = null,
@@ -158,7 +157,7 @@ pub const WaylandBackend = struct {
             c.wl_callback_destroy(cb);
             self.frame_cb = null;
         }
-        self.destroyShmBuffers(true);
+        self.destroyShmBuffers();
 
         if (self.egl_display != c.EGL_NO_DISPLAY) {
             _ = c.eglMakeCurrent(self.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT);
@@ -431,7 +430,7 @@ pub const WaylandBackend = struct {
         }
     }
 
-    fn destroyShmBuffers(self: *WaylandBackend, free_cell_cache: bool) void {
+    fn destroyShmBuffers(self: *WaylandBackend) void {
         for (&self.shm_slots) |*slot| {
             if (slot.wl_buffer) |buf| {
                 c.wl_buffer_destroy(buf);
@@ -439,13 +438,7 @@ pub const WaylandBackend = struct {
             }
             slot.busy = false;
             slot.pixel_offset = 0;
-            if (free_cell_cache) {
-                if (self.shm_allocator) |alloc| {
-                    slot.state.deinit(alloc);
-                }
-            } else {
-                slot.state.invalidate();
-            }
+            slot.state.invalidate();
         }
         if (self.shm_pool) |pool| {
             c.wl_shm_pool_destroy(pool);
@@ -462,7 +455,7 @@ pub const WaylandBackend = struct {
 
     fn recreateShmBuffers(self: *WaylandBackend) !void {
         const shm = self.wl_shm orelse return error.NoWlShm;
-        self.destroyShmBuffers(false);
+        self.destroyShmBuffers();
 
         const w: i32 = @max(1, self.width);
         const h: i32 = @max(1, self.height);
@@ -543,13 +536,11 @@ pub const WaylandBackend = struct {
 
     pub fn presentShm(
         self: *WaylandBackend,
-        allocator: std.mem.Allocator,
         bg_count: usize,
         quads: []const QuadVertex,
         opacity: f32,
         request_frame_sync: bool,
     ) !void {
-        self.shm_allocator = allocator;
         const surf = self.wl_surface orelse return;
         const dpy = self.wl_display orelse return;
 
@@ -561,8 +552,7 @@ pub const WaylandBackend = struct {
 
         const slot = self.acquireShmSlot();
         var dmg: [max_damage_rects]DamageRect = undefined;
-        const dmg_count = try ShmDraw.renderSlot(
-            allocator,
+        const dmg_count = ShmDraw.renderSlot(
             &slot.state,
             self.slotPixels(slot),
             self.shm_width,

@@ -11,20 +11,14 @@ pub const DamageRect = struct {
 };
 
 pub const max_damage_rects = 12;
+pub const max_cells = 1200;
 
 pub const SlotState = struct {
     width: i32 = 0,
     height: i32 = 0,
     last_opacity_u8: u16 = 0xFFFF, // 0xFFFF forces an initial full-buffer draw
-    cell_uvs: []u32 = &.{},
-
-    pub fn deinit(self: *SlotState, allocator: std.mem.Allocator) void {
-        if (self.cell_uvs.len > 0) {
-            allocator.free(self.cell_uvs);
-            self.cell_uvs = &.{};
-        }
-        self.* = .{};
-    }
+    cell_count: usize = 0,
+    cell_uvs: [max_cells]u32 = @splat(0),
 
     pub fn invalidate(self: *SlotState) void {
         self.last_opacity_u8 = 0xFFFF;
@@ -238,7 +232,6 @@ pub const ShmDraw = struct {
     /// Renders `quads` into `pixels` (`width * height`), updating only changed glyph cells when
     /// possible and returning exact buffer-space damage rectangles for `wl_surface_damage_buffer`.
     pub fn renderSlot(
-        allocator: std.mem.Allocator,
         slot: *SlotState,
         pixels: []u32,
         width: i32,
@@ -247,7 +240,7 @@ pub const ShmDraw = struct {
         quads: []const QuadVertex,
         opacity: f32,
         damage_out: *[max_damage_rects]DamageRect,
-    ) !usize {
+    ) usize {
         if (width <= 0 or height <= 0 or pixels.len < @as(usize, @intCast(width * height))) {
             return 0;
         }
@@ -256,11 +249,11 @@ pub const ShmDraw = struct {
         const alpha_scale: u8 = @intFromFloat(@round(clamped_op * 255.0));
 
         const clamped_bg = @min(bg_count, quads.len);
-        const cell_quads = quads[clamped_bg..];
+        const raw_cells = quads[clamped_bg..];
+        const cell_quads = raw_cells[0..@min(raw_cells.len, max_cells)];
 
-        if (slot.cell_uvs.len != cell_quads.len) {
-            if (slot.cell_uvs.len > 0) allocator.free(slot.cell_uvs);
-            slot.cell_uvs = try allocator.alloc(u32, cell_quads.len);
+        if (slot.cell_count != cell_quads.len) {
+            slot.cell_count = cell_quads.len;
             slot.last_opacity_u8 = 0xFFFF;
         }
 
@@ -335,7 +328,6 @@ test "ShmDraw recovers exact Tamzen atlas coordinates and performs incremental c
     const h: i32 = 17;
     var pixels: [w * h]u32 = @splat(0);
     var slot: SlotState = .{};
-    defer slot.deinit(std.testing.allocator);
 
     const glyph_a_uv = embedded.latin1_uvs['A'];
     const glyph_b_uv = embedded.latin1_uvs['B'];
@@ -365,18 +357,18 @@ test "ShmDraw recovers exact Tamzen atlas coordinates and performs incremental c
     };
 
     var dmg: [max_damage_rects]DamageRect = undefined;
-    const n1 = try ShmDraw.renderSlot(std.testing.allocator, &slot, &pixels, w, h, 1, &quads, 1.0, &dmg);
+    const n1 = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, &dmg);
     try std.testing.expectEqual(@as(usize, 1), n1);
     try std.testing.expectEqual(@as(i32, w), dmg[0].w);
     try std.testing.expectEqual(@as(i32, h), dmg[0].h);
 
     // Repeating identical state produces 0 damage rects
-    const n2 = try ShmDraw.renderSlot(std.testing.allocator, &slot, &pixels, w, h, 1, &quads, 1.0, &dmg);
+    const n2 = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, &dmg);
     try std.testing.expectEqual(@as(usize, 0), n2);
 
     // Updating only cell 0 emits a single 7x14 cell damage rect
     quads[1].uv = glyph_b_uv;
-    const n3 = try ShmDraw.renderSlot(std.testing.allocator, &slot, &pixels, w, h, 1, &quads, 1.0, &dmg);
+    const n3 = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, &dmg);
     try std.testing.expectEqual(@as(usize, 1), n3);
     try std.testing.expectEqual(@as(i32, 0), dmg[0].x);
     try std.testing.expectEqual(@as(i32, 7), dmg[0].w);
