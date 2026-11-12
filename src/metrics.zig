@@ -482,10 +482,11 @@ pub const LoadProbe = struct {
 /// `.discharging` `-`, `.charging` `+`, `.maintaining` ` `), and battery `%` (`capacity_pct`):
 /// - Discharging (`BAT*` `Discharging`): whole-machine battery discharge rail (`-`).
 /// - Charging (`BAT*` `Charging`): total effective charger draw (`component_uw + charging_uw`, `+`).
-/// - Maintaining / Desktop: live non-overlapping `hwmon` component power (`CPU/APU + GPUs + NVMe + NIC + PSU`, ` `).
+/// - Maintaining / Desktop: live non-overlapping `hwmon` + `powercap` RAPL component power (`CPU/APU + GPUs + NVMe + NIC + PSU`, ` `).
 pub const PowerProbe = struct {
     const max_batteries = 4;
     const max_hwmon_sensors = 16;
+    const max_rapl_domains = 8;
 
     const BatterySlot = struct {
         status_fd: ?Io.File = null,
@@ -508,6 +509,13 @@ pub const PowerProbe = struct {
         is_cpu_only: bool = false,
     };
 
+    const RaplSlot = struct {
+        energy_fd: ?Io.File = null,
+        max_range_uj: u64 = 0,
+        prev_uj: u64 = 0,
+        has_prev: bool = false,
+    };
+
     searched: bool = false,
     has_battery: bool = false,
     has_power_sensor: bool = false,
@@ -516,6 +524,9 @@ pub const PowerProbe = struct {
     battery_count: usize = 0,
     hwmon_slots: [max_hwmon_sensors]HwmonPowerSlot = @splat(.{}),
     hwmon_count: usize = 0,
+    rapl_slots: [max_rapl_domains]RaplSlot = @splat(.{}),
+    rapl_count: usize = 0,
+    last_rapl_ns: i96 = 0,
 
     capacity_pct: u64 = 0,
     effective_tenths_w: u64 = 0,
@@ -523,8 +534,11 @@ pub const PowerProbe = struct {
     pub fn deinit(self: *PowerProbe, io: Io) void {
         for (&self.batteries) |*b| b.closeAll(io);
         for (&self.hwmon_slots) |*h| closeSlot(&h.file, io);
+        for (&self.rapl_slots) |*r| closeSlot(&r.energy_fd, io);
         self.battery_count = 0;
         self.hwmon_count = 0;
+        self.rapl_count = 0;
+        self.last_rapl_ns = 0;
     }
 
     /// Excludes `/sys/class/hwmon` mirrors of `/sys/class/power_supply` (`BAT*`, `AC*`, `ucsi*`, `hid-*`)
@@ -543,6 +557,22 @@ pub const PowerProbe = struct {
             mem.eql(u8, driver_name, "zenergy") or
             mem.eql(u8, driver_name, "amd_energy") or
             mem.eql(u8, driver_name, "fam15h_power");
+    }
+
+    pub fn isTopLevelRaplPackage(entry_name: []const u8, domain_name: []const u8) bool {
+        return mem.count(u8, entry_name, ":") == 1 and mem.startsWith(u8, domain_name, "package-");
+    }
+
+    pub fn computeRaplUw(prev_uj: u64, cur_uj: u64, max_range_uj: u64, dt_ns: u64) u64 {
+        if (dt_ns == 0) return 0;
+        const delta_uj: u64 = if (cur_uj >= prev_uj)
+            cur_uj - prev_uj
+        else if (max_range_uj > prev_uj)
+            (max_range_uj - prev_uj) +| cur_uj
+        else
+            return 0;
+        const uw = (@as(u128, delta_uj) * 1_000_000_000) / dt_ns;
+        return @intCast(@min(uw, std.math.maxInt(u64)));
     }
 
     fn readTrimmedFileOnce(io: Io, path: []const u8, buf: []u8) ?[]const u8 {
@@ -653,8 +683,11 @@ pub const PowerProbe = struct {
             self.hwmon_count += 1;
         }
 
-        // Deduplicate standalone CPU package sensor if an AMD APU `PPT` sensor already covers the socket
-        if (has_apu_ppt) {
+        // Deduplicate standalone CPU package hwmon sensor when:
+        // - RAPL already provides CPU package energy, OR
+        // - Laptop AMD APU `PPT` (`vddnb` on battery-backed host) already covers the socket.
+        // Desktop AM5 iGPUs also expose `vddnb` on `amdgpu`, but only report iGPU power (~0.03W).
+        if (self.rapl_count > 0 or (has_apu_ppt and self.has_battery)) {
             var write_idx: usize = 0;
             for (self.hwmon_slots[0..self.hwmon_count]) |*slot| {
                 if (slot.is_cpu_only) {
@@ -669,10 +702,45 @@ pub const PowerProbe = struct {
         }
     }
 
+    fn discoverRaplPower(self: *PowerProbe, io: Io) void {
+        var dir = Io.Dir.openDirAbsolute(io, "/sys/class/powercap", .{ .iterate = true }) catch return;
+        defer dir.close(io);
+
+        var path_buf: [160]u8 = undefined;
+        var name_buf: [64]u8 = undefined;
+        var range_buf: [32]u8 = undefined;
+
+        var iter = dir.iterate();
+        while (iter.next(io) catch null) |entry| {
+            if (self.rapl_count >= max_rapl_domains) break;
+
+            const name_path = std.fmt.bufPrint(&path_buf, "/sys/class/powercap/{s}/name", .{entry.name}) catch continue;
+            const domain_name = readTrimmedFileOnce(io, name_path, &name_buf) orelse continue;
+            if (!isTopLevelRaplPackage(entry.name, domain_name)) continue;
+
+            const energy_path = std.fmt.bufPrint(&path_buf, "/sys/class/powercap/{s}/energy_uj", .{entry.name}) catch continue;
+            const energy_fd = Io.Dir.openFileAbsolute(io, energy_path, .{}) catch continue;
+
+            var max_range_uj: u64 = 0;
+            if (std.fmt.bufPrint(&path_buf, "/sys/class/powercap/{s}/max_energy_range_uj", .{entry.name})) |range_path| {
+                if (readTrimmedFileOnce(io, range_path, &range_buf)) |range_str| {
+                    max_range_uj = std.fmt.parseInt(u64, range_str, 10) catch 0;
+                }
+            } else |_| {}
+
+            self.rapl_slots[self.rapl_count] = .{
+                .energy_fd = energy_fd,
+                .max_range_uj = max_range_uj,
+            };
+            self.rapl_count += 1;
+        }
+    }
+
     pub fn sample(self: *PowerProbe, io: Io) !void {
         if (!self.searched) {
             self.searched = true;
             self.discoverBatteries(io);
+            self.discoverRaplPower(io);
             self.discoverHwmonPower(io);
             var bat_has_power = false;
             for (self.batteries[0..self.battery_count]) |b| {
@@ -681,7 +749,7 @@ pub const PowerProbe = struct {
                     break;
                 }
             }
-            self.has_power_sensor = bat_has_power or (self.hwmon_count > 0);
+            self.has_power_sensor = bat_has_power or (self.hwmon_count > 0) or (self.rapl_count > 0);
         }
 
         var cap_sum: u64 = 0;
@@ -728,6 +796,23 @@ pub const PowerProbe = struct {
             if (readU64Slot(slot.file, io)) |uw| {
                 component_uw +|= uw;
             }
+        }
+
+        if (self.rapl_count > 0) {
+            const now_ns = monotonicNs(io);
+            const dt_ns: u64 = if (self.last_rapl_ns > 0 and now_ns > self.last_rapl_ns)
+                @intCast(@min(now_ns - self.last_rapl_ns, std.math.maxInt(u64)))
+            else
+                0;
+            for (self.rapl_slots[0..self.rapl_count]) |*slot| {
+                const cur_uj = readU64Slot(slot.energy_fd, io) orelse continue;
+                if (slot.has_prev and dt_ns > 0) {
+                    component_uw +|= computeRaplUw(slot.prev_uj, cur_uj, slot.max_range_uj, dt_ns);
+                }
+                slot.prev_uj = cur_uj;
+                slot.has_prev = true;
+            }
+            self.last_rapl_ns = now_ns;
         }
 
         const effective_uw: u64 = if (any_discharging)
@@ -1189,4 +1274,16 @@ test "Device filters, mount path unescaping, and hot-unplug saturating diffs" {
     try std.testing.expect(!PowerProbe.isPowerSupplyHwmonMirror("nvme"));
     try std.testing.expect(PowerProbe.isCpuOnlyPowerDriver("zenpower"));
     try std.testing.expect(!PowerProbe.isCpuOnlyPowerDriver("amdgpu"));
+
+    // RAPL package filtering & energy delta conversion (including counter wraparound)
+    try std.testing.expect(PowerProbe.isTopLevelRaplPackage("intel-rapl:0", "package-0"));
+    try std.testing.expect(!PowerProbe.isTopLevelRaplPackage("intel-rapl:0:0", "core"));
+    try std.testing.expect(!PowerProbe.isTopLevelRaplPackage("intel-rapl", "package-0"));
+    try std.testing.expect(!PowerProbe.isTopLevelRaplPackage("intel-rapl:0", "dram"));
+
+    // 25_000_000 uJ over 1 second (1_000_000_000 ns) = 25 W = 25_000_000 uW
+    try std.testing.expectEqual(@as(u64, 25_000_000), PowerProbe.computeRaplUw(100_000_000, 125_000_000, 1_000_000_000, 1_000_000_000));
+    // Wraparound across max_range_uj = 1_000_000_000: (1_000_000_000 - 990_000_000) + 5_000_000 = 15_000_000 uJ over 0.5s = 30 W
+    try std.testing.expectEqual(@as(u64, 30_000_000), PowerProbe.computeRaplUw(990_000_000, 5_000_000, 1_000_000_000, 500_000_000));
+    try std.testing.expectEqual(@as(u64, 0), PowerProbe.computeRaplUw(100, 200, 1000, 0));
 }

@@ -84,3 +84,22 @@ Check status or switch startup flags:
 systemctl --user status zigbar.service
 systemctl --user restart zigbar.service
 ```
+
+## Desktop Power Monitoring (RAPL)
+
+On laptops, `zigbar` reads whole-machine wattage from `/sys/class/power_supply/BAT*`. On desktops (no battery), it sums:
+- Top-level CPU package energy deltas from `/sys/class/powercap/intel-rapl:*/energy_uj` (`package-*`)
+- All non-overlapping `/sys/class/hwmon/hwmon*/power1_input` (or `power1_average`) sensors (e.g., discrete/integrated GPUs, or a digital PSU with a Linux `hwmon` driver such as `corsair-psu`)
+
+Standard desktop motherboards, RAM, NVMe drives, NICs, and non-digital PSUs do not expose `hwmon` wattage sensors in Linux, so desktop readings reflect **CPU package + GPUs** (plus any other `hwmon` device that reports `power1_*`).
+
+### Enabling CPU Package Power Without Root
+
+Linux restricts `/sys/class/powercap/intel-rapl:*/energy_uj` to `0400 root:root` by default (CVE-2020-8694). To allow `zigbar` to read CPU package power on a desktop without granting broad filesystem capabilities (`cap_dac_read_search`) or installing out-of-tree kernel modules (`zenergy-dkms`), add a one-time `systemd-tmpfiles` rule scoped to your user's group (replace `$USER` with your group if different):
+
+```bash
+echo "z /sys/class/powercap/intel-rapl:*/energy_uj 0440 root $(id -gn) -" | sudo tee /etc/tmpfiles.d/rapl.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/rapl.conf
+```
+
+Restart `zigbar` afterwards so it picks up the RAPL sensor.
