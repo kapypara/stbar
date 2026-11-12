@@ -1,8 +1,26 @@
 const std = @import("std");
 const c = @import("c");
 const ProcLoader = @import("GlProcs.zig").ProcLoader;
+const QuadVertex = @import("RectDraw.zig").RectDraw.QuadVertex;
+const shm_draw_zig = @import("ShmDraw.zig");
+const ShmDraw = shm_draw_zig.ShmDraw;
+const ShmSlotState = shm_draw_zig.SlotState;
+const DamageRect = shm_draw_zig.DamageRect;
+const max_damage_rects = shm_draw_zig.max_damage_rects;
 
 const USE_GLX_CREATE_WINDOW = 1;
+
+var xshm_attach_failed: bool = false;
+
+fn xshmErrorHandler(_: ?*c.Display, _: [*c]c.XErrorEvent) callconv(.c) c_int {
+    xshm_attach_failed = true;
+    return 0;
+}
+
+pub const X11RenderMode = enum {
+    shm,
+    glx,
+};
 
 pub const Click = struct {
     x: i32 = 0,
@@ -11,6 +29,8 @@ pub const Click = struct {
 };
 
 pub const X11Backend = struct {
+    render_mode: X11RenderMode = .shm,
+
     display: ?*c.Display = null,
     x_screen: i32 = 0,
     root: c.Window = 0,
@@ -19,8 +39,22 @@ pub const X11Backend = struct {
     render_context: c.GLXContext = null,
 
     visual: ?*c.XVisualInfo = null,
+    chosen_visual: ?*c.Visual = null,
+    chosen_depth: u32 = 32,
     fbconfig: c.GLXFBConfig = null,
     cmap: c.Colormap = 0,
+    gc: c.GC = null,
+
+    // Native X11 `MIT-SHM` software buffer (`XPutImage` fallback over remote X11)
+    shm_info: c.XShmSegmentInfo = std.mem.zeroes(c.XShmSegmentInfo),
+    shm_image: ?*c.XImage = null,
+    shm_attached: bool = false,
+    fallback_map: ?*anyopaque = null,
+    fallback_map_bytes: usize = 0,
+    shm_width: i32 = 0,
+    shm_height: i32 = 0,
+    shm_state: ShmSlotState = .{},
+    needs_expose_blit: bool = false,
     del_atom: c.Atom = 0,
     wm_strut_atom: c.Atom = 0,
     wm_strut_partial_atom: c.Atom = 0,
@@ -64,14 +98,37 @@ pub const X11Backend = struct {
 
         try self.createTheWindow();
         errdefer self.deinit();
-        try self.createTheRenderContext();
+
+        switch (self.render_mode) {
+            .shm => {
+                var gc_vals: c.XGCValues = std.mem.zeroes(c.XGCValues);
+                gc_vals.graphics_exposures = c.False;
+                self.gc = c.XCreateGC(
+                    self.display.?,
+                    self.handle,
+                    @intCast(c.GCGraphicsExposures),
+                    &gc_vals,
+                );
+                if (self.gc == null) return error.XCreateGcFailed;
+                try self.recreateShmImage();
+                self.clearTransparent();
+            },
+            .glx => try self.createTheRenderContext(),
+        }
     }
 
     pub fn deinit(self: *X11Backend) void {
         if (self.display) |dpy| {
-            _ = c.glXMakeCurrent(dpy, 0, null);
-            if (self.render_context != null) c.glXDestroyContext(dpy, self.render_context);
-            if (USE_GLX_CREATE_WINDOW == 1 and self.glx_handle != 0) c.glXDestroyWindow(dpy, self.glx_handle);
+            self.destroyShmImage();
+            if (self.gc != null) {
+                _ = c.XFreeGC(dpy, self.gc);
+                self.gc = null;
+            }
+            if (self.render_mode == .glx) {
+                _ = c.glXMakeCurrent(dpy, 0, null);
+                if (self.render_context != null) c.glXDestroyContext(dpy, self.render_context);
+                if (USE_GLX_CREATE_WINDOW == 1 and self.glx_handle != 0) c.glXDestroyWindow(dpy, self.glx_handle);
+            }
             if (self.handle != 0) _ = c.XDestroyWindow(dpy, self.handle);
             if (self.cmap != 0) _ = c.XFreeColormap(dpy, self.cmap);
             if (self.visual) |vis| _ = c.XFree(vis);
@@ -88,16 +145,45 @@ pub const X11Backend = struct {
         return @ptrCast(c.glXGetProcAddressARB(@ptrCast(name)));
     }
 
-    fn createTheWindow(self: *X11Backend) !void {
-        self.display = c.XOpenDisplay(null) orelse return error.XOpenDisplayFailed;
-        const dpy = self.display.?;
+    fn selectArgbVisualShm(self: *X11Backend, dpy: *c.Display) !void {
+        var tmpl: c.XVisualInfo = std.mem.zeroes(c.XVisualInfo);
+        tmpl.screen = self.x_screen;
+        tmpl.depth = 32;
+        tmpl.@"class" = c.TrueColor;
 
-        self.x_screen = c.DefaultScreen(dpy);
-        self.root = c.RootWindow(dpy, self.x_screen);
-        if (self.width <= 0) {
-            self.width = c.DisplayWidth(dpy, self.x_screen);
+        var nitems: c_int = 0;
+        if (c.XGetVisualInfo(
+            dpy,
+            c.VisualScreenMask | c.VisualDepthMask | c.VisualClassMask,
+            &tmpl,
+            &nitems,
+        )) |vlist| {
+            defer _ = c.XFree(vlist);
+            for (0..@intCast(@max(0, nitems))) |i| {
+                const pf = c.XRenderFindVisualFormat(dpy, vlist[i].visual);
+                if (pf != null and pf.*.direct.alphaMask != 0) {
+                    self.chosen_visual = vlist[i].visual;
+                    self.chosen_depth = @intCast(vlist[i].depth);
+                    return;
+                }
+            }
+            if (nitems > 0) {
+                self.chosen_visual = vlist[0].visual;
+                self.chosen_depth = @intCast(vlist[0].depth);
+                return;
+            }
         }
 
+        var matched: c.XVisualInfo = undefined;
+        if (c.XMatchVisualInfo(dpy, self.x_screen, 32, c.TrueColor, &matched) != 0) {
+            self.chosen_visual = matched.visual;
+            self.chosen_depth = 32;
+            return;
+        }
+        return error.NoArgbVisual;
+    }
+
+    fn selectArgbVisualGlx(self: *X11Backend, dpy: *c.Display) !void {
         const vis_attribs = [_]i32{
             c.GLX_RENDER_TYPE,   c.GLX_RGBA_BIT,
             c.GLX_DRAWABLE_TYPE, c.GLX_WINDOW_BIT,
@@ -130,8 +216,26 @@ pub const X11Backend = struct {
             }
         }
         if (!found) return error.NoMatchingFBConfig;
+        self.chosen_visual = self.visual.?.visual;
+        self.chosen_depth = @intCast(self.visual.?.depth);
+    }
 
-        self.cmap = c.XCreateColormap(dpy, self.root, self.visual.?.visual, c.AllocNone);
+    fn createTheWindow(self: *X11Backend) !void {
+        self.display = c.XOpenDisplay(null) orelse return error.XOpenDisplayFailed;
+        const dpy = self.display.?;
+
+        self.x_screen = c.DefaultScreen(dpy);
+        self.root = c.RootWindow(dpy, self.x_screen);
+        if (self.width <= 0) {
+            self.width = c.DisplayWidth(dpy, self.x_screen);
+        }
+
+        switch (self.render_mode) {
+            .shm => try self.selectArgbVisualShm(dpy),
+            .glx => try self.selectArgbVisualGlx(dpy),
+        }
+
+        self.cmap = c.XCreateColormap(dpy, self.root, self.chosen_visual, c.AllocNone);
 
         var attr: c.XSetWindowAttributes = std.mem.zeroes(c.XSetWindowAttributes);
         attr.colormap = self.cmap;
@@ -149,21 +253,23 @@ pub const X11Backend = struct {
             @intCast(self.width),
             @intCast(self.height),
             0,
-            self.visual.?.depth,
+            @intCast(self.chosen_depth),
             c.InputOutput,
-            self.visual.?.visual,
+            self.chosen_visual,
             c.CWColormap | c.CWBorderPixel | c.CWEventMask,
             &attr,
         );
         if (self.handle == 0) return error.CreateWindowFailed;
 
-        if (USE_GLX_CREATE_WINDOW == 0) {
-            self.glx_handle = self.handle;
-        } else {
-            const glx_attr = [_]i32{c.None};
-            self.glx_handle = c.glXCreateWindow(dpy, self.fbconfig, self.handle, &glx_attr);
+        if (self.render_mode == .glx) {
+            if (USE_GLX_CREATE_WINDOW == 0) {
+                self.glx_handle = self.handle;
+            } else {
+                const glx_attr = [_]i32{c.None};
+                self.glx_handle = c.glXCreateWindow(dpy, self.fbconfig, self.handle, &glx_attr);
+            }
+            if (self.glx_handle == 0) return error.GlxCreateWindowFailed;
         }
-        if (self.glx_handle == 0) return error.GlxCreateWindowFailed;
 
         var hints = std.mem.zeroes(c.XSizeHints);
         hints.flags = c.USPosition | c.PPosition | c.USSize | c.PSize;
@@ -321,9 +427,242 @@ pub const X11Backend = struct {
         self.clearTransparent();
     }
 
+    fn destroyXImage(img: *c.XImage) void {
+        // Prevent Xlib's `destroy_image` from calling `free()` on SysV `shmat` or `mmap` memory
+        img.*.data = null;
+        if (img.*.f.destroy_image) |destroy_fn| {
+            _ = destroy_fn(img);
+        }
+    }
+
+    fn destroyShmImage(self: *X11Backend) void {
+        const dpy = self.display;
+        if (self.shm_attached) {
+            if (dpy) |d| {
+                _ = c.XShmDetach(d, &self.shm_info);
+                _ = c.XSync(d, c.False);
+            }
+            self.shm_attached = false;
+        }
+        if (self.shm_image) |img| {
+            destroyXImage(img);
+            self.shm_image = null;
+        }
+        if (self.shm_info.shmaddr != null and @intFromPtr(self.shm_info.shmaddr) != std.math.maxInt(usize)) {
+            _ = c.shmdt(self.shm_info.shmaddr);
+            self.shm_info.shmaddr = null;
+        }
+        self.shm_info = std.mem.zeroes(c.XShmSegmentInfo);
+        if (self.fallback_map) |ptr| {
+            _ = c.munmap(ptr, self.fallback_map_bytes);
+            self.fallback_map = null;
+            self.fallback_map_bytes = 0;
+        }
+        self.shm_width = 0;
+        self.shm_height = 0;
+        self.shm_state.invalidate();
+    }
+
+    fn recreateShmImage(self: *X11Backend) !void {
+        const dpy = self.display orelse return error.NoDisplay;
+        self.destroyShmImage();
+
+        const w = @max(1, self.width);
+        const h = @max(1, self.height);
+        const frame_bytes: usize = @intCast(w * h * @sizeOf(u32));
+
+        // 1. Fast zero-copy local `MIT-SHM` path
+        if (c.XShmQueryExtension(dpy) != 0) {
+            if (c.XShmCreateImage(
+                dpy,
+                self.chosen_visual,
+                self.chosen_depth,
+                c.ZPixmap,
+                null,
+                &self.shm_info,
+                @intCast(w),
+                @intCast(h),
+            )) |img| {
+                if (img.*.bits_per_pixel == 32 and img.*.bytes_per_line == w * 4) {
+                    const seg_bytes: usize = @intCast(img.*.bytes_per_line * img.*.height);
+                    const shmid = c.shmget(c.IPC_PRIVATE, seg_bytes, c.IPC_CREAT | 0o600);
+                    if (shmid >= 0) {
+                        const addr = c.shmat(shmid, null, 0);
+                        if (addr != null and @intFromPtr(addr) != std.math.maxInt(usize)) {
+                            self.shm_info.shmid = shmid;
+                            self.shm_info.shmaddr = @ptrCast(addr);
+                            self.shm_info.readOnly = c.False;
+                            img.*.data = @ptrCast(addr);
+
+                            _ = c.XSync(dpy, c.False);
+                            xshm_attach_failed = false;
+                            const prev_handler = c.XSetErrorHandler(xshmErrorHandler);
+                            const attached_ok = c.XShmAttach(dpy, &self.shm_info) != 0;
+                            _ = c.XSync(dpy, c.False);
+                            _ = c.XSetErrorHandler(prev_handler);
+
+                            // Mark SysV segment for automatic kernel cleanup on detach/exit (zero `ipcs` leaks even on SIGKILL)
+                            _ = c.shmctl(shmid, c.IPC_RMID, null);
+
+                            if (attached_ok and !xshm_attach_failed) {
+                                self.shm_image = img;
+                                self.shm_attached = true;
+                                self.shm_width = w;
+                                self.shm_height = h;
+                                self.shm_state.invalidate();
+                                return;
+                            }
+                            _ = c.shmdt(addr);
+                            self.shm_info = std.mem.zeroes(c.XShmSegmentInfo);
+                        } else {
+                            _ = c.shmctl(shmid, c.IPC_RMID, null);
+                        }
+                    }
+                }
+                destroyXImage(img);
+            }
+        }
+
+        // 2. Fallback anonymous `mmap` + `XPutImage` (e.g. remote SSH X11 forwarding or isolated IPC namespace)
+        const mapped = c.mmap(null, frame_bytes, c.PROT_READ | c.PROT_WRITE, c.MAP_PRIVATE | c.MAP_ANONYMOUS, -1, 0);
+        if (mapped == null or @intFromPtr(mapped) == std.math.maxInt(usize)) {
+            return error.X11BufferMmapFailed;
+        }
+        const img = c.XCreateImage(
+            dpy,
+            self.chosen_visual,
+            self.chosen_depth,
+            c.ZPixmap,
+            0,
+            @ptrCast(mapped),
+            @intCast(w),
+            @intCast(h),
+            32,
+            w * 4,
+        ) orelse {
+            _ = c.munmap(mapped.?, frame_bytes);
+            return error.XCreateImageFailed;
+        };
+        self.fallback_map = mapped;
+        self.fallback_map_bytes = frame_bytes;
+        self.shm_image = img;
+        self.shm_attached = false;
+        self.shm_width = w;
+        self.shm_height = h;
+        self.shm_state.invalidate();
+    }
+
+    fn shmPixels(self: *const X11Backend) []u32 {
+        const img = self.shm_image.?;
+        const base: [*]u32 = @ptrCast(@alignCast(img.*.data));
+        const len: usize = @intCast(self.shm_width * self.shm_height);
+        return base[0..len];
+    }
+
+    fn putRect(self: *X11Backend, x: i32, y: i32, w: i32, h: i32) void {
+        if (w <= 0 or h <= 0) return;
+        const dpy = self.display orelse return;
+        const gc = self.gc orelse return;
+        const img = self.shm_image orelse return;
+
+        if (self.shm_attached) {
+            _ = c.XShmPutImage(
+                dpy,
+                self.handle,
+                gc,
+                img,
+                x,
+                y,
+                x,
+                y,
+                @intCast(w),
+                @intCast(h),
+                c.False,
+            );
+        } else {
+            _ = c.XPutImage(
+                dpy,
+                self.handle,
+                gc,
+                img,
+                x,
+                y,
+                x,
+                y,
+                @intCast(w),
+                @intCast(h),
+            );
+        }
+    }
+
+    pub fn presentShm(
+        self: *X11Backend,
+        bg_count: usize,
+        quads: []const QuadVertex,
+        opacity: f32,
+        _: bool,
+    ) !void {
+        const dpy = self.display orelse return;
+        const target_w = @max(1, self.width);
+        const target_h = @max(1, self.height);
+        if (self.shm_image == null or self.shm_width != target_w or self.shm_height != target_h) {
+            try self.recreateShmImage();
+        }
+
+        var dmg: [max_damage_rects]DamageRect = undefined;
+        const dmg_count = ShmDraw.renderSlot(
+            &self.shm_state,
+            self.shmPixels(),
+            self.shm_width,
+            self.shm_height,
+            bg_count,
+            quads,
+            opacity,
+            &dmg,
+        );
+
+        if (self.needs_expose_blit) {
+            self.needs_expose_blit = false;
+            self.putRect(0, 0, self.shm_width, self.shm_height);
+            _ = c.XSync(dpy, c.False);
+            return;
+        }
+        if (dmg_count == 0) return;
+
+        for (dmg[0..dmg_count]) |r| {
+            self.putRect(r.x, r.y, r.w, r.h);
+        }
+        // Ensure X server finishes reading shared memory before next frame mutates `shmPixels`
+        _ = c.XSync(dpy, c.False);
+    }
+
+    pub fn waitForFrameSync(self: *X11Backend) void {
+        if (self.render_mode != .shm) return;
+        self.waitForEventsOrTimeout(16);
+    }
+
     pub fn clearTransparent(self: *X11Backend) void {
-        c.glClear(c.GL_COLOR_BUFFER_BIT);
-        self.swapBuffers();
+        switch (self.render_mode) {
+            .glx => {
+                c.glClear(c.GL_COLOR_BUFFER_BIT);
+                self.swapBuffers();
+            },
+            .shm => {
+                const dpy = self.display orelse return;
+                const target_w = @max(1, self.width);
+                const target_h = @max(1, self.height);
+                if (self.shm_image == null or self.shm_width != target_w or self.shm_height != target_h) {
+                    self.recreateShmImage() catch return;
+                }
+                @memset(self.shmPixels(), 0);
+                self.shm_state.width = self.shm_width;
+                self.shm_state.height = self.shm_height;
+                self.shm_state.last_opacity_u8 = 0;
+                self.needs_expose_blit = false;
+                self.putRect(0, 0, self.shm_width, self.shm_height);
+                _ = c.XSync(dpy, c.False);
+            },
+        }
     }
 
     pub fn updateTheMessageQueue(self: *X11Backend) void {
@@ -352,6 +691,7 @@ pub const X11Backend = struct {
                 },
                 c.Expose => {
                     if (event.xexpose.count == 0) {
+                        self.needs_expose_blit = true;
                         self.exposed = true;
                     }
                 },
@@ -430,11 +770,15 @@ pub const X11Backend = struct {
     }
 
     pub fn updateViewport(self: *const X11Backend) void {
-        c.glViewport(0, 0, self.width, self.height);
+        if (self.render_mode == .glx) {
+            c.glViewport(0, 0, self.width, self.height);
+        }
     }
 
     pub fn swapBuffers(self: *const X11Backend) void {
-        c.glXSwapBuffers(self.display, self.glx_handle);
+        if (self.render_mode == .glx) {
+            c.glXSwapBuffers(self.display, self.glx_handle);
+        }
     }
 
     pub fn setClipboard(self: *X11Backend, text: []const u8) void {

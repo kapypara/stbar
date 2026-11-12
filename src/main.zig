@@ -7,8 +7,8 @@ const status_zig = @import("StatusMonitor.zig");
 const StatusMonitor = status_zig.StatusMonitor;
 const BarMode = status_zig.BarMode;
 
-/// Default display server backend (`--backend=auto|wayland|wayland-egl|x11`):
-/// - `.auto`: native Wayland `zwlr_layer_shell_v1` + `wl_shm` when `WAYLAND_DISPLAY` is set, else X11/GLX
+/// Default display server backend (`--backend=auto|wayland|wayland-egl|x11|x11-glx`):
+/// - `.auto`: native Wayland `zwlr_layer_shell_v1` + `wl_shm` when `WAYLAND_DISPLAY` is set, else X11 `MIT-SHM`
 const default_backend_mode: BackendPreference = .auto;
 
 /// Default startup bar mode (`--mode=auto-hide|pinned|dock`):
@@ -62,11 +62,11 @@ const usage_text =
     \\Usage: zigbar [options]
     \\
     \\Options:
-    \\  -m, --mode=<auto-hide|pinned|dock>             Startup bar mode (default: auto-hide)
-    \\  -b, --backend=<auto|wayland|wayland-egl|x11>   Display backend (default: auto)
-    \\  -o, --output=<connector>                       Target Wayland output (e.g. eDP-1, DP-1; default: primary)
-    \\      --hz=<1..60>                               Metric sample rate while visible (default: 8)
-    \\  -h, --help                                     Show this help message and exit
+    \\  -m, --mode=<auto-hide|pinned|dock>                     Startup bar mode (default: auto-hide)
+    \\  -b, --backend=<auto|wayland|wayland-egl|x11|x11-glx>   Display backend (default: auto)
+    \\  -o, --output=<connector>                               Target Wayland output (e.g. eDP-1, DP-1; default: primary)
+    \\      --hz=<1..60>                                       Metric sample rate while visible (default: 8)
+    \\  -h, --help                                             Show this help message and exit
     \\
     \\Mouse & Signal Controls:
     \\  Hover top 1px (>1s)                            Reveal bar in auto-hide mode
@@ -93,7 +93,8 @@ fn parseBackendValue(val: []const u8) ?BackendPreference {
     if (std.mem.eql(u8, val, "auto")) return .auto;
     if (std.mem.eql(u8, val, "wayland") or std.mem.eql(u8, val, "wl") or std.mem.eql(u8, val, "shm") or std.mem.eql(u8, val, "wayland-shm")) return .wayland;
     if (std.mem.eql(u8, val, "wayland-egl") or std.mem.eql(u8, val, "wl-egl") or std.mem.eql(u8, val, "egl")) return .wayland_egl;
-    if (std.mem.eql(u8, val, "x11") or std.mem.eql(u8, val, "xorg") or std.mem.eql(u8, val, "glx")) return .x11;
+    if (std.mem.eql(u8, val, "x11") or std.mem.eql(u8, val, "xorg") or std.mem.eql(u8, val, "xshm") or std.mem.eql(u8, val, "x11-shm")) return .x11;
+    if (std.mem.eql(u8, val, "x11-glx") or std.mem.eql(u8, val, "glx")) return .x11_glx;
     return null;
 }
 
@@ -127,7 +128,7 @@ fn parseCli(args: std.process.Args) !CliConfig {
             };
         } else if (std.mem.startsWith(u8, arg, "--backend=")) {
             cfg.backend = parseBackendValue(arg["--backend=".len..]) orelse {
-                writeFd(2, "zigbar: invalid --backend (expected auto, wayland, wayland-egl, or x11)\n");
+                writeFd(2, "zigbar: invalid --backend (expected auto, wayland, wayland-egl, x11, or x11-glx)\n");
                 return error.InvalidArgument;
             };
         } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--backend")) {
@@ -136,7 +137,7 @@ fn parseCli(args: std.process.Args) !CliConfig {
                 return error.InvalidArgument;
             };
             cfg.backend = parseBackendValue(val) orelse {
-                writeFd(2, "zigbar: invalid --backend (expected auto, wayland, wayland-egl, or x11)\n");
+                writeFd(2, "zigbar: invalid --backend (expected auto, wayland, wayland-egl, x11, or x11-glx)\n");
                 return error.InvalidArgument;
             };
         } else if (std.mem.startsWith(u8, arg, "--output=")) {
@@ -233,6 +234,7 @@ test {
     _ = @import("ShmDraw.zig");
     _ = @import("metrics.zig");
     _ = @import("WaylandBackend.zig");
+    _ = @import("X11Backend.zig");
 }
 
 test "CliConfig.setOutput validates bounds and non-empty connector names" {
@@ -245,4 +247,8 @@ test "CliConfig.setOutput validates bounds and non-empty connector names" {
     try std.testing.expect(!cfg.setOutput(&too_long));
     // Previous valid output remains intact on rejected overwrite
     try std.testing.expectEqualStrings("eDP-1", cfg.outputSlice());
+    try std.testing.expectEqual(@as(?BackendPreference, .x11), parseBackendValue("x11"));
+    try std.testing.expectEqual(@as(?BackendPreference, .x11), parseBackendValue("xshm"));
+    try std.testing.expectEqual(@as(?BackendPreference, .x11_glx), parseBackendValue("x11-glx"));
+    try std.testing.expectEqual(@as(?BackendPreference, .x11_glx), parseBackendValue("glx"));
 }

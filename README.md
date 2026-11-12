@@ -1,10 +1,10 @@
 # zigbar
 
-Ultra-low-overhead Linux status bar written in **Zig 0.17.1**, supporting native **Wayland `wl_shm` (`zwlr_layer_shell_v1`)**, **Wayland `EGL`**, and **X11 (`EWMH` + `GLX`)** in a single standalone executable with zero external runtime files.
+Ultra-low-overhead Linux status bar written in **Zig 0.17.1**, supporting native **Wayland `wl_shm` (`zwlr_layer_shell_v1`)**, **X11 `MIT-SHM` (`EWMH` + `XShmPutImage`)**, **Wayland `EGL`**, and **X11 `GLX`** in a single standalone executable with zero external runtime files.
 
 ## Highlights
 
-- **Single-Threaded Native `wl_shm` Renderer (`~3 MB` RSS, `1` Thread):** Default Wayland backend renders glyphs directly from L1-cached 2-bit `.rodata` into a triple-buffered `memfd` shared-memory pool (`WL_SHM_FORMAT_ARGB8888`) without loading Mesa/GPU drivers, submitting cell-level `wl_surface_damage_buffer` rects and pacing smooth animations via `wl_surface.frame` hardware VSync callbacks — while preserving `wayland-egl` and `x11` OpenGL 3.2 backends in the same binary.
+- **Single-Threaded Native `wl_shm` & `MIT-SHM` Renderers (`<1 MB` Private RSS, `1` Thread):** Default Wayland (`wl_shm`) and X11 (`XShmPutImage`) backends render glyphs directly from L1-cached 2-bit `.rodata` into shared memory without loading Mesa/GPU drivers, submitting cell-level damage rectangles (`wl_surface_damage_buffer` / `XShmPutImage`) — while preserving `wayland-egl` and `x11-glx` OpenGL 3.2 backends in the same binary.
 - **Standalone Single Binary:** `assets/font/tamzen.json` and `assets/font/tamzen.png` are baked into `.rodata` at build time (`tools/bake_font.zig`), requiring zero external assets or Zig package dependencies at runtime.
 - **Zero Polling While Hidden:** In `auto-hide` mode, `zigbar` shrinks its input region to a `1px` top-edge strip and suspends indefinitely inside kernel `poll(..., -1)` (`0 Hz` timers, `0` `/proc` reads, `0` GPU draws). Last-viewed metric state is preserved across sleep so revealing the bar glimpses its previous state and smoothly catches up at VSync.
 - **Framerate-Free Hardware VSync Interpolation:** Samples live Linux metrics (`/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`, `/proc/self/mountinfo`, `/sys/class/hwmon`, `sysinfo`, `localtime_r`) at `8 Hz` while visible and interpolates `prev -> target` smoothly locked to your monitor's native VSync refresh rate when values change — sleeping in `poll()` whenever steady.
@@ -42,11 +42,11 @@ zig build test -Doptimize=Debug --summary all
 Usage: zigbar [options]
 
 Options:
-  -m, --mode=<auto-hide|pinned|dock>             Startup bar mode (default: auto-hide)
-  -b, --backend=<auto|wayland|wayland-egl|x11>   Display backend (default: auto)
-  -o, --output=<connector>                       Target Wayland output (e.g. eDP-1, DP-1; default: primary)
-      --hz=<1..60>                               Metric sample rate while visible (default: 8)
-  -h, --help                                     Show help message and exit
+  -m, --mode=<auto-hide|pinned|dock>                     Startup bar mode (default: auto-hide)
+  -b, --backend=<auto|wayland|wayland-egl|x11|x11-glx>   Display backend (default: auto)
+  -o, --output=<connector>                               Target Wayland output (e.g. eDP-1, DP-1; default: primary)
+      --hz=<1..60>                                       Metric sample rate while visible (default: 8)
+  -h, --help                                             Show help message and exit
 ```
 
 ### Mouse & Signal Controls

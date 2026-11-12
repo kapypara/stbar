@@ -2,22 +2,26 @@ const std = @import("std");
 pub const c = @import("c");
 const ProcLoader = @import("GlProcs.zig").ProcLoader;
 const QuadVertex = @import("RectDraw.zig").RectDraw.QuadVertex;
-const X11Backend = @import("X11Backend.zig").X11Backend;
+const x11_zig = @import("X11Backend.zig");
+const X11Backend = x11_zig.X11Backend;
+const X11RenderMode = x11_zig.X11RenderMode;
 const wayland_zig = @import("WaylandBackend.zig");
 const WaylandBackend = wayland_zig.WaylandBackend;
 const WaylandRenderMode = wayland_zig.WaylandRenderMode;
-pub const Click = @import("X11Backend.zig").Click;
+pub const Click = x11_zig.Click;
 
 pub const BackendPreference = enum {
     /// Prefer native Wayland `zwlr_layer_shell_v1` + `wl_shm` when `WAYLAND_DISPLAY` is active,
-    /// falling back to `wayland-egl` or `x11` automatically.
+    /// falling back to `wayland-egl`, `x11` (`MIT-SHM`), or `x11-glx` automatically.
     auto,
-    /// Native Wayland `zwlr_layer_shell_v1` + `wl_shm` (single-threaded, ~3 MB RSS, zero Mesa load).
+    /// Native Wayland `zwlr_layer_shell_v1` + `wl_shm` (single-threaded, <1 MB private RSS, zero Mesa load).
     wayland,
     /// Native Wayland `zwlr_layer_shell_v1` + `EGL` / OpenGL 3.2 Core.
     wayland_egl,
-    /// Force X11 / Xwayland + `GLX` / OpenGL 3.2 Core.
+    /// Native X11 / Xwayland + `MIT-SHM` (`XShmPutImage`, single-threaded, <1 MB private RSS, zero Mesa load).
     x11,
+    /// Force X11 / Xwayland + `GLX` / OpenGL 3.2 Core.
+    x11_glx,
 };
 
 pub const ActiveBackend = enum {
@@ -80,18 +84,25 @@ pub const Window = struct {
         switch (self.backend_preference) {
             .wayland => try self.initWayland(width, height, .shm),
             .wayland_egl => try self.initWayland(width, height, .egl),
-            .x11 => try self.initX11(x, y, width, height),
+            .x11 => try self.initX11(x, y, width, height, .shm),
+            .x11_glx => try self.initX11(x, y, width, height, .glx),
             .auto => {
                 if (std.c.getenv("WAYLAND_DISPLAY") != null) {
                     self.initWayland(width, height, .shm) catch {
                         self.backend = .none;
                         self.initWayland(width, height, .egl) catch {
                             self.backend = .none;
-                            try self.initX11(x, y, width, height);
+                            self.initX11(x, y, width, height, .shm) catch {
+                                self.backend = .none;
+                                try self.initX11(x, y, width, height, .glx);
+                            };
                         };
                     };
                 } else {
-                    try self.initX11(x, y, width, height);
+                    self.initX11(x, y, width, height, .shm) catch {
+                        self.backend = .none;
+                        try self.initX11(x, y, width, height, .glx);
+                    };
                 }
             },
         }
@@ -121,8 +132,9 @@ pub const Window = struct {
         self.syncFromBackend();
     }
 
-    fn initX11(self: *Window, x: i32, y: i32, width: i32, height: i32) !void {
+    fn initX11(self: *Window, x: i32, y: i32, width: i32, height: i32, render_mode: X11RenderMode) !void {
         self.backend = .{ .x11 = .{
+            .render_mode = render_mode,
             .docked = self.docked,
             .strut_enabled = self.strut_enabled,
             .input_height = self.input_height,
@@ -159,7 +171,8 @@ pub const Window = struct {
     pub fn usesShm(self: *const Window) bool {
         return switch (self.backend) {
             .wayland => |*wl| wl.render_mode == .shm,
-            else => false,
+            .x11 => |*x11| x11.render_mode == .shm,
+            .none => false,
         };
     }
 
@@ -172,14 +185,16 @@ pub const Window = struct {
     ) !void {
         switch (self.backend) {
             .wayland => |*wl| try wl.presentShm(bg_count, quads, opacity, request_frame_sync),
-            else => {},
+            .x11 => |*x11| try x11.presentShm(bg_count, quads, opacity, request_frame_sync),
+            .none => {},
         }
     }
 
     pub fn waitForFrameSync(self: *Window) void {
         switch (self.backend) {
             .wayland => |*wl| wl.waitForFrameSync(),
-            else => {},
+            .x11 => |*x11| x11.waitForFrameSync(),
+            .none => {},
         }
     }
 
