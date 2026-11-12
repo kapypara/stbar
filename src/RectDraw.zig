@@ -1,20 +1,16 @@
 const std = @import("std");
 
 const c = @import("c");
+const types = @import("Types.zig");
 const gl_procs_zig = @import("GlProcs.zig");
 const GlProcs = gl_procs_zig.GlProcs;
 const ProcLoader = gl_procs_zig.ProcLoader;
 
 pub const RectDraw = struct {
-    pub const uv_solid: [2]u16 = .{ 65535, 65535 };
-    pub const uv_empty: [2]u16 = .{ 0, 65535 };
-
-    pub const QuadVertex = extern struct {
-        size: [2]f32,
-        pos: [2]i16,
-        uv: [2]u16,
-        color: [4]u8,
-    };
+    pub const uv_solid = types.uv_solid;
+    pub const uv_empty = types.uv_empty;
+    pub const QuadVertex = types.QuadVertex;
+    pub const TitleClip = types.TitleClip;
 
     gl: GlProcs = undefined,
 
@@ -255,7 +251,21 @@ pub const RectDraw = struct {
         self.vbo_capacity = quad_count;
     }
 
-    pub fn drawBatch(self: *RectDraw, quads: []const QuadVertex, opacity: f32) void {
+    fn ndcXToPixel(ndc_i16: i16, width: i32) i32 {
+        const w_f: f32 = @floatFromInt(@max(1, width));
+        const nx = @max(-1.0, @as(f32, @floatFromInt(ndc_i16)) / 32767.0);
+        const px_f = (nx + 1.0) * 0.5 * w_f;
+        return std.math.clamp(@as(i32, @intFromFloat(@ceil(px_f - 0.5))), 0, @max(0, width));
+    }
+
+    pub fn drawBatch(
+        self: *RectDraw,
+        quads: []const QuadVertex,
+        opacity: f32,
+        viewport_w: i32,
+        viewport_h: i32,
+        title_clip: ?TitleClip,
+    ) void {
         c.glClear(c.GL_COLOR_BUFFER_BIT);
         if (quads.len == 0 or opacity <= 0.0) return;
 
@@ -264,6 +274,28 @@ pub const RectDraw = struct {
 
         const byte_size: c.GLsizeiptr = @intCast(quads.len * @sizeOf(QuadVertex));
         self.gl.BufferSubData(c.GL_ARRAY_BUFFER, 0, byte_size, quads.ptr);
+
+        if (title_clip) |tc| {
+            const start = @min(tc.quad_start, quads.len);
+            const end = @min(tc.quad_end, quads.len);
+            if (end > start and viewport_w > 0 and viewport_h > 0) {
+                if (start > 0) {
+                    c.glDrawArrays(c.GL_POINTS, 0, @intCast(start));
+                }
+                const x0 = ndcXToPixel(tc.min_ndc_x, viewport_w);
+                const x1 = @max(x0, ndcXToPixel(tc.max_ndc_x, viewport_w));
+                if (x1 > x0) {
+                    c.glEnable(c.GL_SCISSOR_TEST);
+                    c.glScissor(x0, 0, x1 - x0, viewport_h);
+                    c.glDrawArrays(c.GL_POINTS, @intCast(start), @intCast(end - start));
+                    c.glDisable(c.GL_SCISSOR_TEST);
+                }
+                if (end < quads.len) {
+                    c.glDrawArrays(c.GL_POINTS, @intCast(end), @intCast(quads.len - end));
+                }
+                return;
+            }
+        }
         c.glDrawArrays(c.GL_POINTS, 0, @intCast(quads.len));
     }
 

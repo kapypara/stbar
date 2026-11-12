@@ -1,9 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const mem = std.mem;
-
-const x11 = @import("Window.zig").c;
-
+const build_options = @import("build_options");
 const c = @import("c");
 
 const ticker_zig = @import("Ticker.zig");
@@ -939,13 +937,17 @@ pub const TimeProbe = struct {
 };
 
 pub const WindowNameProbe = struct {
-    display: ?*x11.Display = null,
-    root: x11.Window = 0,
-    self_window: x11.Window = 0,
-    tracked_window: x11.Window = 0,
-    net_active_atom: x11.Atom = 0,
-    net_name_atom: x11.Atom = 0,
-    wm_name_atom: x11.Atom = 0,
+    const X11State = if (build_options.enable_x11) struct {
+        display: ?*c.Display = null,
+        root: c.Window = 0,
+        self_window: c.Window = 0,
+        tracked_window: c.Window = 0,
+        net_active_atom: c.Atom = 0,
+        net_name_atom: c.Atom = 0,
+        wm_name_atom: c.Atom = 0,
+    } else struct {};
+
+    x11_state: X11State = .{},
     dirty: bool = true,
     current_name: [256]u8 = @splat(0),
     name_len: usize = 0,
@@ -953,22 +955,25 @@ pub const WindowNameProbe = struct {
 
     pub fn attach(
         self: *WindowNameProbe,
-        display: ?*x11.Display,
-        root: x11.Window,
-        self_window: x11.Window,
-        net_active_atom: x11.Atom,
-        net_name_atom: x11.Atom,
-        wm_name_atom: x11.Atom,
+        display: if (build_options.enable_x11) ?*c.Display else void,
+        root: if (build_options.enable_x11) c.Window else void,
+        self_window: if (build_options.enable_x11) c.Window else void,
+        net_active_atom: if (build_options.enable_x11) c.Atom else void,
+        net_name_atom: if (build_options.enable_x11) c.Atom else void,
+        wm_name_atom: if (build_options.enable_x11) c.Atom else void,
     ) void {
-        self.display = display;
-        self.root = root;
-        self.self_window = self_window;
-        self.net_active_atom = net_active_atom;
-        self.net_name_atom = net_name_atom;
-        self.wm_name_atom = wm_name_atom;
+        if (!comptime build_options.enable_x11) return;
+        self.x11_state = .{
+            .display = display,
+            .root = root,
+            .self_window = self_window,
+            .net_active_atom = net_active_atom,
+            .net_name_atom = net_name_atom,
+            .wm_name_atom = wm_name_atom,
+        };
         self.dirty = true;
         if (display != null) {
-            _ = x11.XSetErrorHandler(xErrorHandler);
+            _ = c.XSetErrorHandler(xErrorHandler);
         }
     }
 
@@ -993,12 +998,13 @@ pub const WindowNameProbe = struct {
 
     // Event-driven active window query: executes X11 roundtrips only when marked dirty via PropertyNotify
     pub fn sample(self: *WindowNameProbe) void {
+        if (!comptime build_options.enable_x11) return;
         if (!self.dirty) return;
-        const display = self.display orelse return;
-        if (self.root == 0) return;
+        const display = self.x11_state.display orelse return;
+        if (self.x11_state.root == 0) return;
         self.dirty = false;
 
-        var actual_type: x11.Atom = 0;
+        var actual_type: c.Atom = 0;
         var actual_format: i32 = 0;
         var nitems: u64 = 0;
         var bytes_after: u64 = 0;
@@ -1008,41 +1014,41 @@ pub const WindowNameProbe = struct {
         var next_len: usize = 0;
 
         // 1. Get the Active Window ID
-        if (x11.XGetWindowProperty(display, self.root, self.net_active_atom, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == x11.Success) {
+        if (c.XGetWindowProperty(display, self.x11_state.root, self.x11_state.net_active_atom, 0, ~@as(i64, 0), c.False, c.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == c.Success) {
             if (prop != null and nitems > 0) {
-                const window_id = @as(*x11.Window, @ptrCast(@alignCast(prop))).*;
-                _ = x11.XFree(prop);
+                const window_id = @as(*c.Window, @ptrCast(@alignCast(prop))).*;
+                _ = c.XFree(prop);
                 prop = null;
 
-                if (window_id != self.tracked_window) {
-                    if (self.tracked_window != 0 and self.tracked_window != self.self_window and self.tracked_window != self.root) {
-                        _ = x11.XSelectInput(display, self.tracked_window, x11.NoEventMask);
+                if (window_id != self.x11_state.tracked_window) {
+                    if (self.x11_state.tracked_window != 0 and self.x11_state.tracked_window != self.x11_state.self_window and self.x11_state.tracked_window != self.x11_state.root) {
+                        _ = c.XSelectInput(display, self.x11_state.tracked_window, c.NoEventMask);
                     }
-                    self.tracked_window = window_id;
-                    if (window_id != 0 and window_id != self.self_window and window_id != self.root) {
-                        _ = x11.XSelectInput(display, window_id, x11.PropertyChangeMask);
+                    self.x11_state.tracked_window = window_id;
+                    if (window_id != 0 and window_id != self.x11_state.self_window and window_id != self.x11_state.root) {
+                        _ = c.XSelectInput(display, window_id, c.PropertyChangeMask);
                     }
-                    _ = x11.XFlush(display);
+                    _ = c.XFlush(display);
                 }
 
                 if (window_id != 0) {
                     // 2. Get _NET_WM_NAME, falling back to WM_NAME
-                    if (x11.XGetWindowProperty(display, window_id, self.net_name_atom, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == x11.Success and prop != null and nitems > 0) {
+                    if (c.XGetWindowProperty(display, window_id, self.x11_state.net_name_atom, 0, ~@as(i64, 0), c.False, c.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == c.Success and prop != null and nitems > 0) {
                         next_len = sanitizeName(prop[0..@min(nitems, 255)], &next_buf);
-                        _ = x11.XFree(prop);
+                        _ = c.XFree(prop);
                     } else {
-                        if (prop != null) _ = x11.XFree(prop);
+                        if (prop != null) _ = c.XFree(prop);
                         prop = null;
-                        if (x11.XGetWindowProperty(display, window_id, self.wm_name_atom, 0, ~@as(i64, 0), x11.False, x11.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == x11.Success and prop != null and nitems > 0) {
+                        if (c.XGetWindowProperty(display, window_id, self.x11_state.wm_name_atom, 0, ~@as(i64, 0), c.False, c.AnyPropertyType, &actual_type, &actual_format, &nitems, &bytes_after, &prop) == c.Success and prop != null and nitems > 0) {
                             next_len = sanitizeName(prop[0..@min(nitems, 255)], &next_buf);
-                            _ = x11.XFree(prop);
+                            _ = c.XFree(prop);
                         } else if (prop != null) {
-                            _ = x11.XFree(prop);
+                            _ = c.XFree(prop);
                         }
                     }
                 }
             } else if (prop != null) {
-                _ = x11.XFree(prop);
+                _ = c.XFree(prop);
             }
         }
 
@@ -1053,14 +1059,17 @@ pub const WindowNameProbe = struct {
         }
     }
 
-    fn xErrorHandler(_: ?*x11.Display, _: ?*x11.XErrorEvent) callconv(.c) i32 {
-        return 0; // Equivalent to your ignoreErrors
+    fn xErrorHandler(
+        _: if (build_options.enable_x11) ?*c.Display else ?*anyopaque,
+        _: if (build_options.enable_x11) ?*c.XErrorEvent else ?*anyopaque,
+    ) callconv(.c) i32 {
+        return 0;
     }
 
     fn sanitizeName(src: []const u8, dest: *[256]u8) usize {
         var j: usize = 0;
         for (src) |char| {
-            if (char != '\n' and char != '\r') { // From your sanitizeName logic
+            if (char != '\n' and char != '\r') {
                 dest[j] = char;
                 j += 1;
             }

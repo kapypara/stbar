@@ -20,10 +20,16 @@ pub fn build(b: *std.Build) void {
         "optimize",
         "Prioritize performance, safety, or binary size (default: ReleaseFast)",
     ) orelse .fast;
-    // It's also possible to define more custom flags to toggle optional features
-    // of this build script using `b.option()`. All defined flags (including
-    // target and optimize options) will be listed when running `zig build --help`
-    // in this directory.
+    const enable_gpu = b.option(
+        bool,
+        "gpu",
+        "Enable OpenGL 3.2 backends (wayland-egl, x11-glx; default: false)",
+    ) orelse false;
+    const enable_x11 = b.option(
+        bool,
+        "x11",
+        "Enable X11 / Xwayland backend support (default: true)",
+    ) orelse true;
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -81,24 +87,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }));
 
-    // --- ADDED SYSTEM DEPENDENCIES HERE ---
-    // Link libc (required for C headers and system libraries)
+    const build_opts = b.addOptions();
+    build_opts.addOption(bool, "enable_gpu", enable_gpu);
+    build_opts.addOption(bool, "enable_x11", enable_x11);
+    exe.root_module.addOptions("build_options", build_opts);
+
+    // --- SYSTEM DEPENDENCIES ---
     exe.root_module.link_libc = true;
-
-    // Link the required system libraries (Wayland + EGL + OpenGL + sd-bus + X11 fallback)
-    const c_lib = [_][]const u8{
-        "wayland-client",
-        "wayland-egl",
-        "EGL",
-        "GL",
-        "libsystemd",
-        "X11",
-        "Xrender",
-        "Xext",
-    };
-
-    for (c_lib) |lib| {
-        exe.root_module.linkSystemLibrary(lib, .{});
+    exe.root_module.linkSystemLibrary("wayland-client", .{});
+    exe.root_module.linkSystemLibrary("libsystemd", .{});
+    if (enable_gpu) {
+        exe.root_module.linkSystemLibrary("wayland-egl", .{});
+        exe.root_module.linkSystemLibrary("EGL", .{});
+        exe.root_module.linkSystemLibrary("GL", .{});
+    }
+    if (enable_x11) {
+        exe.root_module.linkSystemLibrary("X11", .{});
+        exe.root_module.linkSystemLibrary("Xrender", .{});
+        exe.root_module.linkSystemLibrary("Xext", .{});
     }
 
     const wf = b.addWriteFiles();
@@ -130,22 +136,21 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addIncludePath(wf.getDirectory());
 
-    const c_header = wf.add("c.h",
-        \\#define _GNU_SOURCE
-        \\#include <wayland-client.h>
+    const gpu_headers: []const u8 = if (enable_gpu)
         \\#include <wayland-egl.h>
         \\#include <EGL/egl.h>
-        \\#include "xdg-shell-client-protocol.h"
-        \\#include "wlr-layer-shell-unstable-v1-client-protocol.h"
-        \\#include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
-        \\#include "ext-data-control-v1-client-protocol.h"
-        \\#include "wlr-data-control-unstable-v1-client-protocol.h"
-        \\#include "fractional-scale-v1-client-protocol.h"
-        \\#include "viewporter-client-protocol.h"
         \\#include <GL/gl.h>
         \\#include <GL/glext.h>
+        \\
+    else
+        "";
+    const glx_headers: []const u8 = if (enable_gpu and enable_x11)
         \\#include <GL/glx.h>
         \\#include <GL/glxext.h>
+        \\
+    else
+        "";
+    const x11_headers: []const u8 = if (enable_x11)
         \\#include <X11/Xatom.h>
         \\#include <X11/extensions/Xrender.h>
         \\#include <X11/extensions/shape.h>
@@ -153,8 +158,23 @@ pub fn build(b: *std.Build) void {
         \\#include <X11/Xutil.h>
         \\#include <sys/ipc.h>
         \\#include <sys/shm.h>
-        \\#include <sys/mman.h>
+        \\
+    else
+        "";
+
+    const c_header = wf.add("c.h", b.fmt(
+        \\#define _GNU_SOURCE
+        \\#include <wayland-client.h>
+        \\#include "xdg-shell-client-protocol.h"
+        \\#include "wlr-layer-shell-unstable-v1-client-protocol.h"
+        \\#include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
+        \\#include "ext-data-control-v1-client-protocol.h"
+        \\#include "wlr-data-control-unstable-v1-client-protocol.h"
+        \\#include "fractional-scale-v1-client-protocol.h"
+        \\#include "viewporter-client-protocol.h"
+        \\{s}{s}{s}#include <sys/mman.h>
         \\#include <sys/statvfs.h>
+        \\#include <dirent.h>
         \\#include <poll.h>
         \\#include <unistd.h>
         \\#include <fcntl.h>
@@ -162,7 +182,8 @@ pub fn build(b: *std.Build) void {
         \\#include <time.h>
         \\#include <systemd/sd-bus.h>
         \\
-    );
+    , .{ gpu_headers, glx_headers, x11_headers }));
+
     const translate_c = b.addTranslateC(.{
         .root_source_file = c_header,
         .target = target,
@@ -170,8 +191,17 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     translate_c.addIncludePath(wf.getDirectory());
-    for (c_lib) |lib| {
-        translate_c.linkSystemLibrary(lib, .{});
+    translate_c.linkSystemLibrary("wayland-client", .{});
+    translate_c.linkSystemLibrary("libsystemd", .{});
+    if (enable_gpu) {
+        translate_c.linkSystemLibrary("wayland-egl", .{});
+        translate_c.linkSystemLibrary("EGL", .{});
+        translate_c.linkSystemLibrary("GL", .{});
+    }
+    if (enable_x11) {
+        translate_c.linkSystemLibrary("X11", .{});
+        translate_c.linkSystemLibrary("Xrender", .{});
+        translate_c.linkSystemLibrary("Xext", .{});
     }
     exe.root_module.addImport("c", translate_c.createModule());
     // --------------------------------------

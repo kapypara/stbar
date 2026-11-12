@@ -1,5 +1,9 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const c = @import("c");
+const types = @import("Types.zig");
+const BarPosition = types.BarPosition;
+const MarqueeMode = types.MarqueeMode;
 const window_zig = @import("Window.zig");
 const Window = window_zig.Window;
 const BackendPreference = window_zig.BackendPreference;
@@ -12,10 +16,16 @@ const BarMode = status_zig.BarMode;
 const default_backend_mode: BackendPreference = .auto;
 
 /// Default startup bar mode (`--mode=auto-hide|pinned|dock`):
-/// - `.auto_hide`: overlay (`strut = OFF`), 1px top hover sensor (>1s reveal, 0 Hz sleep while hidden)
+/// - `.auto_hide`: overlay (`strut = OFF`), 1px edge hover sensor (>1s reveal, 0 Hz sleep while hidden)
 /// - `.pinned_overlay`: overlay (`strut = OFF`), always visible
-/// - `.docked_strut`: reserved 17px top dock (`strut = ON`), always visible
+/// - `.docked_strut`: reserved 17px dock (`strut = ON`), always visible
 const default_initial_mode: BarMode = .auto_hide;
+
+/// Default screen edge anchor (`-p, --position=top|bottom`).
+const default_bar_position: BarPosition = .top;
+
+/// Default overflowing window-title scroll style (`--marquee=smooth|snap`).
+const default_marquee_mode: MarqueeMode = .smooth;
 
 /// Default metric sample frequency while visible (`--hz=1..60`; 0 Hz while hidden).
 const default_visible_sample_hz: u8 = 8;
@@ -40,6 +50,8 @@ fn onSignal(sig: c_int) callconv(.c) void {
 
 const CliConfig = struct {
     mode: BarMode = default_initial_mode,
+    position: BarPosition = default_bar_position,
+    marquee: MarqueeMode = default_marquee_mode,
     backend: BackendPreference = default_backend_mode,
     sample_hz: u8 = default_visible_sample_hz,
     output: [64]u8 = @splat(0),
@@ -63,13 +75,15 @@ const usage_text =
     \\
     \\Options:
     \\  -m, --mode=<auto-hide|pinned|dock>                     Startup bar mode (default: auto-hide)
+    \\  -p, --position=<top|bottom>                            Screen edge anchor (default: top)
     \\  -b, --backend=<auto|wayland|wayland-egl|x11|x11-glx>   Display backend (default: auto)
     \\  -o, --output=<connector>                               Target Wayland output (e.g. eDP-1, DP-1; default: primary)
+    \\      --marquee=<smooth|snap>                            Overflowing window title scroll style (default: smooth)
     \\      --hz=<1..60>                                       Metric sample rate while visible (default: 8)
     \\  -h, --help                                             Show this help message and exit
     \\
     \\Mouse & Signal Controls:
-    \\  Hover top 1px (>1s)                            Reveal bar in auto-hide mode
+    \\  Hover 1px edge (>1s)                           Reveal bar in auto-hide mode
     \\  Left-click segment                             Run segment action (copy time/power/title, open btop/dolphin)
     \\  Right-click / SIGUSR1                          Toggle pinned overlay (strut OFF) <-> auto-hide
     \\  Middle-click / SIGUSR2                         Toggle 17px docked strut (strut ON) <-> auto-hide
@@ -89,6 +103,18 @@ fn parseModeValue(val: []const u8) ?BarMode {
     return null;
 }
 
+fn parsePositionValue(val: []const u8) ?BarPosition {
+    if (std.mem.eql(u8, val, "top") or std.mem.eql(u8, val, "t")) return .top;
+    if (std.mem.eql(u8, val, "bottom") or std.mem.eql(u8, val, "bot") or std.mem.eql(u8, val, "b")) return .bottom;
+    return null;
+}
+
+fn parseMarqueeValue(val: []const u8) ?MarqueeMode {
+    if (std.mem.eql(u8, val, "smooth") or std.mem.eql(u8, val, "pixel")) return .smooth;
+    if (std.mem.eql(u8, val, "snap") or std.mem.eql(u8, val, "char") or std.mem.eql(u8, val, "step")) return .snap;
+    return null;
+}
+
 fn parseBackendValue(val: []const u8) ?BackendPreference {
     if (std.mem.eql(u8, val, "auto")) return .auto;
     if (std.mem.eql(u8, val, "wayland") or std.mem.eql(u8, val, "wl") or std.mem.eql(u8, val, "shm") or std.mem.eql(u8, val, "wayland-shm")) return .wayland;
@@ -96,6 +122,21 @@ fn parseBackendValue(val: []const u8) ?BackendPreference {
     if (std.mem.eql(u8, val, "x11") or std.mem.eql(u8, val, "xorg") or std.mem.eql(u8, val, "xshm") or std.mem.eql(u8, val, "x11-shm")) return .x11;
     if (std.mem.eql(u8, val, "x11-glx") or std.mem.eql(u8, val, "glx")) return .x11_glx;
     return null;
+}
+
+fn validateBackendEnabled(backend: BackendPreference) !void {
+    if (!comptime build_options.enable_gpu) {
+        if (backend == .wayland_egl or backend == .x11_glx) {
+            writeFd(2, "zigbar: GPU backends are disabled in this build (rebuild with -Dgpu=true)\n");
+            return error.InvalidArgument;
+        }
+    }
+    if (!comptime build_options.enable_x11) {
+        if (backend == .x11 or backend == .x11_glx) {
+            writeFd(2, "zigbar: X11 backend is disabled in this build (rebuild with -Dx11=true)\n");
+            return error.InvalidArgument;
+        }
+    }
 }
 
 fn writeFd(fd: c_int, msg: []const u8) void {
@@ -126,11 +167,40 @@ fn parseCli(args: std.process.Args) !CliConfig {
                 writeFd(2, "zigbar: invalid --mode (expected auto-hide, pinned, or dock)\n");
                 return error.InvalidArgument;
             };
+        } else if (std.mem.startsWith(u8, arg, "--position=")) {
+            cfg.position = parsePositionValue(arg["--position=".len..]) orelse {
+                writeFd(2, "zigbar: invalid --position (expected top or bottom)\n");
+                return error.InvalidArgument;
+            };
+        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--position")) {
+            const val = it.next() orelse {
+                writeFd(2, "zigbar: missing value for --position\n");
+                return error.InvalidArgument;
+            };
+            cfg.position = parsePositionValue(val) orelse {
+                writeFd(2, "zigbar: invalid --position (expected top or bottom)\n");
+                return error.InvalidArgument;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--marquee=")) {
+            cfg.marquee = parseMarqueeValue(arg["--marquee=".len..]) orelse {
+                writeFd(2, "zigbar: invalid --marquee (expected smooth or snap)\n");
+                return error.InvalidArgument;
+            };
+        } else if (std.mem.eql(u8, arg, "--marquee")) {
+            const val = it.next() orelse {
+                writeFd(2, "zigbar: missing value for --marquee\n");
+                return error.InvalidArgument;
+            };
+            cfg.marquee = parseMarqueeValue(val) orelse {
+                writeFd(2, "zigbar: invalid --marquee (expected smooth or snap)\n");
+                return error.InvalidArgument;
+            };
         } else if (std.mem.startsWith(u8, arg, "--backend=")) {
             cfg.backend = parseBackendValue(arg["--backend=".len..]) orelse {
                 writeFd(2, "zigbar: invalid --backend (expected auto, wayland, wayland-egl, x11, or x11-glx)\n");
                 return error.InvalidArgument;
             };
+            try validateBackendEnabled(cfg.backend);
         } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--backend")) {
             const val = it.next() orelse {
                 writeFd(2, "zigbar: missing value for --backend\n");
@@ -140,6 +210,7 @@ fn parseCli(args: std.process.Args) !CliConfig {
                 writeFd(2, "zigbar: invalid --backend (expected auto, wayland, wayland-egl, x11, or x11-glx)\n");
                 return error.InvalidArgument;
             };
+            try validateBackendEnabled(cfg.backend);
         } else if (std.mem.startsWith(u8, arg, "--output=")) {
             if (!cfg.setOutput(arg["--output=".len..])) {
                 writeFd(2, "zigbar: invalid --output (expected non-empty connector name <= 64 chars)\n");
@@ -187,6 +258,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     sa.__sigaction_handler.sa_handler = onSignal;
     _ = c.sigaction(c.SIGINT, &sa, null);
     _ = c.sigaction(c.SIGTERM, &sa, null);
+    _ = c.sigaction(c.SIGHUP, &sa, null);
     _ = c.sigaction(c.SIGUSR1, &sa, null);
     _ = c.sigaction(c.SIGUSR2, &sa, null);
 
@@ -200,6 +272,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var window = Window{
         .backend_preference = cli.backend,
+        .position = cli.position,
         .docked = true,
         .strut_enabled = (cli.mode == .docked_strut),
         .input_height = if (cli.mode == .auto_hide) 1 else 14 + 3,
@@ -211,7 +284,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try window.init(0, 0, 0, 14 + 3);
     defer window.deinit();
 
-    var monitor: StatusMonitor = .{ .window = &window };
+    var monitor: StatusMonitor = .{
+        .window = &window,
+        .marquee_mode = cli.marquee,
+    };
     try monitor.init(io, cli.sample_hz, cli.mode);
     defer monitor.deinit();
 
@@ -227,6 +303,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 }
 
 test {
+    _ = @import("Types.zig");
     _ = @import("formats.zig");
     _ = @import("Actions.zig");
     _ = @import("Segment.zig");
@@ -234,10 +311,15 @@ test {
     _ = @import("ShmDraw.zig");
     _ = @import("metrics.zig");
     _ = @import("WaylandBackend.zig");
-    _ = @import("X11Backend.zig");
+    if (comptime build_options.enable_x11) {
+        _ = @import("X11Backend.zig");
+    }
+    if (comptime build_options.enable_gpu) {
+        _ = @import("RectDraw.zig");
+    }
 }
 
-test "CliConfig.setOutput validates bounds and non-empty connector names" {
+test "CliConfig.setOutput and CLI value parsers validate inputs" {
     var cfg: CliConfig = .{};
     try std.testing.expectEqual(@as(usize, 0), cfg.outputSlice().len);
     try std.testing.expect(!cfg.setOutput(""));
@@ -251,4 +333,10 @@ test "CliConfig.setOutput validates bounds and non-empty connector names" {
     try std.testing.expectEqual(@as(?BackendPreference, .x11), parseBackendValue("xshm"));
     try std.testing.expectEqual(@as(?BackendPreference, .x11_glx), parseBackendValue("x11-glx"));
     try std.testing.expectEqual(@as(?BackendPreference, .x11_glx), parseBackendValue("glx"));
+    try std.testing.expectEqual(@as(?BarPosition, .top), parsePositionValue("top"));
+    try std.testing.expectEqual(@as(?BarPosition, .bottom), parsePositionValue("bottom"));
+    try std.testing.expectEqual(@as(?BarPosition, null), parsePositionValue("left"));
+    try std.testing.expectEqual(@as(?MarqueeMode, .smooth), parseMarqueeValue("smooth"));
+    try std.testing.expectEqual(@as(?MarqueeMode, .snap), parseMarqueeValue("snap"));
+    try std.testing.expectEqual(@as(?MarqueeMode, null), parseMarqueeValue("bounce"));
 }

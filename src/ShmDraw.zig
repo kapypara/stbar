@@ -1,7 +1,10 @@
 const std = @import("std");
 const embedded = @import("tamzen_embedded");
-const RectDraw = @import("RectDraw.zig").RectDraw;
-const QuadVertex = RectDraw.QuadVertex;
+const types = @import("Types.zig");
+pub const QuadVertex = types.QuadVertex;
+pub const TitleClip = types.TitleClip;
+pub const uv_solid = types.uv_solid;
+pub const uv_empty = types.uv_empty;
 
 pub const DamageRect = struct {
     x: i32,
@@ -19,7 +22,10 @@ pub const SlotState = struct {
     last_opacity_u8: u16 = 0xFFFF, // 0xFFFF forces an initial full-buffer draw
     cell_count: usize = 0,
     bg_sig: u64 = 0,
+    title_clip_px0: usize = 0,
+    title_clip_px1: usize = 0,
     cell_uvs: [max_cells]u32 = @splat(0),
+    cell_pos_x: [max_cells]i16 = @splat(0),
 
     pub fn invalidate(self: *SlotState) void {
         self.last_opacity_u8 = 0xFFFF;
@@ -180,6 +186,14 @@ pub const ShmDraw = struct {
         return @truncate(embedded.packed_2bit[idx >> 2] >> @intCast((idx & 3) * 2));
     }
 
+    inline fn ndcXToPixel(ndc_i16: i16, width: i32) usize {
+        const w_f: f32 = @floatFromInt(width);
+        const nx = @max(-1.0, @as(f32, @floatFromInt(ndc_i16)) / 32767.0);
+        const px_f = (nx + 1.0) * 0.5 * w_f;
+        const ix = std.math.clamp(@as(i32, @intFromFloat(@ceil(px_f - 0.5))), 0, width);
+        return @intCast(ix);
+    }
+
     fn blitCell(
         pixels: []u32,
         width: i32,
@@ -187,23 +201,27 @@ pub const ShmDraw = struct {
         q: QuadVertex,
         alpha_scale: u8,
         skip_if_empty: bool,
+        clip_x0: usize,
+        clip_x1: usize,
     ) ?DamageRect {
-        const is_empty = (q.uv[0] == RectDraw.uv_empty[0] and q.uv[1] == RectDraw.uv_empty[1]);
+        const is_empty = (q.uv[0] == uv_empty[0] and q.uv[1] == uv_empty[1]);
         if (is_empty and skip_if_empty) return null;
 
         const sx = spanX(q, width);
         const sy = spanY(q, height);
-        if (sx.p0 >= sx.p1 or sy.p0 >= sy.p1) return null;
+        const draw_x0 = @max(sx.p0, clip_x0);
+        const draw_x1 = @min(sx.p1, clip_x1);
+        if (draw_x0 >= draw_x1 or sy.p0 >= sy.p1) return null;
 
         const stride: usize = @intCast(width);
 
         if (is_empty) {
             const bg_argb = packArgb(q.color, alpha_scale);
-            fillRect(pixels, stride, sx.p0, sx.p1, sy.p0, sy.p1, bg_argb);
+            fillRect(pixels, stride, draw_x0, draw_x1, sy.p0, sy.p1, bg_argb);
             return .{
-                .x = @intCast(sx.p0),
+                .x = @intCast(draw_x0),
                 .y = @intCast(sy.p0),
-                .w = @intCast(sx.p1 - sx.p0),
+                .w = @intCast(draw_x1 - draw_x0),
                 .h = @intCast(sy.p1 - sy.p0),
             };
         }
@@ -214,22 +232,24 @@ pub const ShmDraw = struct {
         const atlas_y0 = cell.row * embedded.char_height;
         const cell_w = sx.p1 - sx.p0;
         const cell_h = sy.p1 - sy.p0;
+        const start_dx = draw_x0 - sx.p0;
+        const draw_w = draw_x1 - draw_x0;
 
         if (cell_w == embedded.char_width and cell_h == embedded.char_height) {
             for (0..embedded.char_height) |dy| {
-                const src_base = (atlas_y0 + dy) * embedded.width + atlas_x0;
-                const dst_row = pixels[(sy.p0 + dy) * stride + sx.p0 ..][0..embedded.char_width];
-                for (0..embedded.char_width) |dx| {
-                    dst_row[dx] = lut[samplePacked2Bit(src_base + dx)];
+                const src_base = (atlas_y0 + dy) * embedded.width + atlas_x0 + start_dx;
+                const dst_row = pixels[(sy.p0 + dy) * stride + draw_x0 ..][0..draw_w];
+                for (0..draw_w) |i| {
+                    dst_row[i] = lut[samplePacked2Bit(src_base + i)];
                 }
             }
         } else {
-            // Precompute rational box-coverage X taps once per cell (`<= 64` px fast path)
+            // Precompute rational box-coverage X taps once per visible span (`<= 64` px fast path)
             var x_taps_buf: [64]AxisTap = undefined;
-            const use_x_cache = cell_w <= x_taps_buf.len;
+            const use_x_cache = draw_w <= x_taps_buf.len;
             if (use_x_cache) {
-                for (0..cell_w) |dx| {
-                    x_taps_buf[dx] = computeAxisTap(dx, cell_w, embedded.char_width);
+                for (0..draw_w) |i| {
+                    x_taps_buf[i] = computeAxisTap(start_dx + i, cell_w, embedded.char_width);
                 }
             }
 
@@ -237,35 +257,35 @@ pub const ShmDraw = struct {
                 const y_tap = computeAxisTap(dy, cell_h, embedded.char_height);
                 const src_row0 = (atlas_y0 + y_tap.t0) * embedded.width + atlas_x0;
                 const src_row1 = (atlas_y0 + y_tap.t1) * embedded.width + atlas_x0;
-                const dst_row = pixels[(sy.p0 + dy) * stride + sx.p0 ..][0..cell_w];
+                const dst_row = pixels[(sy.p0 + dy) * stride + draw_x0 ..][0..draw_w];
 
                 if (y_tap.w == 0) {
-                    for (0..cell_w) |dx| {
-                        const x_tap = if (use_x_cache) x_taps_buf[dx] else computeAxisTap(dx, cell_w, embedded.char_width);
+                    for (0..draw_w) |i| {
+                        const x_tap = if (use_x_cache) x_taps_buf[i] else computeAxisTap(start_dx + i, cell_w, embedded.char_width);
                         const c00 = samplePacked2Bit(src_row0 + x_tap.t0);
                         if (x_tap.w == 0) {
-                            dst_row[dx] = lut[c00];
+                            dst_row[i] = lut[c00];
                         } else {
                             const c10 = samplePacked2Bit(src_row0 + x_tap.t1);
-                            dst_row[dx] = if (c00 == c10) lut[c00] else lerpArgb256(lut[c00], lut[c10], x_tap.w);
+                            dst_row[i] = if (c00 == c10) lut[c00] else lerpArgb256(lut[c00], lut[c10], x_tap.w);
                         }
                     }
                 } else {
-                    for (0..cell_w) |dx| {
-                        const x_tap = if (use_x_cache) x_taps_buf[dx] else computeAxisTap(dx, cell_w, embedded.char_width);
+                    for (0..draw_w) |i| {
+                        const x_tap = if (use_x_cache) x_taps_buf[i] else computeAxisTap(start_dx + i, cell_w, embedded.char_width);
                         const c00 = samplePacked2Bit(src_row0 + x_tap.t0);
                         const c01 = samplePacked2Bit(src_row1 + x_tap.t0);
                         if (x_tap.w == 0) {
-                            dst_row[dx] = if (c00 == c01) lut[c00] else lerpArgb256(lut[c00], lut[c01], y_tap.w);
+                            dst_row[i] = if (c00 == c01) lut[c00] else lerpArgb256(lut[c00], lut[c01], y_tap.w);
                         } else {
                             const c10 = samplePacked2Bit(src_row0 + x_tap.t1);
                             const c11 = samplePacked2Bit(src_row1 + x_tap.t1);
                             if (c00 == c10 and c00 == c01 and c00 == c11) {
-                                dst_row[dx] = lut[c00];
+                                dst_row[i] = lut[c00];
                             } else {
                                 const top = lerpArgb256(lut[c00], lut[c10], x_tap.w);
                                 const bot = lerpArgb256(lut[c01], lut[c11], x_tap.w);
-                                dst_row[dx] = lerpArgb256(top, bot, y_tap.w);
+                                dst_row[i] = lerpArgb256(top, bot, y_tap.w);
                             }
                         }
                     }
@@ -274,9 +294,9 @@ pub const ShmDraw = struct {
         }
 
         return .{
-            .x = @intCast(sx.p0),
+            .x = @intCast(draw_x0),
             .y = @intCast(sy.p0),
-            .w = @intCast(cell_w),
+            .w = @intCast(draw_w),
             .h = @intCast(cell_h),
         };
     }
@@ -320,6 +340,7 @@ pub const ShmDraw = struct {
         bg_count: usize,
         quads: []const QuadVertex,
         opacity: f32,
+        title_clip: ?TitleClip,
         damage_out: *[max_damage_rects]DamageRect,
     ) usize {
         if (width <= 0 or height <= 0 or pixels.len < @as(usize, @intCast(width * height))) {
@@ -332,6 +353,8 @@ pub const ShmDraw = struct {
         const clamped_bg = @min(bg_count, quads.len);
         const raw_cells = quads[clamped_bg..];
         const cell_quads = raw_cells[0..@min(raw_cells.len, max_cells)];
+        const full_w: usize = @intCast(width);
+        const full_h: usize = @intCast(height);
 
         if (slot.cell_count != cell_quads.len) {
             slot.cell_count = cell_quads.len;
@@ -350,6 +373,30 @@ pub const ShmDraw = struct {
             return 1;
         }
 
+        var has_tc = false;
+        var tc_cell_start: usize = 0;
+        var tc_cell_end: usize = 0;
+        var clip_px0: usize = 0;
+        var clip_px1: usize = full_w;
+        var clear_px0: usize = 0;
+        var clear_px1: usize = full_w;
+        var tc_bg_argb: u32 = 0;
+
+        if (title_clip) |tc| {
+            if (tc.quad_end > tc.quad_start and tc.quad_end > clamped_bg) {
+                tc_cell_start = @min(tc.quad_start -| clamped_bg, cell_quads.len);
+                tc_cell_end = @min(tc.quad_end -| clamped_bg, cell_quads.len);
+                if (tc_cell_end > tc_cell_start) {
+                    has_tc = true;
+                    clear_px0 = ndcXToPixel(tc.clear_min_ndc_x, width);
+                    clear_px1 = @max(clear_px0, ndcXToPixel(tc.clear_max_ndc_x, width));
+                    clip_px0 = std.math.clamp(ndcXToPixel(tc.min_ndc_x, width), clear_px0, clear_px1);
+                    clip_px1 = std.math.clamp(ndcXToPixel(tc.max_ndc_x, width), clip_px0, clear_px1);
+                    tc_bg_argb = packArgb(tc.bg_color, alpha_scale);
+                }
+            }
+        }
+
         const next_bg_sig = computeBgSig(quads[0..clamped_bg]);
         const full_redraw = (slot.width != width or
             slot.height != height or
@@ -357,7 +404,7 @@ pub const ShmDraw = struct {
             slot.bg_sig != next_bg_sig);
 
         if (full_redraw) {
-            const stride: usize = @intCast(width);
+            const stride: usize = full_w;
             @memset(pixels[0..@intCast(width * height)], 0);
 
             for (quads[0..clamped_bg]) |bg_q| {
@@ -369,23 +416,61 @@ pub const ShmDraw = struct {
 
             for (cell_quads, 0..) |cq, idx| {
                 slot.cell_uvs[idx] = packUv(cq.uv);
-                _ = blitCell(pixels, width, height, cq, alpha_scale, true);
+                slot.cell_pos_x[idx] = cq.pos[0];
+                const c0 = if (has_tc and idx >= tc_cell_start and idx < tc_cell_end) clip_px0 else 0;
+                const c1 = if (has_tc and idx >= tc_cell_start and idx < tc_cell_end) clip_px1 else full_w;
+                _ = blitCell(pixels, width, height, cq, alpha_scale, true, c0, c1);
             }
 
             slot.width = width;
             slot.height = height;
             slot.last_opacity_u8 = alpha_scale;
             slot.bg_sig = next_bg_sig;
+            slot.title_clip_px0 = clip_px0;
+            slot.title_clip_px1 = clip_px1;
             damage_out[0] = .{ .x = 0, .y = 0, .w = width, .h = height };
             return 1;
         }
 
         var damage_count: usize = 0;
+
+        if (has_tc) {
+            var title_changed = (clip_px0 != slot.title_clip_px0 or clip_px1 != slot.title_clip_px1);
+            if (!title_changed) {
+                for (cell_quads[tc_cell_start..tc_cell_end], tc_cell_start..) |cq, idx| {
+                    if (packUv(cq.uv) != slot.cell_uvs[idx] or cq.pos[0] != slot.cell_pos_x[idx]) {
+                        title_changed = true;
+                        break;
+                    }
+                }
+            }
+            if (title_changed) {
+                slot.title_clip_px0 = clip_px0;
+                slot.title_clip_px1 = clip_px1;
+                fillRect(pixels, full_w, clear_px0, clear_px1, 0, full_h, tc_bg_argb);
+                for (cell_quads[tc_cell_start..tc_cell_end], tc_cell_start..) |cq, idx| {
+                    slot.cell_uvs[idx] = packUv(cq.uv);
+                    slot.cell_pos_x[idx] = cq.pos[0];
+                    _ = blitCell(pixels, width, height, cq, alpha_scale, true, clip_px0, clip_px1);
+                }
+                if (clear_px1 > clear_px0) {
+                    appendDamage(damage_out, &damage_count, .{
+                        .x = @intCast(clear_px0),
+                        .y = 0,
+                        .w = @intCast(clear_px1 - clear_px0),
+                        .h = height,
+                    });
+                }
+            }
+        }
+
         for (cell_quads, 0..) |cq, idx| {
+            if (has_tc and idx >= tc_cell_start and idx < tc_cell_end) continue;
             const p_uv = packUv(cq.uv);
-            if (p_uv == slot.cell_uvs[idx]) continue;
+            if (p_uv == slot.cell_uvs[idx] and cq.pos[0] == slot.cell_pos_x[idx]) continue;
             slot.cell_uvs[idx] = p_uv;
-            if (blitCell(pixels, width, height, cq, alpha_scale, false)) |rect| {
+            slot.cell_pos_x[idx] = cq.pos[0];
+            if (blitCell(pixels, width, height, cq, alpha_scale, false, 0, full_w)) |rect| {
                 appendDamage(damage_out, &damage_count, rect);
             }
         }
@@ -421,7 +506,7 @@ test "ShmDraw recovers exact Tamzen atlas coordinates and performs incremental c
         .{
             .size = .{ 2.0, 2.0 },
             .pos = .{ -32768, 32767 },
-            .uv = RectDraw.uv_solid,
+            .uv = uv_solid,
             .color = .{ 0x59, 0x59, 0x59, 0xCC },
         },
         // Cell 0 at x=0..7
@@ -435,24 +520,24 @@ test "ShmDraw recovers exact Tamzen atlas coordinates and performs incremental c
         .{
             .size = .{ 0.5, 14.0 / 17.0 * 2.0 },
             .pos = .{ -16384, 28067 },
-            .uv = RectDraw.uv_empty,
+            .uv = uv_empty,
             .color = .{ 0x59, 0x59, 0x59, 0xCC },
         },
     };
 
     var dmg: [max_damage_rects]DamageRect = undefined;
-    const n1 = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, &dmg);
+    const n1 = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, null, &dmg);
     try std.testing.expectEqual(@as(usize, 1), n1);
     try std.testing.expectEqual(@as(i32, w), dmg[0].w);
     try std.testing.expectEqual(@as(i32, h), dmg[0].h);
 
     // Repeating identical state produces 0 damage rects
-    const n2 = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, &dmg);
+    const n2 = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, null, &dmg);
     try std.testing.expectEqual(@as(usize, 0), n2);
 
     // Updating only cell 0 emits a single 7x14 cell damage rect
     quads[1].uv = glyph_b_uv;
-    const n3 = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, &dmg);
+    const n3 = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, null, &dmg);
     try std.testing.expectEqual(@as(usize, 1), n3);
     try std.testing.expectEqual(@as(i32, 0), dmg[0].x);
     try std.testing.expectEqual(@as(i32, 7), dmg[0].w);
@@ -460,7 +545,7 @@ test "ShmDraw recovers exact Tamzen atlas coordinates and performs incremental c
 
     // Changing segment background geometry triggers a full-bar redraw even with identical cells/opacity
     quads[0].color = .{ 0x3C, 0x6E, 0x84, 0xCC };
-    const n4 = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, &dmg);
+    const n4 = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, null, &dmg);
     try std.testing.expectEqual(@as(usize, 1), n4);
     try std.testing.expectEqual(@as(i32, w), dmg[0].w);
     try std.testing.expectEqual(@as(i32, h), dmg[0].h);
@@ -476,7 +561,7 @@ test "ShmDraw HiDPI scaling preserves crisp 2x integer blocks and smooth 1.5x co
         .{
             .size = .{ 2.0, 2.0 },
             .pos = .{ -32768, 32767 },
-            .uv = RectDraw.uv_solid,
+            .uv = uv_solid,
             .color = bg_col,
         },
         // Full-width single glyph cell (`14x28` at 2x, `11x21` at ~1.5x)
@@ -492,7 +577,7 @@ test "ShmDraw HiDPI scaling preserves crisp 2x integer blocks and smooth 1.5x co
     var px_2x: [14 * 28]u32 = @splat(0);
     var slot_2x: SlotState = .{};
     var dmg: [max_damage_rects]DamageRect = undefined;
-    _ = ShmDraw.renderSlot(&slot_2x, &px_2x, 14, 28, 1, &quads, 1.0, &dmg);
+    _ = ShmDraw.renderSlot(&slot_2x, &px_2x, 14, 28, 1, &quads, 1.0, null, &dmg);
     var fg_2x_count: usize = 0;
     for (px_2x) |p| {
         // Every pixel at 2x must be strictly pure background or pure foreground (zero blur)
@@ -513,10 +598,96 @@ test "ShmDraw HiDPI scaling preserves crisp 2x integer blocks and smooth 1.5x co
     // 2. Fractional ~1.5x scale (`11x21` buffer for a `7x14` cell): produces coverage-blended edge pixels
     var px_15x: [11 * 21]u32 = @splat(0);
     var slot_15x: SlotState = .{};
-    _ = ShmDraw.renderSlot(&slot_15x, &px_15x, 11, 21, 1, &quads, 1.0, &dmg);
+    _ = ShmDraw.renderSlot(&slot_15x, &px_15x, 11, 21, 1, &quads, 1.0, null, &dmg);
     var blended_count: usize = 0;
     for (px_15x) |p| {
         if (p != bg_argb and p != fg_argb) blended_count += 1;
     }
     try std.testing.expect(blended_count > 0);
+}
+
+test "ShmDraw TitleClip crops smooth-scrolled glyphs cleanly to inner viewport" {
+    const w: i32 = 28; // 4 cells of 7px: [0..7) left margin, [7..21) viewport, [21..28) right margin
+    const h: i32 = 17;
+    const bg_col: [4]u8 = .{ 0x00, 0x00, 0x00, 0x77 };
+    const bg_argb = ShmDraw.packArgb(bg_col, 255);
+    const glyph_m_uv = embedded.latin1_uvs['M'];
+
+    var pixels: [w * h]u32 = @splat(0);
+    var slot: SlotState = .{};
+    var dmg: [max_damage_rects]DamageRect = undefined;
+
+    var quads = [_]QuadVertex{
+        .{
+            .size = .{ 2.0, 2.0 },
+            .pos = .{ -32768, 32767 },
+            .uv = uv_solid,
+            .color = bg_col,
+        },
+        // Glyph shifted half into left margin (`x = 3..10`)
+        .{
+            .size = .{ 0.5, 14.0 / 17.0 * 2.0 },
+            .pos = .{ -25745, 28067 },
+            .uv = glyph_m_uv,
+            .color = bg_col,
+        },
+        // Incoming glyph shifted half from right margin (`x = 17..24`)
+        .{
+            .size = .{ 0.5, 14.0 / 17.0 * 2.0 },
+            .pos = .{ 7022, 28067 },
+            .uv = glyph_m_uv,
+            .color = bg_col,
+        },
+    };
+
+    const tc_paused = TitleClip{
+        .quad_start = 1,
+        .quad_end = 3,
+        .min_ndc_x = -16384, // x = 7
+        .max_ndc_x = 16384, // x = 21
+        .clear_min_ndc_x = -32768, // x = 0
+        .clear_max_ndc_x = 32767, // x = 28
+        .bg_color = bg_col,
+    };
+
+    _ = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, tc_paused, &dmg);
+
+    // Paused: left margin [0..7) and right margin [21..28) must remain 100% pure background
+    for (0..@intCast(h)) |py| {
+        for (0..7) |px| {
+            try std.testing.expectEqual(bg_argb, pixels[py * 28 + px]);
+        }
+        for (21..28) |px| {
+            try std.testing.expectEqual(bg_argb, pixels[py * 28 + px]);
+        }
+    }
+
+    // Edge-to-edge scrolling (`[0..28)`) lets edge glyphs render into `[0..7)` and `[21..28)`
+    const tc_edge = TitleClip{
+        .quad_start = 1,
+        .quad_end = 3,
+        .min_ndc_x = -32768,
+        .max_ndc_x = 32767,
+        .clear_min_ndc_x = -32768,
+        .clear_max_ndc_x = 32767,
+        .bg_color = bg_col,
+    };
+    quads[1].pos[0] -= 2340;
+    quads[2].pos[0] -= 2340;
+    const n_edge = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, tc_edge, &dmg);
+    try std.testing.expectEqual(@as(usize, 1), n_edge);
+    try std.testing.expectEqual(@as(i32, 0), dmg[0].x);
+    try std.testing.expectEqual(@as(i32, 28), dmg[0].w);
+
+    // Returning to paused (`[7..21)`) wipes any edge-bleed in `[0..7)` and `[21..28)` cleanly
+    const n_rest = ShmDraw.renderSlot(&slot, &pixels, w, h, 1, &quads, 1.0, tc_paused, &dmg);
+    try std.testing.expectEqual(@as(usize, 1), n_rest);
+    for (0..@intCast(h)) |py| {
+        for (0..7) |px| {
+            try std.testing.expectEqual(bg_argb, pixels[py * 28 + px]);
+        }
+        for (21..28) |px| {
+            try std.testing.expectEqual(bg_argb, pixels[py * 28 + px]);
+        }
+    }
 }

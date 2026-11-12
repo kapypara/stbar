@@ -6,12 +6,17 @@ const c = @import("c");
 /// `window.captionChanged` that pushes title changes directly to this process's unique
 /// session D-Bus connection (`sd-bus` fd multiplexed into the main `poll()` loop — zero polling).
 pub const KwinTitleWatcher = struct {
-    const plugin_name = "zigbar_title";
+    const legacy_plugin_name = "zigbar_title";
+    const lock_prefix = "zigbar-kwin-";
+    const lock_suffix = ".pid";
 
     bus: ?*c.sd_bus = null,
     slot: ?*c.sd_bus_slot = null,
     active: bool = false,
     changed: bool = false,
+    has_lock_file: bool = false,
+    plugin_name_buf: [48]u8 = @splat(0),
+    lock_path_buf: [256]u8 = @splat(0),
     title: [256]u8 = @splat(0),
     title_len: usize = 0,
 
@@ -34,13 +39,32 @@ pub const KwinTitleWatcher = struct {
             return false;
         }
 
-        // Clean up any leftover script instance from an unclean exit before loading fresh
-        self.unloadKwinScript();
-
-        var path_buf: [256]u8 = undefined;
         const runtime_dir_ptr = std.c.getenv("XDG_RUNTIME_DIR");
         const runtime_dir = if (runtime_dir_ptr) |p| std.mem.span(p) else "/tmp";
         const pid: i64 = @intCast(c.getpid());
+
+        // Per-PID plugin name prevents multi-monitor or second `zigbar` instances from unloading
+        // another live `zigbar` instance's KWin listener, while GC'ing any dead SIGKILL'd scripts.
+        _ = std.fmt.bufPrint(&self.plugin_name_buf, "zigbar_title_{d}\x00", .{pid}) catch {
+            self.deinit();
+            return false;
+        };
+        const plugin_name_z: [*:0]const u8 = @ptrCast(&self.plugin_name_buf);
+
+        _ = std.fmt.bufPrint(&self.lock_path_buf, "{s}/{s}{d}{s}\x00", .{
+            runtime_dir,
+            lock_prefix,
+            pid,
+            lock_suffix,
+        }) catch {
+            self.deinit();
+            return false;
+        };
+        const lock_path_z: [*:0]const u8 = @ptrCast(&self.lock_path_buf);
+
+        self.cleanupStaleScripts(runtime_dir, pid);
+
+        var path_buf: [256]u8 = undefined;
         const js_slice = std.fmt.bufPrint(&path_buf, "{s}/zigbar-kwin-{d}.js\x00", .{ runtime_dir, pid }) catch {
             self.deinit();
             return false;
@@ -86,6 +110,10 @@ pub const KwinTitleWatcher = struct {
         }
         defer _ = c.unlink(js_path);
 
+        if (writeTempFile(lock_path_z, "")) {
+            self.has_lock_file = true;
+        }
+
         var err: c.sd_bus_error = std.mem.zeroes(c.sd_bus_error);
         defer c.sd_bus_error_free(&err);
         var reply: ?*c.sd_bus_message = null;
@@ -103,7 +131,7 @@ pub const KwinTitleWatcher = struct {
             &reply,
             "ss",
             js_path,
-            plugin_name,
+            plugin_name_z,
         );
         if (load_rc < 0 or reply == null) {
             self.deinit();
@@ -112,14 +140,14 @@ pub const KwinTitleWatcher = struct {
 
         var script_id: i32 = -1;
         if (c.sd_bus_message_read_basic(reply, 'i', @ptrCast(&script_id)) < 0 or script_id < 0) {
-            self.unloadKwinScript();
+            self.unloadKwinScriptName(plugin_name_z);
             self.deinit();
             return false;
         }
 
         var obj_buf: [64]u8 = undefined;
         const obj_v6_slice = std.fmt.bufPrint(&obj_buf, "/Scripting/Script{d}\x00", .{script_id}) catch {
-            self.unloadKwinScript();
+            self.unloadKwinScriptName(plugin_name_z);
             self.deinit();
             return false;
         };
@@ -140,7 +168,7 @@ pub const KwinTitleWatcher = struct {
         if (run_rc < 0) {
             c.sd_bus_error_free(&run_err);
             const obj_v5_slice = std.fmt.bufPrint(&obj_buf, "/{d}\x00", .{script_id}) catch {
-                self.unloadKwinScript();
+                self.unloadKwinScriptName(plugin_name_z);
                 self.deinit();
                 return false;
             };
@@ -157,7 +185,7 @@ pub const KwinTitleWatcher = struct {
             );
         }
         if (run_rc < 0) {
-            self.unloadKwinScript();
+            self.unloadKwinScriptName(plugin_name_z);
             self.deinit();
             return false;
         }
@@ -169,8 +197,12 @@ pub const KwinTitleWatcher = struct {
 
     pub fn deinit(self: *KwinTitleWatcher) void {
         if (self.active) {
-            self.unloadKwinScript();
+            self.unloadKwinScriptName(@ptrCast(&self.plugin_name_buf));
             self.active = false;
+        }
+        if (self.has_lock_file) {
+            _ = c.unlink(@ptrCast(&self.lock_path_buf));
+            self.has_lock_file = false;
         }
         if (self.slot) |s| {
             _ = c.sd_bus_slot_unref(s);
@@ -182,7 +214,7 @@ pub const KwinTitleWatcher = struct {
         }
     }
 
-    fn unloadKwinScript(self: *KwinTitleWatcher) void {
+    fn unloadKwinScriptName(self: *KwinTitleWatcher, name: [*:0]const u8) void {
         const bus = self.bus orelse return;
         var err: c.sd_bus_error = std.mem.zeroes(c.sd_bus_error);
         defer c.sd_bus_error_free(&err);
@@ -195,8 +227,47 @@ pub const KwinTitleWatcher = struct {
             &err,
             null,
             "s",
-            plugin_name,
+            name,
         );
+    }
+
+    fn cleanupStaleScripts(self: *KwinTitleWatcher, runtime_dir: []const u8, self_pid: i64) void {
+        // Always unload legacy un-suffixed plugin name if left behind by older binaries
+        self.unloadKwinScriptName(legacy_plugin_name);
+        self.unloadKwinScriptName(@ptrCast(&self.plugin_name_buf));
+
+        var dir_z_buf: [256]u8 = undefined;
+        const dir_slice = std.fmt.bufPrint(&dir_z_buf, "{s}\x00", .{runtime_dir}) catch return;
+        const dir = c.opendir(@ptrCast(dir_slice.ptr)) orelse return;
+        defer _ = c.closedir(dir);
+
+        while (c.readdir(dir)) |entry| {
+            const name_ptr: [*:0]const u8 = @ptrCast(&entry.*.d_name);
+            const name = std.mem.span(name_ptr);
+            if (!std.mem.startsWith(u8, name, lock_prefix) or !std.mem.endsWith(u8, name, lock_suffix)) {
+                continue;
+            }
+            const pid_str = name[lock_prefix.len .. name.len - lock_suffix.len];
+            const old_pid = std.fmt.parseInt(i64, pid_str, 10) catch continue;
+            if (old_pid <= 0 or old_pid == self_pid) continue;
+
+            var proc_buf: [64]u8 = undefined;
+            const proc_slice = std.fmt.bufPrint(&proc_buf, "/proc/{d}\x00", .{old_pid}) catch continue;
+            if (c.access(@ptrCast(proc_slice.ptr), c.F_OK) == 0) {
+                // Live process — leave its KWin script untouched!
+                continue;
+            }
+
+            var stale_plugin_buf: [48]u8 = undefined;
+            if (std.fmt.bufPrint(&stale_plugin_buf, "zigbar_title_{d}\x00", .{old_pid})) |sp| {
+                self.unloadKwinScriptName(@ptrCast(sp.ptr));
+            } else |_| {}
+
+            var stale_lock_buf: [320]u8 = undefined;
+            if (std.fmt.bufPrint(&stale_lock_buf, "{s}/{s}\x00", .{ runtime_dir, name })) |sl| {
+                _ = c.unlink(@ptrCast(sl.ptr));
+            } else |_| {}
+        }
     }
 
     pub fn fd(self: *const KwinTitleWatcher) c_int {

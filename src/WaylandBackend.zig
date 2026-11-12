@@ -1,16 +1,20 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const c = @import("c");
-const ProcLoader = @import("GlProcs.zig").ProcLoader;
-const QuadVertex = @import("RectDraw.zig").RectDraw.QuadVertex;
+const types = @import("Types.zig");
+const QuadVertex = types.QuadVertex;
+const Click = types.Click;
+const BarPosition = types.BarPosition;
+const TitleClip = types.TitleClip;
+const ProcLoader = if (build_options.enable_gpu) @import("GlProcs.zig").ProcLoader else void;
 const shm_draw_zig = @import("ShmDraw.zig");
 const ShmDraw = shm_draw_zig.ShmDraw;
 const ShmSlotState = shm_draw_zig.SlotState;
 const DamageRect = shm_draw_zig.DamageRect;
 const max_damage_rects = shm_draw_zig.max_damage_rects;
-const Click = @import("X11Backend.zig").Click;
 const KwinTitleWatcher = @import("KwinTitleWatcher.zig").KwinTitleWatcher;
 
-const EGL_PLATFORM_WAYLAND_KHR: c.EGLenum = 0x31D8;
+const EGL_PLATFORM_WAYLAND_KHR = 0x31D8;
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
@@ -24,6 +28,22 @@ pub const WaylandBackend = struct {
     const max_toplevels = 64;
     const max_outputs = 16;
     const shm_slot_count = 3;
+
+    const EglState = if (build_options.enable_gpu) struct {
+        window: ?*c.struct_wl_egl_window = null,
+        display: c.EGLDisplay = c.EGL_NO_DISPLAY,
+        context: c.EGLContext = c.EGL_NO_CONTEXT,
+        surface: c.EGLSurface = c.EGL_NO_SURFACE,
+        config: c.EGLConfig = null,
+    } else struct {};
+
+    const AuxX11State = if (build_options.enable_x11) struct {
+        dpy: ?*c.Display = null,
+        root: c.Window = 0,
+        net_active_window_atom: c.Atom = 0,
+        net_wm_name_atom: c.Atom = 0,
+        wm_name_atom: c.Atom = 0,
+    } else struct {};
 
     pub const OutputSlot = struct {
         owner: ?*WaylandBackend = null,
@@ -57,6 +77,7 @@ pub const WaylandBackend = struct {
     };
 
     render_mode: WaylandRenderMode = .shm,
+    position: BarPosition = .top,
     compositor_version: u32 = 1,
 
     wl_display: ?*c.struct_wl_display = null,
@@ -67,7 +88,6 @@ pub const WaylandBackend = struct {
     wl_pointer: ?*c.struct_wl_pointer = null,
     wl_surface: ?*c.struct_wl_surface = null,
     frame_cb: ?*c.struct_wl_callback = null,
-    egl_window: ?*c.struct_wl_egl_window = null,
 
     // Native `wl_shm` triple-buffered shared memory pool (`memfd_create`)
     shm_pool: ?*c.struct_wl_shm_pool = null,
@@ -133,16 +153,8 @@ pub const WaylandBackend = struct {
     kwin_needs_pump: bool = true,
 
     // Optional event-driven Xwayland root property watcher when neither wlr-foreign-toplevel nor KWin D-Bus is active
-    aux_x11_dpy: ?*c.Display = null,
-    aux_x11_root: c.Window = 0,
-    net_active_window_atom: c.Atom = 0,
-    net_wm_name_atom: c.Atom = 0,
-    wm_name_atom: c.Atom = 0,
-
-    egl_display: c.EGLDisplay = c.EGL_NO_DISPLAY,
-    egl_context: c.EGLContext = c.EGL_NO_CONTEXT,
-    egl_surface: c.EGLSurface = c.EGL_NO_SURFACE,
-    egl_config: c.EGLConfig = null,
+    aux_x11: AuxX11State = .{},
+    egl: EglState = .{},
 
     requested_width: i32 = 0,
     width: i32 = 1920,
@@ -167,6 +179,9 @@ pub const WaylandBackend = struct {
     /// Note: `self` must reside at a stable address before calling `init` because Wayland
     /// listeners store `self` as their callback user-data pointer.
     pub fn init(self: *WaylandBackend, width: i32, height: i32) !void {
+        if (!comptime build_options.enable_gpu) {
+            if (self.render_mode == .egl) return error.GpuDisabledInBuild;
+        }
         self.requested_width = width;
         if (width > 0) self.width = width;
         self.height = height;
@@ -193,7 +208,13 @@ pub const WaylandBackend = struct {
                     try self.recreateShmBuffers();
                     self.clearTransparent();
                 },
-                .egl => try self.createEglContext(),
+                .egl => {
+                    if (comptime build_options.enable_gpu) {
+                        try self.createEglContext();
+                    } else {
+                        return error.GpuDisabledInBuild;
+                    }
+                },
             }
         } else {
             self.surface_lost = true;
@@ -208,15 +229,17 @@ pub const WaylandBackend = struct {
                     _ = c.write(2, msg.ptr, msg.len);
                 } else |_| {}
             }
-            if (self.render_mode == .egl) {
-                try self.createEglContext();
+            if (comptime build_options.enable_gpu) {
+                if (self.render_mode == .egl) {
+                    try self.createEglContext();
+                }
             }
         }
 
         if (!self.has_foreign_toplevel) {
             if (self.kwin_watcher.init()) {
                 self.title_dirty = true;
-            } else {
+            } else if (comptime build_options.enable_x11) {
                 self.initAuxX11Watcher();
             }
         }
@@ -326,9 +349,10 @@ pub const WaylandBackend = struct {
     }
 
     fn syncEglWindow(self: *WaylandBackend) void {
+        if (!comptime build_options.enable_gpu) return;
         if (self.render_mode != .egl) return;
         self.stageSurfaceScale();
-        if (self.egl_window) |win| {
+        if (self.egl.window) |win| {
             const buf = self.bufferSize();
             c.wl_egl_window_resize(win, buf.w, buf.h, 0, 0);
         }
@@ -354,9 +378,11 @@ pub const WaylandBackend = struct {
 
     pub fn deinit(self: *WaylandBackend) void {
         self.kwin_watcher.deinit();
-        if (self.aux_x11_dpy) |x_dpy| {
-            _ = c.XCloseDisplay(x_dpy);
-            self.aux_x11_dpy = null;
+        if (comptime build_options.enable_x11) {
+            if (self.aux_x11.dpy) |x_dpy| {
+                _ = c.XCloseDisplay(x_dpy);
+                self.aux_x11.dpy = null;
+            }
         }
 
         if (self.frame_cb) |cb| {
@@ -365,23 +391,25 @@ pub const WaylandBackend = struct {
         }
         self.destroyShmBuffers();
 
-        if (self.egl_display != c.EGL_NO_DISPLAY) {
-            _ = c.eglMakeCurrent(self.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT);
-            if (self.egl_surface != c.EGL_NO_SURFACE) {
-                _ = c.eglDestroySurface(self.egl_display, self.egl_surface);
-                self.egl_surface = c.EGL_NO_SURFACE;
+        if (comptime build_options.enable_gpu) {
+            if (self.egl.display != c.EGL_NO_DISPLAY) {
+                _ = c.eglMakeCurrent(self.egl.display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, c.EGL_NO_CONTEXT);
+                if (self.egl.surface != c.EGL_NO_SURFACE) {
+                    _ = c.eglDestroySurface(self.egl.display, self.egl.surface);
+                    self.egl.surface = c.EGL_NO_SURFACE;
+                }
+                if (self.egl.context != c.EGL_NO_CONTEXT) {
+                    _ = c.eglDestroyContext(self.egl.display, self.egl.context);
+                    self.egl.context = c.EGL_NO_CONTEXT;
+                }
+                _ = c.eglTerminate(self.egl.display);
+                self.egl.display = c.EGL_NO_DISPLAY;
             }
-            if (self.egl_context != c.EGL_NO_CONTEXT) {
-                _ = c.eglDestroyContext(self.egl_display, self.egl_context);
-                self.egl_context = c.EGL_NO_CONTEXT;
-            }
-            _ = c.eglTerminate(self.egl_display);
-            self.egl_display = c.EGL_NO_DISPLAY;
-        }
 
-        if (self.egl_window) |win| {
-            c.wl_egl_window_destroy(win);
-            self.egl_window = null;
+            if (self.egl.window) |win| {
+                c.wl_egl_window_destroy(win);
+                self.egl.window = null;
+            }
         }
 
         for (&self.toplevels) |*slot| {
@@ -456,11 +484,16 @@ pub const WaylandBackend = struct {
     }
 
     pub fn getProcLoader(_: *const WaylandBackend) ProcLoader {
-        return eglLoadProc;
+        if (comptime build_options.enable_gpu) {
+            return eglLoadProc;
+        }
     }
 
     fn eglLoadProc(name: [*:0]const u8) callconv(.c) ?*const anyopaque {
-        return @ptrCast(c.eglGetProcAddress(name));
+        if (comptime build_options.enable_gpu) {
+            return @ptrCast(c.eglGetProcAddress(name));
+        }
+        return null;
     }
 
     pub fn waylandTitle(self: *const WaylandBackend) ?[]const u8 {
@@ -478,15 +511,17 @@ pub const WaylandBackend = struct {
             c.wl_callback_destroy(cb);
             self.frame_cb = null;
         }
-        if (self.render_mode == .egl and self.egl_display != c.EGL_NO_DISPLAY) {
-            _ = c.eglMakeCurrent(self.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, self.egl_context);
-            if (self.egl_surface != c.EGL_NO_SURFACE) {
-                _ = c.eglDestroySurface(self.egl_display, self.egl_surface);
-                self.egl_surface = c.EGL_NO_SURFACE;
-            }
-            if (self.egl_window) |win| {
-                c.wl_egl_window_destroy(win);
-                self.egl_window = null;
+        if (comptime build_options.enable_gpu) {
+            if (self.render_mode == .egl and self.egl.display != c.EGL_NO_DISPLAY) {
+                _ = c.eglMakeCurrent(self.egl.display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, self.egl.context);
+                if (self.egl.surface != c.EGL_NO_SURFACE) {
+                    _ = c.eglDestroySurface(self.egl.display, self.egl.surface);
+                    self.egl.surface = c.EGL_NO_SURFACE;
+                }
+                if (self.egl.window) |win| {
+                    c.wl_egl_window_destroy(win);
+                    self.egl.window = null;
+                }
             }
         }
         for (&self.shm_slots) |*slot| {
@@ -547,11 +582,15 @@ pub const WaylandBackend = struct {
                 }
             },
             .egl => {
-                self.createEglSurface() catch {
-                    self.teardownLayerSurface();
-                    self.pending_surface_rebind = false;
+                if (comptime build_options.enable_gpu) {
+                    self.createEglSurface() catch {
+                        self.teardownLayerSurface();
+                        self.pending_surface_rebind = false;
+                        return;
+                    };
+                } else {
                     return;
-                };
+                }
             },
         }
 
@@ -603,10 +642,14 @@ pub const WaylandBackend = struct {
         _ = c.zwlr_layer_surface_v1_add_listener(self.layer_surface, &layer_surface_listener, self);
 
         const req_w: u32 = if (self.requested_width > 0) @intCast(self.requested_width) else 0;
+        const edge_anchor: u32 = switch (self.position) {
+            .top => c.ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP,
+            .bottom => c.ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM,
+        };
         const anchor: u32 = if (self.requested_width > 0)
-            c.ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | c.ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT
+            edge_anchor | c.ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT
         else
-            c.ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | c.ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | c.ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
+            edge_anchor | c.ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | c.ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
 
         c.zwlr_layer_surface_v1_set_size(self.layer_surface, req_w, @intCast(self.height));
         c.zwlr_layer_surface_v1_set_anchor(self.layer_surface, anchor);
@@ -636,17 +679,18 @@ pub const WaylandBackend = struct {
     }
 
     fn createEglContext(self: *WaylandBackend) !void {
+        if (!comptime build_options.enable_gpu) return error.GpuDisabledInBuild;
         const dpy = self.wl_display.?;
 
-        self.egl_display = c.eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, @ptrCast(dpy), null);
-        if (self.egl_display == c.EGL_NO_DISPLAY) {
-            self.egl_display = c.eglGetDisplay(@ptrCast(dpy));
+        self.egl.display = c.eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, @ptrCast(dpy), null);
+        if (self.egl.display == c.EGL_NO_DISPLAY) {
+            self.egl.display = c.eglGetDisplay(@ptrCast(dpy));
         }
-        if (self.egl_display == c.EGL_NO_DISPLAY) return error.EglGetDisplayFailed;
+        if (self.egl.display == c.EGL_NO_DISPLAY) return error.EglGetDisplayFailed;
 
         var major: c.EGLint = 0;
         var minor: c.EGLint = 0;
-        if (c.eglInitialize(self.egl_display, &major, &minor) != c.EGL_TRUE) {
+        if (c.eglInitialize(self.egl.display, &major, &minor) != c.EGL_TRUE) {
             return error.EglInitializeFailed;
         }
         if (c.eglBindAPI(c.EGL_OPENGL_API) != c.EGL_TRUE) {
@@ -664,7 +708,7 @@ pub const WaylandBackend = struct {
             c.EGL_NONE,
         };
         var num_configs: c.EGLint = 0;
-        if (c.eglChooseConfig(self.egl_display, &cfg_attribs, &self.egl_config, 1, &num_configs) != c.EGL_TRUE or num_configs == 0) {
+        if (c.eglChooseConfig(self.egl.display, &cfg_attribs, &self.egl.config, 1, &num_configs) != c.EGL_TRUE or num_configs == 0) {
             return error.EglChooseConfigFailed;
         }
 
@@ -674,18 +718,18 @@ pub const WaylandBackend = struct {
             c.EGL_CONTEXT_OPENGL_PROFILE_MASK, c.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
             c.EGL_NONE,
         };
-        self.egl_context = c.eglCreateContext(self.egl_display, self.egl_config, c.EGL_NO_CONTEXT, &ctx_attribs);
-        if (self.egl_context == c.EGL_NO_CONTEXT) {
+        self.egl.context = c.eglCreateContext(self.egl.display, self.egl.config, c.EGL_NO_CONTEXT, &ctx_attribs);
+        if (self.egl.context == c.EGL_NO_CONTEXT) {
             const fallback_attribs = [_]c.EGLint{c.EGL_NONE};
-            self.egl_context = c.eglCreateContext(self.egl_display, self.egl_config, c.EGL_NO_CONTEXT, &fallback_attribs);
+            self.egl.context = c.eglCreateContext(self.egl.display, self.egl.config, c.EGL_NO_CONTEXT, &fallback_attribs);
         }
-        if (self.egl_context == c.EGL_NO_CONTEXT) return error.EglCreateContextFailed;
+        if (self.egl.context == c.EGL_NO_CONTEXT) return error.EglCreateContextFailed;
 
         if (self.wl_surface != null) {
             try self.createEglSurface();
         } else {
             // Surfaceless context allows shader/VBO initialization while waiting for target output hotplug
-            if (c.eglMakeCurrent(self.egl_display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, self.egl_context) != c.EGL_TRUE) {
+            if (c.eglMakeCurrent(self.egl.display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, self.egl.context) != c.EGL_TRUE) {
                 return error.EglMakeCurrentFailed;
             }
             c.glClearColor(0.0, 0.0, 0.0, 0.0);
@@ -693,36 +737,37 @@ pub const WaylandBackend = struct {
     }
 
     fn createEglSurface(self: *WaylandBackend) !void {
+        if (!comptime build_options.enable_gpu) return error.GpuDisabledInBuild;
         self.stageSurfaceScale();
         const buf = self.bufferSize();
-        self.egl_window = c.wl_egl_window_create(
+        self.egl.window = c.wl_egl_window_create(
             self.wl_surface,
             buf.w,
             buf.h,
         ) orelse return error.WlEglWindowCreateFailed;
 
-        self.egl_surface = c.eglCreatePlatformWindowSurface(
-            self.egl_display,
-            self.egl_config,
-            @ptrCast(self.egl_window),
+        self.egl.surface = c.eglCreatePlatformWindowSurface(
+            self.egl.display,
+            self.egl.config,
+            @ptrCast(self.egl.window),
             null,
         );
-        if (self.egl_surface == c.EGL_NO_SURFACE) {
-            self.egl_surface = c.eglCreateWindowSurface(
-                self.egl_display,
-                self.egl_config,
-                self.egl_window,
+        if (self.egl.surface == c.EGL_NO_SURFACE) {
+            self.egl.surface = c.eglCreateWindowSurface(
+                self.egl.display,
+                self.egl.config,
+                self.egl.window,
                 null,
             );
         }
-        if (self.egl_surface == c.EGL_NO_SURFACE) return error.EglCreateSurfaceFailed;
+        if (self.egl.surface == c.EGL_NO_SURFACE) return error.EglCreateSurfaceFailed;
 
-        if (c.eglMakeCurrent(self.egl_display, self.egl_surface, self.egl_surface, self.egl_context) != c.EGL_TRUE) {
+        if (c.eglMakeCurrent(self.egl.display, self.egl.surface, self.egl.surface, self.egl.context) != c.EGL_TRUE) {
             return error.EglMakeCurrentFailed;
         }
 
         // Hardware VSync pacing (interval = 1)
-        _ = c.eglSwapInterval(self.egl_display, 1);
+        _ = c.eglSwapInterval(self.egl.display, 1);
 
         c.glClearColor(0.0, 0.0, 0.0, 0.0);
         self.updateViewport();
@@ -730,14 +775,15 @@ pub const WaylandBackend = struct {
     }
 
     fn initAuxX11Watcher(self: *WaylandBackend) void {
+        if (!comptime build_options.enable_x11) return;
         const dpy = c.XOpenDisplay(null) orelse return;
-        self.aux_x11_dpy = dpy;
+        self.aux_x11.dpy = dpy;
         const screen = c.DefaultScreen(dpy);
-        self.aux_x11_root = c.RootWindow(dpy, screen);
-        self.net_active_window_atom = c.XInternAtom(dpy, "_NET_ACTIVE_WINDOW", c.False);
-        self.net_wm_name_atom = c.XInternAtom(dpy, "_NET_WM_NAME", c.False);
-        self.wm_name_atom = c.XInternAtom(dpy, "WM_NAME", c.False);
-        _ = c.XSelectInput(dpy, self.aux_x11_root, c.PropertyChangeMask);
+        self.aux_x11.root = c.RootWindow(dpy, screen);
+        self.aux_x11.net_active_window_atom = c.XInternAtom(dpy, "_NET_ACTIVE_WINDOW", c.False);
+        self.aux_x11.net_wm_name_atom = c.XInternAtom(dpy, "_NET_WM_NAME", c.False);
+        self.aux_x11.wm_name_atom = c.XInternAtom(dpy, "WM_NAME", c.False);
+        _ = c.XSelectInput(dpy, self.aux_x11.root, c.PropertyChangeMask);
         _ = c.XFlush(dpy);
     }
 
@@ -775,7 +821,8 @@ pub const WaylandBackend = struct {
 
         if (target <= 1) {
             if (c.wl_compositor_create_region(comp)) |region| {
-                c.wl_region_add(region, 0, 0, @max(1, self.width), 1);
+                const hover_y: i32 = if (self.position == .bottom) @max(0, self.height - 1) else 0;
+                c.wl_region_add(region, 0, hover_y, @max(1, self.width), 1);
                 c.wl_surface_set_input_region(surf, region);
                 c.wl_region_destroy(region);
             }
@@ -904,6 +951,7 @@ pub const WaylandBackend = struct {
         bg_count: usize,
         quads: []const QuadVertex,
         opacity: f32,
+        title_clip: ?TitleClip,
         request_frame_sync: bool,
     ) !void {
         const surf = self.wl_surface orelse return;
@@ -926,6 +974,7 @@ pub const WaylandBackend = struct {
             bg_count,
             quads,
             opacity,
+            title_clip,
             &dmg,
         );
 
@@ -975,9 +1024,11 @@ pub const WaylandBackend = struct {
     pub fn clearTransparent(self: *WaylandBackend) void {
         switch (self.render_mode) {
             .egl => {
-                if (self.egl_surface != c.EGL_NO_SURFACE) {
-                    c.glClear(c.GL_COLOR_BUFFER_BIT);
-                    self.swapBuffers();
+                if (comptime build_options.enable_gpu) {
+                    if (self.egl.surface != c.EGL_NO_SURFACE) {
+                        c.glClear(c.GL_COLOR_BUFFER_BIT);
+                        self.swapBuffers();
+                    }
                 }
             },
             .shm => {
@@ -1011,15 +1062,19 @@ pub const WaylandBackend = struct {
     }
 
     pub fn updateViewport(self: *const WaylandBackend) void {
-        if (self.render_mode == .egl) {
-            const buf = self.bufferSize();
-            c.glViewport(0, 0, buf.w, buf.h);
+        if (comptime build_options.enable_gpu) {
+            if (self.render_mode == .egl) {
+                const buf = self.bufferSize();
+                c.glViewport(0, 0, buf.w, buf.h);
+            }
         }
     }
 
     pub fn swapBuffers(self: *const WaylandBackend) void {
-        if (self.render_mode == .egl and self.egl_display != c.EGL_NO_DISPLAY and self.egl_surface != c.EGL_NO_SURFACE) {
-            _ = c.eglSwapBuffers(self.egl_display, self.egl_surface);
+        if (comptime build_options.enable_gpu) {
+            if (self.render_mode == .egl and self.egl.display != c.EGL_NO_DISPLAY and self.egl.surface != c.EGL_NO_SURFACE) {
+                _ = c.eglSwapBuffers(self.egl.display, self.egl.surface);
+            }
         }
     }
 
@@ -1079,18 +1134,20 @@ pub const WaylandBackend = struct {
             }
         }
 
-        if (self.aux_x11_dpy) |x_dpy| {
-            var event: c.XEvent = undefined;
-            var pending = c.XEventsQueued(x_dpy, c.QueuedAfterReading);
-            while (pending > 0) : (pending = c.XEventsQueued(x_dpy, c.QueuedAlready)) {
-                _ = c.XNextEvent(x_dpy, &event);
-                if (event.type == c.PropertyNotify) {
-                    const atom = event.xproperty.atom;
-                    if (atom == self.net_active_window_atom or
-                        atom == self.net_wm_name_atom or
-                        atom == self.wm_name_atom)
-                    {
-                        self.title_dirty = true;
+        if (comptime build_options.enable_x11) {
+            if (self.aux_x11.dpy) |x_dpy| {
+                var event: c.XEvent = undefined;
+                var pending = c.XEventsQueued(x_dpy, c.QueuedAfterReading);
+                while (pending > 0) : (pending = c.XEventsQueued(x_dpy, c.QueuedAlready)) {
+                    _ = c.XNextEvent(x_dpy, &event);
+                    if (event.type == c.PropertyNotify) {
+                        const atom = event.xproperty.atom;
+                        if (atom == self.aux_x11.net_active_window_atom or
+                            atom == self.aux_x11.net_wm_name_atom or
+                            atom == self.aux_x11.wm_name_atom)
+                        {
+                            self.title_dirty = true;
+                        }
                     }
                 }
             }
@@ -1102,7 +1159,9 @@ pub const WaylandBackend = struct {
         const wl_dpy = self.wl_display orelse return;
         if (timeout_ms == 0) {
             _ = c.wl_display_flush(wl_dpy);
-            if (self.aux_x11_dpy) |x_dpy| _ = c.XFlush(x_dpy);
+            if (comptime build_options.enable_x11) {
+                if (self.aux_x11.dpy) |x_dpy| _ = c.XFlush(x_dpy);
+            }
             return;
         }
         if (self.surface_lost and self.pending_surface_rebind and self.hasMatchingOutput()) {
@@ -1117,8 +1176,10 @@ pub const WaylandBackend = struct {
             }
         }
 
-        if (self.aux_x11_dpy) |x_dpy| {
-            if (c.XPending(x_dpy) > 0) return;
+        if (comptime build_options.enable_x11) {
+            if (self.aux_x11.dpy) |x_dpy| {
+                if (c.XPending(x_dpy) > 0) return;
+            }
         }
 
         while (c.wl_display_prepare_read(wl_dpy) != 0) {
@@ -1147,13 +1208,15 @@ pub const WaylandBackend = struct {
             };
             nfds += 1;
         }
-        if (self.aux_x11_dpy) |x_dpy| {
-            pfds[nfds] = .{
-                .fd = c.ConnectionNumber(x_dpy),
-                .events = c.POLLIN,
-                .revents = 0,
-            };
-            nfds += 1;
+        if (comptime build_options.enable_x11) {
+            if (self.aux_x11.dpy) |x_dpy| {
+                pfds[nfds] = .{
+                    .fd = c.ConnectionNumber(x_dpy),
+                    .events = c.POLLIN,
+                    .revents = 0,
+                };
+                nfds += 1;
+            }
         }
         var wake_idx: ?usize = null;
         if (self.wakeup_fd >= 0) {
@@ -1509,14 +1572,13 @@ pub const WaylandBackend = struct {
         const resolved_w: i32 = if (new_w > 0) @intCast(new_w) else self.width;
         const resolved_h: i32 = if (new_h > 0) @intCast(new_h) else self.height;
         const size_changed = (resolved_w != self.width or resolved_h != self.height);
-        const width_changed = (resolved_w != self.width);
 
         self.width = resolved_w;
         self.height = resolved_h;
 
         if (size_changed) {
             self.syncEglWindow();
-            if (width_changed and self.applied_input_height == 1) {
+            if (self.applied_input_height == 1) {
                 self.stageInputRegion(1);
             }
             if (self.configured) {

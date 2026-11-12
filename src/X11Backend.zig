@@ -1,7 +1,12 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const c = @import("c");
-const ProcLoader = @import("GlProcs.zig").ProcLoader;
-const QuadVertex = @import("RectDraw.zig").RectDraw.QuadVertex;
+const types = @import("Types.zig");
+const QuadVertex = types.QuadVertex;
+const BarPosition = types.BarPosition;
+const TitleClip = types.TitleClip;
+pub const Click = types.Click;
+const ProcLoader = if (build_options.enable_gpu) @import("GlProcs.zig").ProcLoader else void;
 const shm_draw_zig = @import("ShmDraw.zig");
 const ShmDraw = shm_draw_zig.ShmDraw;
 const ShmSlotState = shm_draw_zig.SlotState;
@@ -22,26 +27,25 @@ pub const X11RenderMode = enum {
     glx,
 };
 
-pub const Click = struct {
-    x: i32 = 0,
-    y: i32 = 0,
-    button: u32 = 0,
-};
-
 pub const X11Backend = struct {
+    const GlxState = if (build_options.enable_gpu) struct {
+        handle: c.GLXWindow = 0,
+        render_context: c.GLXContext = null,
+        fbconfig: c.GLXFBConfig = null,
+    } else struct {};
+
     render_mode: X11RenderMode = .shm,
+    position: BarPosition = .top,
 
     display: ?*c.Display = null,
     x_screen: i32 = 0,
     root: c.Window = 0,
     handle: c.Window = 0,
-    glx_handle: c.GLXWindow = 0,
-    render_context: c.GLXContext = null,
+    glx: GlxState = .{},
 
     visual: ?*c.XVisualInfo = null,
     chosen_visual: ?*c.Visual = null,
     chosen_depth: u32 = 32,
-    fbconfig: c.GLXFBConfig = null,
     cmap: c.Colormap = 0,
     gc: c.GC = null,
 
@@ -91,6 +95,9 @@ pub const X11Backend = struct {
     last_click: Click = .{},
 
     pub fn init(self: *X11Backend, x: i32, y: i32, width: i32, height: i32) !void {
+        if (!comptime build_options.enable_gpu) {
+            if (self.render_mode == .glx) return error.GpuDisabledInBuild;
+        }
         self.x = x;
         self.y = y;
         self.width = width;
@@ -113,7 +120,13 @@ pub const X11Backend = struct {
                 try self.recreateShmImage();
                 self.clearTransparent();
             },
-            .glx => try self.createTheRenderContext(),
+            .glx => {
+                if (comptime build_options.enable_gpu) {
+                    try self.createTheRenderContext();
+                } else {
+                    return error.GpuDisabledInBuild;
+                }
+            },
         }
     }
 
@@ -124,10 +137,12 @@ pub const X11Backend = struct {
                 _ = c.XFreeGC(dpy, self.gc);
                 self.gc = null;
             }
-            if (self.render_mode == .glx) {
-                _ = c.glXMakeCurrent(dpy, 0, null);
-                if (self.render_context != null) c.glXDestroyContext(dpy, self.render_context);
-                if (USE_GLX_CREATE_WINDOW == 1 and self.glx_handle != 0) c.glXDestroyWindow(dpy, self.glx_handle);
+            if (comptime build_options.enable_gpu) {
+                if (self.render_mode == .glx) {
+                    _ = c.glXMakeCurrent(dpy, 0, null);
+                    if (self.glx.render_context != null) c.glXDestroyContext(dpy, self.glx.render_context);
+                    if (USE_GLX_CREATE_WINDOW == 1 and self.glx.handle != 0) c.glXDestroyWindow(dpy, self.glx.handle);
+                }
             }
             if (self.handle != 0) _ = c.XDestroyWindow(dpy, self.handle);
             if (self.cmap != 0) _ = c.XFreeColormap(dpy, self.cmap);
@@ -138,11 +153,16 @@ pub const X11Backend = struct {
     }
 
     pub fn getProcLoader(_: *const X11Backend) ProcLoader {
-        return glxLoadProc;
+        if (comptime build_options.enable_gpu) {
+            return glxLoadProc;
+        }
     }
 
     fn glxLoadProc(name: [*:0]const u8) callconv(.c) ?*const anyopaque {
-        return @ptrCast(c.glXGetProcAddressARB(@ptrCast(name)));
+        if (comptime build_options.enable_gpu) {
+            return @ptrCast(c.glXGetProcAddressARB(@ptrCast(name)));
+        }
+        return null;
     }
 
     fn selectArgbVisualShm(self: *X11Backend, dpy: *c.Display) !void {
@@ -184,6 +204,7 @@ pub const X11Backend = struct {
     }
 
     fn selectArgbVisualGlx(self: *X11Backend, dpy: *c.Display) !void {
+        if (!comptime build_options.enable_gpu) return error.GpuDisabledInBuild;
         const vis_attribs = [_]i32{
             c.GLX_RENDER_TYPE,   c.GLX_RGBA_BIT,
             c.GLX_DRAWABLE_TYPE, c.GLX_WINDOW_BIT,
@@ -209,7 +230,7 @@ pub const X11Backend = struct {
 
             const pf = c.XRenderFindVisualFormat(dpy, vis.*.visual);
             if (pf != null and pf.*.direct.alphaMask > 0) {
-                self.fbconfig = fbconfigs[i];
+                self.glx.fbconfig = fbconfigs[i];
                 self.visual = c.glXGetVisualFromFBConfig(dpy, fbconfigs[i]);
                 found = true;
                 break;
@@ -228,6 +249,9 @@ pub const X11Backend = struct {
         self.root = c.RootWindow(dpy, self.x_screen);
         if (self.width <= 0) {
             self.width = c.DisplayWidth(dpy, self.x_screen);
+        }
+        if (self.position == .bottom and self.y == 0) {
+            self.y = @max(0, c.DisplayHeight(dpy, self.x_screen) - self.height);
         }
 
         switch (self.render_mode) {
@@ -261,14 +285,16 @@ pub const X11Backend = struct {
         );
         if (self.handle == 0) return error.CreateWindowFailed;
 
-        if (self.render_mode == .glx) {
-            if (USE_GLX_CREATE_WINDOW == 0) {
-                self.glx_handle = self.handle;
-            } else {
-                const glx_attr = [_]i32{c.None};
-                self.glx_handle = c.glXCreateWindow(dpy, self.fbconfig, self.handle, &glx_attr);
+        if (comptime build_options.enable_gpu) {
+            if (self.render_mode == .glx) {
+                if (USE_GLX_CREATE_WINDOW == 0) {
+                    self.glx.handle = self.handle;
+                } else {
+                    const glx_attr = [_]i32{c.None};
+                    self.glx.handle = c.glXCreateWindow(dpy, self.glx.fbconfig, self.handle, &glx_attr);
+                }
+                if (self.glx.handle == 0) return error.GlxCreateWindowFailed;
             }
-            if (self.glx_handle == 0) return error.GlxCreateWindowFailed;
         }
 
         var hints = std.mem.zeroes(c.XSizeHints);
@@ -333,7 +359,9 @@ pub const X11Backend = struct {
         var win_y: c_int = 0;
         var mask_ret: c_uint = 0;
         if (c.XQueryPointer(dpy, self.handle, &root_ret, &child_ret, &root_x, &root_y, &win_x, &win_y, &mask_ret) != 0) {
-            self.pointer_inside = (win_x >= 0 and win_x < self.width and win_y >= 0 and win_y < self.input_height);
+            const min_y: c_int = if (self.input_height <= 1 and self.position == .bottom) @max(0, self.height - 1) else 0;
+            const max_y: c_int = min_y + self.input_height;
+            self.pointer_inside = (win_x >= 0 and win_x < self.width and win_y >= min_y and win_y < max_y);
         }
     }
 
@@ -349,9 +377,19 @@ pub const X11Backend = struct {
 
         var strut = std.mem.zeroes([12]c.u_long);
         if (enabled) {
-            strut[2] = @intCast(@max(0, self.y + self.height));
-            strut[8] = @intCast(@max(0, self.x));
-            strut[9] = @intCast(@max(0, self.x + self.width - 1));
+            switch (self.position) {
+                .top => {
+                    strut[2] = @intCast(@max(0, self.y + self.height));
+                    strut[8] = @intCast(@max(0, self.x));
+                    strut[9] = @intCast(@max(0, self.x + self.width - 1));
+                },
+                .bottom => {
+                    const screen_h = c.DisplayHeight(dpy, self.x_screen);
+                    strut[3] = @intCast(@max(0, screen_h - self.y));
+                    strut[10] = @intCast(@max(0, self.x));
+                    strut[11] = @intCast(@max(0, self.x + self.width - 1));
+                },
+            }
 
             _ = c.XChangeProperty(dpy, self.handle, self.wm_strut_atom, c.XA_CARDINAL, 32, c.PropModeReplace, @ptrCast(&strut), 4);
             _ = c.XChangeProperty(dpy, self.handle, self.wm_strut_partial_atom, c.XA_CARDINAL, 32, c.PropModeReplace, @ptrCast(&strut), 12);
@@ -376,9 +414,10 @@ pub const X11Backend = struct {
         self.input_height = target;
 
         if (target <= 1) {
+            const hover_y: i16 = if (self.position == .bottom) @intCast(@max(0, self.height - 1)) else 0;
             var rect = c.XRectangle{
                 .x = 0,
-                .y = 0,
+                .y = hover_y,
                 .width = @intCast(@max(1, self.width)),
                 .height = 1,
             };
@@ -390,6 +429,7 @@ pub const X11Backend = struct {
     }
 
     fn createTheRenderContext(self: *X11Backend) !void {
+        if (!comptime build_options.enable_gpu) return error.GpuDisabledInBuild;
         const dpy = self.display orelse return error.NoDisplay;
 
         const CreateCtxAttribsFn = *const fn (?*c.Display, c.GLXFBConfig, c.GLXContext, c_int, [*c]const c_int) callconv(.c) c.GLXContext;
@@ -401,14 +441,14 @@ pub const X11Backend = struct {
                 c.GLX_CONTEXT_PROFILE_MASK_ARB,  c.GLX_CONTEXT_CORE_PROFILE_BIT_ARB,
                 c.None,
             };
-            self.render_context = createAttribs(dpy, self.fbconfig, null, c.True, &ctx_attribs);
+            self.glx.render_context = createAttribs(dpy, self.glx.fbconfig, null, c.True, &ctx_attribs);
         }
-        if (self.render_context == null) {
-            self.render_context = c.glXCreateNewContext(dpy, self.fbconfig, c.GLX_RGBA_TYPE, null, c.True);
+        if (self.glx.render_context == null) {
+            self.glx.render_context = c.glXCreateNewContext(dpy, self.glx.fbconfig, c.GLX_RGBA_TYPE, null, c.True);
         }
-        if (self.render_context == null) return error.ContextCreationFailed;
+        if (self.glx.render_context == null) return error.ContextCreationFailed;
 
-        if (c.glXMakeContextCurrent(dpy, self.glx_handle, self.glx_handle, self.render_context) == 0) {
+        if (c.glXMakeContextCurrent(dpy, self.glx.handle, self.glx.handle, self.glx.render_context) == 0) {
             return error.MakeContextCurrentFailed;
         }
 
@@ -416,7 +456,7 @@ pub const X11Backend = struct {
         const SwapMesaFn = *const fn (c_uint) callconv(.c) c_int;
         if (c.glXGetProcAddressARB("glXSwapIntervalEXT")) |ptr| {
             const setSwapExt: SwapExtFn = @ptrCast(ptr);
-            setSwapExt(dpy, self.glx_handle, 1);
+            setSwapExt(dpy, self.glx.handle, 1);
         } else if (c.glXGetProcAddressARB("glXSwapIntervalMESA")) |ptr| {
             const setSwapMesa: SwapMesaFn = @ptrCast(ptr);
             _ = setSwapMesa(1);
@@ -600,6 +640,7 @@ pub const X11Backend = struct {
         bg_count: usize,
         quads: []const QuadVertex,
         opacity: f32,
+        title_clip: ?TitleClip,
         _: bool,
     ) !void {
         const dpy = self.display orelse return;
@@ -618,6 +659,7 @@ pub const X11Backend = struct {
             bg_count,
             quads,
             opacity,
+            title_clip,
             &dmg,
         );
 
@@ -644,8 +686,10 @@ pub const X11Backend = struct {
     pub fn clearTransparent(self: *X11Backend) void {
         switch (self.render_mode) {
             .glx => {
-                c.glClear(c.GL_COLOR_BUFFER_BIT);
-                self.swapBuffers();
+                if (comptime build_options.enable_gpu) {
+                    c.glClear(c.GL_COLOR_BUFFER_BIT);
+                    self.swapBuffers();
+                }
             },
             .shm => {
                 const dpy = self.display orelse return;
@@ -679,14 +723,11 @@ pub const X11Backend = struct {
                 },
                 c.ConfigureNotify => {
                     if (event.xconfigure.width != self.width or event.xconfigure.height != self.height) {
-                        const width_changed = event.xconfigure.width != self.width;
                         self.width = event.xconfigure.width;
                         self.height = event.xconfigure.height;
                         self.resized = true;
-                        if (width_changed) {
-                            if (self.input_height == 1) self.applyInputHeight(1);
-                            if (self.strut_enabled) self.applyStrut(true);
-                        }
+                        if (self.input_height == 1) self.applyInputHeight(1);
+                        if (self.strut_enabled) self.applyStrut(true);
                     }
                 },
                 c.Expose => {
@@ -770,14 +811,18 @@ pub const X11Backend = struct {
     }
 
     pub fn updateViewport(self: *const X11Backend) void {
-        if (self.render_mode == .glx) {
-            c.glViewport(0, 0, self.width, self.height);
+        if (comptime build_options.enable_gpu) {
+            if (self.render_mode == .glx) {
+                c.glViewport(0, 0, self.width, self.height);
+            }
         }
     }
 
     pub fn swapBuffers(self: *const X11Backend) void {
-        if (self.render_mode == .glx) {
-            c.glXSwapBuffers(self.display, self.glx_handle);
+        if (comptime build_options.enable_gpu) {
+            if (self.render_mode == .glx) {
+                c.glXSwapBuffers(self.display, self.glx.handle);
+            }
         }
     }
 

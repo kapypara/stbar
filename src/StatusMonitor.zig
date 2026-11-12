@@ -1,8 +1,18 @@
 const std = @import("std");
+const build_options = @import("build_options");
+
+const types = @import("Types.zig");
+const QuadVertex = types.QuadVertex;
+const uv_solid = types.uv_solid;
+const uv_empty = types.uv_empty;
+pub const MarqueeMode = types.MarqueeMode;
+const TitleClip = types.TitleClip;
 
 const font_zig = @import("FontAtlas.zig");
 const FontAtlas = font_zig.FontAtlas;
-const RectDraw = @import("RectDraw.zig").RectDraw;
+const RectDraw = if (build_options.enable_gpu) @import("RectDraw.zig").RectDraw else struct {
+    pub fn deinit(_: *@This()) void {}
+};
 const ShmDraw = @import("ShmDraw.zig");
 const actions_zig = @import("Actions.zig");
 const PowerFlow = @import("formats.zig").PowerFlow;
@@ -49,11 +59,13 @@ pub const StatusMonitor = struct {
         battery_and_watts,
     };
 
-    const hover_reveal_ns: i96 = 1 * std.time.ns_per_s; // >1.0s continuous top-1px hover
+    const hover_reveal_ns: i96 = 1 * std.time.ns_per_s; // >1.0s continuous 1px edge hover
     const leave_grace_ns: i96 = 120 * std.time.ns_per_ms; // brief anti-twitch grace on exit
     const fade_in_ns: i96 = 250 * std.time.ns_per_ms; // smooth cubic ease-out reveal
     const fade_out_ns: i96 = 180 * std.time.ns_per_ms; // smooth fade-out on hide
-    const marquee_step_ns: i96 = 125 * std.time.ns_per_ms;
+    const marquee_step_ns: i96 = 125 * std.time.ns_per_ms; // snap-mode character advance (8 chars/s)
+    const smooth_px_ns: i96 = 16_666_667; // smooth-mode 1 logical px per 60Hz VSync (60 px/s)
+    const smooth_char_ns: i96 = 7 * smooth_px_ns; // 7 logical px per character cell (~116.67ms)
 
     const VisibilityState = enum {
         hidden,
@@ -90,16 +102,17 @@ pub const StatusMonitor = struct {
     // Rect Compute
     rect_height: f32 = 0, // height of glyph rect in NDC
     rect_width_i: i16 = 0, // fixed point (-32768 -> 32767)
-    rect_width_f: f32 = 0, // NDC (-1 -> 1)
+    rect_width_f: f32 = 0, // NDC (-1 -> 1), rounded up to match rect_width_i step for gapless 2-cell icons
+    glyph_width_f: f32 = 0, // exact integer-pixel glyph NDC width for constant-width smooth marquee blits
     rect_y_pos: i16 = 0, // y pos for glyph rect in fixed-point NDC
 
     // Inline zero-allocator buffers (`self` lives at a stable stack address in `main`)
     cells_storage: [max_cells]i16 = @splat(0),
-    quad_storage: [max_segments + max_cells]RectDraw.QuadVertex = undefined,
+    quad_storage: [max_segments + max_cells]QuadVertex = undefined,
     sample_storage: [max_sample_hz * max_numeric_metrics]u128 = @splat(0),
 
     cells: []i16 = &.{},
-    quad_buffer: []RectDraw.QuadVertex = &.{},
+    quad_buffer: []QuadVertex = &.{},
     sample_buffer: []u128 = &.{},
 
     // Metric storage owned per StatusMonitor instance
@@ -175,8 +188,14 @@ pub const StatusMonitor = struct {
     last_power_flow: PowerFlow = .maintaining,
 
     // Active window marquee state (monotonic time-driven)
+    marquee_mode: MarqueeMode = .smooth,
+    title_extra_slot: usize = 0,
+    marquee_clip_scrolling: bool = false,
+    marquee_active_clip_min: i16 = -32768,
+    marquee_active_clip_max: i16 = 32767,
     title_codepoints: [260]u32 = @splat(0),
     title_len: usize = 0,
+    marquee_start_ns: i96 = 0,
     marquee_next_ns: i96 = 0,
     title_rotations: usize = 0,
 
@@ -207,16 +226,18 @@ pub const StatusMonitor = struct {
         self.font = FontAtlas.initEmbedded();
         errdefer self.font.deinit();
 
-        if (!self.window.usesShm()) {
-            self.rect = try RectDraw.init(self.window.getProcLoader());
-            errdefer self.rect.deinit();
+        if (comptime build_options.enable_gpu) {
+            if (!self.window.usesShm()) {
+                self.rect = try RectDraw.init(self.window.getProcLoader());
+                errdefer self.rect.deinit();
 
-            var embedded_rgba: [@as(usize, font_zig.embedded.width) * @as(usize, font_zig.embedded.height) * 4]u8 = undefined;
-            font_zig.embedded.unpackRgba(&embedded_rgba);
+                var embedded_rgba: [@as(usize, font_zig.embedded.width) * @as(usize, font_zig.embedded.height) * 4]u8 = undefined;
+                font_zig.embedded.unpackRgba(&embedded_rgba);
 
-            self.rect.use();
-            try self.rect.loadTexture(font_zig.embedded.width, font_zig.embedded.height, &embedded_rgba);
-            self.rect.setTextureSize(self.font.x_increment, self.font.y_increment);
+                self.rect.use();
+                try self.rect.loadTexture(font_zig.embedded.width, font_zig.embedded.height, &embedded_rgba);
+                self.rect.setTextureSize(self.font.x_increment, self.font.y_increment);
+            }
         }
 
         // Bind metric slices to segments (`power_segment` slice is configured dynamically by battery presence)
@@ -236,14 +257,14 @@ pub const StatusMonitor = struct {
         // Wire active-window title source (native Wayland toplevel protocol or event-driven X11 atoms)
         if (self.window.waylandTitle()) |wl_title| {
             self.window_metrics[0].metric.window.setExternalTitle(wl_title);
-        } else {
+        } else if (comptime build_options.enable_x11) {
             self.window_metrics[0].metric.window.attach(
-                self.window.display,
-                self.window.root,
-                self.window.handle,
-                self.window.net_active_window_atom,
-                self.window.net_wm_name_atom,
-                self.window.wm_name_atom,
+                self.window.x11_handles.display,
+                self.window.x11_handles.root,
+                self.window.x11_handles.handle,
+                self.window.x11_handles.net_active_window_atom,
+                self.window.x11_handles.net_wm_name_atom,
+                self.window.x11_handles.wm_name_atom,
             );
         }
         self.window.title_dirty = false;
@@ -404,6 +425,7 @@ pub const StatusMonitor = struct {
         const screen_width = @as(f32, @floatFromInt(@max(1, self.window.width)));
         const char_width = @as(f32, @floatFromInt(self.font.char_width));
         const raw_width_f = char_width / screen_width * 2.0;
+        self.glyph_width_f = raw_width_f;
         self.rect_width_i = @max(1, @as(i16, @intFromFloat(@ceil(raw_width_f * 32767.0))));
         self.rect_width_f = @as(f32, @floatFromInt(self.rect_width_i)) / 32767.0;
 
@@ -419,34 +441,38 @@ pub const StatusMonitor = struct {
         const stor_idx = therm_idx -| storage_width;
         const net_idx = stor_idx -| network_width;
         const power_idx = net_idx -| power_width;
+        const extra_slot: usize = if (power_idx > 0) 1 else 0;
+        self.title_extra_slot = extra_slot;
 
-        self.time_segment.cell_start = time_idx;
+        self.time_segment.cell_start = time_idx + extra_slot;
         self.time_segment.cells = self.cells[time_idx..cells_count];
 
-        self.processor_segment.cell_start = proc_idx;
+        self.processor_segment.cell_start = proc_idx + extra_slot;
         self.processor_segment.cells = self.cells[proc_idx..time_idx];
 
-        self.thermal_load_segment.cell_start = therm_idx;
+        self.thermal_load_segment.cell_start = therm_idx + extra_slot;
         self.thermal_load_segment.cells = self.cells[therm_idx..proc_idx];
 
-        self.storage_load_segment.cell_start = stor_idx;
+        self.storage_load_segment.cell_start = stor_idx + extra_slot;
         self.storage_load_segment.cells = self.cells[stor_idx..therm_idx];
 
-        self.network_load_segment.cell_start = net_idx;
+        self.network_load_segment.cell_start = net_idx + extra_slot;
         self.network_load_segment.cells = self.cells[net_idx..stor_idx];
 
-        self.power_segment.cell_start = power_idx;
+        self.power_segment.cell_start = power_idx + extra_slot;
         self.power_segment.cells = self.cells[power_idx..net_idx];
 
         self.window_title_segment.cell_start = 0;
         self.window_title_segment.cells = self.cells[0..power_idx];
 
-        // Slice inline batched vertex buffer: segment background rects + N glyph cells
+        // Slice inline batched vertex buffer: segment background rects + N glyph cells (+1 incoming smooth-scroll slot)
         const bg_quads = self.segments.len;
         assert(bg_quads <= max_segments);
-        self.quad_buffer = self.quad_storage[0 .. bg_quads + cells_count];
-        if (!self.window.usesShm()) {
-            self.rect.ensureCapacity(self.quad_buffer.len);
+        self.quad_buffer = self.quad_storage[0 .. bg_quads + cells_count + extra_slot];
+        if (comptime build_options.enable_gpu) {
+            if (!self.window.usesShm()) {
+                self.rect.ensureCapacity(self.quad_buffer.len);
+            }
         }
 
         self.clearAllAndDrawStatic();
@@ -464,7 +490,7 @@ pub const StatusMonitor = struct {
     fn generateCells(self: *StatusMonitor, min_fixed_cells: usize) void {
         const cell_size: u16 = @intCast(self.rect_width_i);
         const char_count: usize = @max(min_fixed_cells + 4, @divTrunc(65535, cell_size));
-        const total_cells = @min(max_cells, char_count + 1);
+        const total_cells = @min(max_cells - 1, char_count + 1);
         self.cells = self.cells_storage[0..total_cells];
 
         var current_x: i16 = -32768;
@@ -751,8 +777,8 @@ pub const StatusMonitor = struct {
             now_ns = monotonicNs(self.io);
         }
 
-        // During active fades, let hardware VSync (`wl_surface.frame` or `swapBuffers`) pace frames directly
-        if (self.state == .fading_in or self.state == .fading_out) {
+        // During active fades or smooth pixel-scrolling marquee, let hardware VSync (`wl_surface.frame` or `swapBuffers`) pace frames
+        if (self.state == .fading_in or self.state == .fading_out or (drew and self.isSmoothMarqueeScrolling(now_ns))) {
             self.window.waitForFrameSync();
             return;
         }
@@ -856,6 +882,82 @@ pub const StatusMonitor = struct {
         return max_chars > 0 and self.title_len > max_chars;
     }
 
+    fn isSmoothMarqueeScrolling(self: *const StatusMonitor, now_ns: i96) bool {
+        return self.marquee_mode == .smooth and self.hasActiveMarquee() and now_ns >= self.marquee_start_ns;
+    }
+
+    fn titleSegRightNdc(self: *const StatusMonitor) i16 {
+        const seg = &self.window_title_segment;
+        if (seg.cells.len == 0) return -32768;
+        const end_x_i32 = @as(i32, seg.cells[seg.cells.len - 1]) + @as(i32, self.rect_width_i);
+        return @intCast(std.math.clamp(end_x_i32, -32768, 32767));
+    }
+
+    fn currentTitleClip(self: *const StatusMonitor) ?TitleClip {
+        const seg = &self.window_title_segment;
+        const max_chars = seg.cells.len -| 2;
+        const total_title_quads = seg.cells.len + self.title_extra_slot;
+        if (max_chars == 0 or self.quad_buffer.len < self.segments.len + seg.cell_start + total_title_quads) return null;
+        const base = self.segments.len + seg.cell_start;
+        const seg_left = seg.cells[0];
+        const seg_right = self.titleSegRightNdc();
+        return .{
+            .quad_start = base,
+            .quad_end = base + total_title_quads,
+            .min_ndc_x = if (self.marquee_clip_scrolling) self.marquee_active_clip_min else seg.cells[1],
+            .max_ndc_x = if (self.marquee_clip_scrolling) self.marquee_active_clip_max else seg.cells[1 + max_chars],
+            .clear_min_ndc_x = seg_left,
+            .clear_max_ndc_x = seg_right,
+            .bg_color = rgbaBytes(seg.color),
+        };
+    }
+
+    fn cellPhysPixels(self: *const StatusMonitor) i96 {
+        const buf_w: i96 = @max(1, self.window.bufferSize().w);
+        const logical_w: i96 = @max(1, self.window.width);
+        const char_w: i96 = @max(1, self.font.char_width);
+        return @max(1, @divTrunc(char_w * buf_w + @divTrunc(logical_w, 2), logical_w));
+    }
+
+    fn resetTitleCellPositions(self: *StatusMonitor) bool {
+        const seg = &self.window_title_segment;
+        const total_title_quads = seg.cells.len + self.title_extra_slot;
+        if (seg.cells.len == 0 or self.quad_buffer.len < self.segments.len + seg.cell_start + total_title_quads) return false;
+        const base = self.segments.len + seg.cell_start;
+        var changed = false;
+        for (seg.cells, 0..) |cell_x, local_i| {
+            const q = &self.quad_buffer[base + local_i];
+            if (q.pos[0] != cell_x) {
+                q.pos[0] = cell_x;
+                changed = true;
+            }
+        }
+        // Ensure paused start/end gap cells (`0`, `len - 1`) and extra incoming slot are culled
+        const first_q = &self.quad_buffer[base];
+        if (first_q.uv[0] != uv_empty[0] or first_q.uv[1] != uv_empty[1]) {
+            first_q.uv = uv_empty;
+            changed = true;
+        }
+        const last_q = &self.quad_buffer[base + seg.cells.len - 1];
+        if (last_q.uv[0] != uv_empty[0] or last_q.uv[1] != uv_empty[1]) {
+            last_q.uv = uv_empty;
+            changed = true;
+        }
+        if (self.title_extra_slot > 0) {
+            const extra_q = &self.quad_buffer[base + seg.cells.len];
+            const right_x = self.titleSegRightNdc();
+            if (extra_q.pos[0] != right_x) {
+                extra_q.pos[0] = right_x;
+                changed = true;
+            }
+            if (extra_q.uv[0] != uv_empty[0] or extra_q.uv[1] != uv_empty[1]) {
+                extra_q.uv = uv_empty;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
     fn renderVisible(self: *StatusMonitor, now_ns: i96) !bool {
         var drew_anything = self.frame_dirty;
         const progress = self.interpolationProgress(now_ns);
@@ -898,42 +1000,50 @@ pub const StatusMonitor = struct {
             }
         }
 
-        // 3. Active window title + monotonic marquee rotation for overflowing titles
+        // 3. Active window title + monotonic marquee (smooth pixel scroll or snap rotation)
         if (self.renderWindowTitle(now_ns)) {
             drew_anything = true;
         }
 
         if (drew_anything) {
             self.frame_dirty = false;
+            const title_clip = self.currentTitleClip();
             if (self.window.usesShm()) {
                 const want_vsync = self.state == .fading_in or
                     self.state == .fading_out or
+                    self.isSmoothMarqueeScrolling(now_ns) or
                     (if (self.minNextInterpolationStepNs(now_ns)) |t_ns| t_ns <= now_ns + 16 * std.time.ns_per_ms else false);
                 try self.window.presentShm(
                     self.segments.len,
                     self.quad_buffer,
                     self.opacity,
+                    title_clip,
                     want_vsync,
                 );
                 return true;
             }
 
-            const pre_swap_ns = now_ns;
-            self.rect.drawBatch(self.quad_buffer, self.opacity);
-            self.window.swapBuffers();
+            if (comptime build_options.enable_gpu) {
+                const pre_swap_ns = now_ns;
+                const buf = self.window.bufferSize();
+                self.rect.drawBatch(self.quad_buffer, self.opacity, buf.w, buf.h, title_clip);
+                self.window.swapBuffers();
 
-            const post_swap_ns = monotonicNs(self.io);
-            if (post_swap_ns - pre_swap_ns < 2 * std.time.ns_per_ms) {
-                self.consecutive_unpaced_swaps +|= 1;
-                if (self.consecutive_unpaced_swaps >= 2 and
-                    (self.state == .fading_in or self.state == .fading_out or self.minNextInterpolationStepNs(post_swap_ns) != null))
-                {
-                    sleepNs(self.io, 8 * std.time.ns_per_ms);
+                const post_swap_ns = monotonicNs(self.io);
+                if (post_swap_ns - pre_swap_ns < 2 * std.time.ns_per_ms) {
+                    self.consecutive_unpaced_swaps +|= 1;
+                    if (self.consecutive_unpaced_swaps >= 2 and
+                        (self.state == .fading_in or self.state == .fading_out or
+                            self.isSmoothMarqueeScrolling(post_swap_ns) or
+                            self.minNextInterpolationStepNs(post_swap_ns) != null))
+                    {
+                        sleepNs(self.io, 8 * std.time.ns_per_ms);
+                    }
+                } else {
+                    self.consecutive_unpaced_swaps = 0;
                 }
-            } else {
-                self.consecutive_unpaced_swaps = 0;
+                return true;
             }
-            return true;
         }
         self.consecutive_unpaced_swaps = 0;
         return false;
@@ -964,12 +1074,20 @@ pub const StatusMonitor = struct {
 
     fn renderWindowTitle(self: *StatusMonitor, now_ns: i96) bool {
         const win_probe = &self.window_metrics[0].metric.window;
-        const max_chars = self.window_title_segment.cells.len -| 2;
+        const seg = &self.window_title_segment;
+        const max_chars = seg.cells.len -| 2;
         if (max_chars == 0) return false;
 
         if (win_probe.changed) {
             win_probe.changed = false;
-            var changed = self.clearSegment(&self.window_title_segment);
+            var changed = self.marquee_clip_scrolling;
+            self.marquee_clip_scrolling = false;
+            if (self.resetTitleCellPositions()) {
+                changed = true;
+            }
+            if (self.clearSegment(seg)) {
+                changed = true;
+            }
 
             self.title_len = 0;
             const raw = win_probe.slice();
@@ -990,27 +1108,139 @@ pub const StatusMonitor = struct {
                 self.title_len += 3;
             }
 
-            self.marquee_next_ns = now_ns + std.time.ns_per_s;
+            self.marquee_start_ns = now_ns + std.time.ns_per_s;
+            self.marquee_next_ns = self.marquee_start_ns;
             self.title_rotations = 0;
 
-            if (self.drawCodepoints(&self.window_title_segment, self.title_codepoints[0..@min(self.title_len, max_chars)], 1)) {
+            if (self.drawCodepoints(seg, self.title_codepoints[0..@min(self.title_len, max_chars)], 1)) {
                 changed = true;
             }
             return changed;
         }
 
-        // Monotonic marquee scroll after 1 second if title exceeds available cells
-        if (self.title_len > max_chars and now_ns >= self.marquee_next_ns) {
-            std.mem.rotate(u32, self.title_codepoints[0..self.title_len], 1);
-            const changed = self.drawCodepoints(&self.window_title_segment, self.title_codepoints[0..max_chars], 1);
+        if (self.marquee_mode == .smooth) {
+            if (self.title_len > max_chars and now_ns >= self.marquee_start_ns) {
+                const cell_px = self.cellPhysPixels();
+                const elapsed_ns = @max(0, now_ns - self.marquee_start_ns);
+                const total_px_steps = @divTrunc(2 * elapsed_ns * cell_px + smooth_char_ns, 2 * smooth_char_ns);
+                const total_limit_chars = self.title_len * 2;
+                const total_limit_px: i96 = @as(i96, @intCast(total_limit_chars)) * cell_px;
 
+                if (total_px_steps >= total_limit_px) {
+                    var changed = self.marquee_clip_scrolling;
+                    self.marquee_clip_scrolling = false;
+                    if (self.resetTitleCellPositions()) {
+                        changed = true;
+                    }
+                    if (self.drawCodepoints(seg, self.title_codepoints[0..max_chars], 1)) {
+                        changed = true;
+                    }
+                    self.marquee_start_ns = now_ns + 60 * std.time.ns_per_s;
+                    self.marquee_next_ns = self.marquee_start_ns;
+                    return changed;
+                }
+
+                const total_chars: usize = @intCast(@divTrunc(total_px_steps, cell_px));
+                const px_step = @mod(total_px_steps, cell_px);
+                const shift_i16: i16 = @intCast(@divTrunc(
+                    px_step * @as(i96, self.rect_width_i) + @divTrunc(cell_px, 2),
+                    cell_px,
+                ));
+
+                // Smoothly expand right clip across the 1-cell end gap over the first cell of scroll,
+                // run 100% edge-to-edge while scrolling, and smoothly restore the 1-cell end gap at loop end.
+                const open_px = @min(cell_px, @min(total_px_steps, total_limit_px - total_px_steps));
+                const open_ndc: i32 = @intCast(@divTrunc(
+                    open_px * @as(i96, self.rect_width_i) + @divTrunc(cell_px, 2),
+                    cell_px,
+                ));
+                const next_clip_min = seg.cells[0];
+                const next_clip_max: i16 = @intCast(std.math.clamp(
+                    @as(i32, seg.cells[seg.cells.len - 1]) + open_ndc,
+                    -32768,
+                    32767,
+                ));
+
+                var changed = (!self.marquee_clip_scrolling or
+                    self.marquee_active_clip_min != next_clip_min or
+                    self.marquee_active_clip_max != next_clip_max);
+                self.marquee_clip_scrolling = true;
+                self.marquee_active_clip_min = next_clip_min;
+                self.marquee_active_clip_max = next_clip_max;
+
+                const base = self.segments.len + seg.cell_start;
+                const slot_count = seg.cells.len + self.title_extra_slot;
+                const seg_right = self.titleSegRightNdc();
+
+                for (0..slot_count) |k| {
+                    const q = &self.quad_buffer[base + k];
+                    const base_x: i16 = if (k < seg.cells.len) seg.cells[k] else seg_right;
+                    const target_x: i16 = @intCast(std.math.clamp(
+                        @as(i32, base_x) - @as(i32, shift_i16),
+                        -32768,
+                        32767,
+                    ));
+                    if (q.pos[0] != target_x) {
+                        q.pos[0] = target_x;
+                        changed = true;
+                    }
+
+                    const next_uv = if (k >= seg.cells.len and shift_i16 == 0)
+                        uv_empty
+                    else blk: {
+                        // Offset by `-1` so at `total_chars = 0`, `title[0]` sits at `cells[1]` (`cells[0]` = `' '`)
+                        const cp_idx = (self.title_len - 1 + total_chars + k) % self.title_len;
+                        const cp = self.title_codepoints[cp_idx];
+                        break :blk if (cp == ' ') uv_empty else (self.font.getGlyphUV(cp) orelse uv_empty);
+                    };
+
+                    if (q.uv[0] != next_uv[0] or q.uv[1] != next_uv[1]) {
+                        q.uv = next_uv;
+                        changed = true;
+                    }
+                }
+
+                const next_elapsed_ns = @divTrunc(
+                    (2 * total_px_steps + 1) * smooth_char_ns + 2 * cell_px - 1,
+                    2 * cell_px,
+                );
+                self.marquee_next_ns = self.marquee_start_ns + next_elapsed_ns;
+                return changed;
+            }
+            return false;
+        }
+
+        // Character-snapping marquee (`--marquee=snap`): edge-to-edge while scrolling, 1-cell gaps when paused
+        if (self.title_len > max_chars and now_ns >= self.marquee_next_ns) {
             self.title_rotations += 1;
             if (self.title_rotations >= self.title_len * 2) {
+                var changed = self.marquee_clip_scrolling;
+                self.marquee_clip_scrolling = false;
+                if (self.resetTitleCellPositions()) changed = true;
+                if (self.clearSegment(seg)) changed = true;
+                if (self.drawCodepoints(seg, self.title_codepoints[0..max_chars], 1)) changed = true;
                 self.marquee_next_ns = now_ns + 60 * std.time.ns_per_s;
                 self.title_rotations = 0;
-            } else {
-                self.marquee_next_ns = now_ns + marquee_step_ns;
+                return changed;
             }
+
+            var changed = !self.marquee_clip_scrolling;
+            self.marquee_clip_scrolling = true;
+            self.marquee_active_clip_min = seg.cells[0];
+            self.marquee_active_clip_max = self.titleSegRightNdc();
+
+            const base = self.segments.len + seg.cell_start;
+            for (0..seg.cells.len) |k| {
+                const cp_idx = (self.title_len - 1 + self.title_rotations + k) % self.title_len;
+                const cp = self.title_codepoints[cp_idx];
+                const next_uv = if (cp == ' ') uv_empty else (self.font.getGlyphUV(cp) orelse uv_empty);
+                const slot = &self.quad_buffer[base + k];
+                if (slot.uv[0] != next_uv[0] or slot.uv[1] != next_uv[1]) {
+                    slot.uv = next_uv;
+                    changed = true;
+                }
+            }
+            self.marquee_next_ns = now_ns + marquee_step_ns;
             return changed;
         }
 
@@ -1034,9 +1264,9 @@ pub const StatusMonitor = struct {
             if (cp == '\n') continue; // Preserve existing static glyph in this cell
 
             const next_uv = if (cp == ' ')
-                RectDraw.uv_empty
+                uv_empty
             else
-                (self.font.getGlyphUV(cp) orelse RectDraw.uv_empty);
+                (self.font.getGlyphUV(cp) orelse uv_empty);
 
             const slot = &self.quad_buffer[base + target_cell];
             if (slot.uv[0] != next_uv[0] or slot.uv[1] != next_uv[1]) {
@@ -1056,9 +1286,9 @@ pub const StatusMonitor = struct {
 
         for (codepoints[0..max_emit], 0..) |cp, cell_idx| {
             const next_uv = if (cp == ' ')
-                RectDraw.uv_empty
+                uv_empty
             else
-                (self.font.getGlyphUV(cp) orelse RectDraw.uv_empty);
+                (self.font.getGlyphUV(cp) orelse uv_empty);
 
             const slot = &self.quad_buffer[base + offset + cell_idx];
             if (slot.uv[0] != next_uv[0] or slot.uv[1] != next_uv[1]) {
@@ -1073,10 +1303,12 @@ pub const StatusMonitor = struct {
     pub fn clearSegment(self: *StatusMonitor, seg: *const Segment) bool {
         if (seg.cells.len == 0 or self.quad_buffer.len == 0) return false;
         const base = self.segments.len + seg.cell_start;
+        const slot_len = seg.cells.len + (if (seg == &self.window_title_segment) self.title_extra_slot else 0);
+        if (base + slot_len > self.quad_buffer.len) return false;
         var changed = false;
-        for (self.quad_buffer[base .. base + seg.cells.len]) |*q| {
-            if (q.uv[0] != RectDraw.uv_empty[0] or q.uv[1] != RectDraw.uv_empty[1]) {
-                q.uv = RectDraw.uv_empty;
+        for (self.quad_buffer[base .. base + slot_len]) |*q| {
+            if (q.uv[0] != uv_empty[0] or q.uv[1] != uv_empty[1]) {
+                q.uv = uv_empty;
                 changed = true;
             }
         }
@@ -1087,10 +1319,11 @@ pub const StatusMonitor = struct {
         if (self.quad_buffer.len < self.segments.len) return;
 
         const bg_quads = self.segments.len;
-        const glyph_size: [2]f32 = .{ self.rect_width_f, self.rect_height };
 
         for (self.segments, 0..) |seg, seg_idx| {
             const color_bytes = rgbaBytes(seg.color);
+            const seg_glyph_w = if (seg == &self.window_title_segment) self.glyph_width_f else self.rect_width_f;
+            const glyph_size: [2]f32 = .{ seg_glyph_w, self.rect_height };
 
             if (seg.cells.len > 0) {
                 const start_ndc = @max(-1.0, @as(f32, @floatFromInt(seg.cells[0])) / 32767.0);
@@ -1104,14 +1337,14 @@ pub const StatusMonitor = struct {
                 self.quad_buffer[seg_idx] = .{
                     .size = .{ seg_width_ndc, 2.0 },
                     .pos = .{ seg.cells[0], 32767 },
-                    .uv = RectDraw.uv_solid,
+                    .uv = uv_solid,
                     .color = color_bytes,
                 };
             } else {
                 self.quad_buffer[seg_idx] = .{
                     .size = .{ 0.0, 0.0 },
                     .pos = .{ 0, 0 },
-                    .uv = RectDraw.uv_empty,
+                    .uv = uv_empty,
                     .color = color_bytes,
                 };
             }
@@ -1121,7 +1354,15 @@ pub const StatusMonitor = struct {
                 self.quad_buffer[base + local_i] = .{
                     .size = glyph_size,
                     .pos = .{ cell_x, self.rect_y_pos },
-                    .uv = RectDraw.uv_empty,
+                    .uv = uv_empty,
+                    .color = color_bytes,
+                };
+            }
+            if (seg == &self.window_title_segment and self.title_extra_slot > 0) {
+                self.quad_buffer[base + seg.cells.len] = .{
+                    .size = glyph_size,
+                    .pos = .{ self.titleSegRightNdc(), self.rect_y_pos },
+                    .uv = uv_empty,
                     .color = color_bytes,
                 };
             }
