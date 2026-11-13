@@ -1,0 +1,14 @@
+[Unit]
+Description=zigbar lightweight Wayland/X11 system status bar
+Documentation=https://github.com/moon/zigbar
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/zigbar --mode=auto-hide --backend=auto
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

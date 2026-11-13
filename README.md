@@ -1,38 +1,105 @@
-# StBar
-a C++ status bar application for Linux That aims to be fast and light through GPU rendering.
-![screenshot](assets/screenshot.png)
+# zigbar
 
-## Features
-- **X11**: Utilizes the X11 API for drawing and managing windows with minimal overhead.
-- **OpenGL**: Utilizes the GPU for rendering and calculations, reducing CPU usage.
-- **JSON Configuration**: The font used for rendering can be easily swapped or changed through JSON without the need for rebuilding.
-- **Texture Rendering**: The program uses a tileset from a texture to render the font quickly.
+Ultra-low-overhead Linux status bar written in **Zig 0.17.1**, supporting native **Wayland `wl_shm` (`zwlr_layer_shell_v1`)**, **X11 `MIT-SHM` (`EWMH` + `XShmPutImage`)**, **Wayland `EGL`**, and **X11 `GLX`** in a single standalone executable with zero external runtime files.
 
-**Dependencies**
-- nlohmann JSON Library: Used for handling JSON configuration files.
-- Tamzen Font (converted to PNG): Provides bitmap font for rednering.
+## Highlights
 
-## Installation
+- **Single-Threaded Native `wl_shm` & `MIT-SHM` Renderers (`<1 MB` Private RSS, `1` Thread):** Default Wayland (`wl_shm`) and X11 (`XShmPutImage`) backends render glyphs directly from L1-cached 2-bit `.rodata` into shared memory without linking or loading Mesa/OpenGL (`-Dgpu=false` by default; optional `-Dgpu=true` enables `wayland-egl` and `x11-glx`, and `-Dx11=false` builds a pure-Wayland binary), submitting cell-level damage rectangles (`wl_surface_damage_buffer` / `XShmPutImage`).
+- **Standalone Single Binary:** `assets/font/tamzen.json` and `assets/font/tamzen.png` are baked into `.rodata` at build time (`tools/bake_font.zig`), requiring zero external assets or Zig package dependencies at runtime.
+- **Zero Polling While Hidden:** In `auto-hide` mode, `zigbar` shrinks its input region to a `1px` edge strip (top or bottom via `--position`) and suspends indefinitely inside kernel `poll(..., -1)` (`0 Hz` timers, `0` `/proc` reads, `0` GPU draws). Last-viewed metric state is preserved across sleep so revealing the bar glimpses its previous state and smoothly catches up at VSync.
+- **Framerate-Free Hardware VSync Interpolation & Smooth Marquee:** Samples live Linux metrics (`/proc/stat`, `/proc/meminfo`, `/proc/diskstats`, `/proc/net/dev`, `/proc/self/mountinfo`, `/sys/class/hwmon`, `sysinfo`, `localtime_r`) at `8 Hz` while visible and interpolates `prev -> target` smoothly locked to your monitor's native VSync refresh rate when values change — sleeping in `poll()` whenever steady. Overflowing window titles scroll pixel-by-pixel at VSync (`--marquee=smooth`, or classic character-snapping via `--marquee=snap`).
+- **Native Wayland & X11 Window Titles, HiDPI, + Top/Bottom Struts:**
+  - **Fractional & Integer Wayland HiDPI:** Native `wp_fractional_scale_v1` + `wp_viewporter` + `wl_compositor` v6 (`preferred_buffer_scale` / `wl_output.scale`) buffer scaling with bit-exact `2x`/`3x` integer blocks and sub-texel box-coverage antialiasing at fractional scales (`125%`, `150%`, `175%`).
+  - **Wayland Layer-Shell & EWMH Struts:** Real `17px` top or bottom (`--position=top|bottom`) exclusive-zone / `_NET_WM_STRUT_PARTIAL` struts on KDE Plasma 6 Wayland, Sway, Hyprland, River, Niri, Labwc, and X11, with seamless DPMS sleep & monitor hotplug recovery.
+  - **Event-Driven Window Titles:** Uses `zwlr_foreign_toplevel_management_v1` on wlroots compositors, event-driven `org.kde.kwin.Scripting` (`sd-bus`) on KDE Plasma Wayland (covering both native Wayland and Xwayland apps), and `PropertyChangeMask` (`_NET_ACTIVE_WINDOW`) on X11.
 
-  Clone this repository:
-    
-    git clone https://github.com/kapypara/stbar
+## Build & Install
 
-  Build the application:
+### System Dependencies (Arch Linux)
 
-    mkdir build && cd build
-    cmake ..
-    make
+```bash
+sudo pacman -S wayland wayland-protocols libglvnd libx11 libxrender libxext systemd-libs
+```
 
-Run the application:
+### Compile Standalone Binary
 
-    ./stbar_v4
+```bash
+zig build
+install -Dm755 zig-out/bin/zigbar ~/.local/bin/zigbar
+```
 
-## Contributing
-Contributions to this project are welcome. Feel free to submit issues, create pull requests, or suggest improvements.
+> `zig build` defaults to native `ReleaseFast` (`-O3` + fast-math + native host SIMD + full LTO + frame-pointer omission + stripped symbols) with `-Dgpu=false -Dx11=true`.
+> - Pass `-Dx11=false` for a pure-Wayland build (`libwayland-client` + `libsystemd` + `libc` only).
+> - Pass `-Dgpu=true` to compile in the optional `wayland-egl` and `x11-glx` OpenGL 3.2 backends (`libglvnd` / `libEGL` / `libGL`).
+> - Pass `-Doptimize=Debug` for debug builds.
 
-## License
-This project is licensed under the MIT License. See the LICENSE file for details.
+Run unit tests:
 
-## Contact
-For questions, feedback, or support, please contact [Kapy](mailto:kapy@badinfo.xyz).
+```bash
+zig build test -Doptimize=Debug --summary all
+```
+
+## CLI Usage & Controls
+
+```text
+Usage: zigbar [options]
+
+Options:
+  -m, --mode=<auto-hide|pinned|dock>                     Startup bar mode (default: auto-hide)
+  -p, --position=<top|bottom>                            Screen edge anchor (default: top)
+  -b, --backend=<auto|wayland|wayland-egl|x11|x11-glx>   Display backend (default: auto)
+  -o, --output=<connector>                               Target Wayland output (e.g. eDP-1, DP-1; default: primary)
+      --marquee=<smooth|snap>                            Overflowing window title scroll style (default: smooth)
+      --hz=<1..60>                                       Metric sample rate while visible (default: 8)
+  -h, --help                                             Show help message and exit
+```
+
+### Mouse & Signal Controls
+
+| Action / Signal | Behavior |
+| :--- | :--- |
+| **Hover `1px` edge (`> 1.0s`)** | Smoothly fades in the bar (`auto-hide` mode); fades out `120ms` after pointer leaves |
+| **Left-click segment** | Runs declarative segment action (copy Unix time / power summary / window title, launch `btop` / `dolphin`) |
+| **Right-click** / `pkill -USR1 -x zigbar` | Toggles **`pinned`** overlay (`strut = OFF`, always visible) <-> **`auto-hide`** |
+| **Middle-click** / `pkill -USR2 -x zigbar` | Toggles **`dock`** mode (`17px` `exclusive_zone` / `_NET_WM_STRUT_PARTIAL` `strut = ON`) <-> **`auto-hide`** |
+
+## Customization (`src/config.zig`)
+
+All personal bar settings — startup CLI defaults, bar height, hover/fade/marquee timings, named PUA icon pairs, RGBA32 segment colors, fixed cell widths, and left-click commands (`btop`/`htop`, `dolphin`, clipboard actions) — live in [`src/config.zig`](src/config.zig) as `comptime` `.rodata` constants (`dwm`/`slstatus` style). Edit `src/config.zig` and re-run `zig build`.
+
+## Autostart with `systemd --user`
+
+Install and enable the bundled user service (`systemd/zigbar.service`) so `zigbar` starts automatically with your graphical Wayland/X11 session:
+
+```bash
+install -Dm755 zig-out/bin/zigbar ~/.local/bin/zigbar
+install -Dm644 systemd/zigbar.service ~/.config/systemd/user/zigbar.service
+systemctl --user daemon-reload
+systemctl --user enable --now zigbar.service
+```
+
+Check status or switch startup flags:
+
+```bash
+systemctl --user status zigbar.service
+systemctl --user restart zigbar.service
+```
+
+## Desktop Power Monitoring (RAPL)
+
+On laptops, `zigbar` reads whole-machine wattage from `/sys/class/power_supply/BAT*`. On desktops (no battery), it sums:
+- Top-level CPU package energy deltas from `/sys/class/powercap/intel-rapl:*/energy_uj` (`package-*`)
+- All non-overlapping `/sys/class/hwmon/hwmon*/power1_input` (or `power1_average`) sensors (e.g., discrete/integrated GPUs, or a digital PSU with a Linux `hwmon` driver such as `corsair-psu`)
+
+Standard desktop motherboards, RAM, NVMe drives, NICs, and non-digital PSUs do not expose `hwmon` wattage sensors in Linux, so desktop readings reflect **CPU package + GPUs** (plus any other `hwmon` device that reports `power1_*`).
+
+### Enabling CPU Package Power Without Root
+
+Linux restricts `/sys/class/powercap/intel-rapl:*/energy_uj` to `0400 root:root` by default (CVE-2020-8694). To allow `zigbar` to read CPU package power on a desktop without granting broad filesystem capabilities (`cap_dac_read_search`) or installing out-of-tree kernel modules (`zenergy-dkms`), add a one-time `systemd-tmpfiles` rule scoped to your user's group (replace `$USER` with your group if different):
+
+```bash
+echo "z /sys/class/powercap/intel-rapl:*/energy_uj 0440 root $(id -gn) -" | sudo tee /etc/tmpfiles.d/rapl.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/rapl.conf
+```
+
+Restart `zigbar` afterwards so it picks up the RAPL sensor.
